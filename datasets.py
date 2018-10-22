@@ -20,11 +20,11 @@ class SynthUoSDataset(Dataset):
     self.sigma = sigma
     rng = np.random.RandomState(seed=seed)
 
-    self.Us = np.zeros(D, d, n)
-    self.Vs = np.zeros(d, self.N, n)
-    self.bs = np.zeros(D, n) if affine else None
-    self.X = np.zeros(D, self.N)
-    self.groups = np.zeros(self.N)
+    self.Us = np.zeros([D, d, n])
+    self.Vs = np.zeros([d, Ng, n])
+    self.bs = np.zeros([D, n]) if affine else None
+    self.X = np.zeros([D, self.N])
+    self.groups = np.zeros(self.N, dtype=np.int32)
 
     # sample data from randomnly generated (linear or affine) subspaces
     for ii in range(n):
@@ -45,7 +45,7 @@ class SynthUoSDataset(Dataset):
     if sigma > 0.:
       self.X += sigma*rng.randn(D, self.N)
 
-    self.X = torch.from_numpy(self.X)
+    self.X = torch.tensor(self.X, dtype=torch.float32)
     return
 
   def __len__(self):
