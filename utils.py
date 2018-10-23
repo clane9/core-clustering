@@ -33,6 +33,11 @@ def get_learning_rate(optimizer):
     for param_group in optimizer.param_groups])
 
 
+def adjust_learning_rate(optimizer, new_lr):
+  for param_group in optimizer.param_groups:
+    param_group['lr'] = new_lr
+
+
 def save_checkpoint(state, is_best, filename='checkpoint.pth.tar',
       best_filename='model_best.pth.tar'):
   """Save restart checkpoint.
@@ -64,15 +69,14 @@ def best_map(groups1, groups2):
   labels2 = np.unique(groups2)
   nclass1 = np.size(labels1)
   nclass2 = np.size(labels2)
-  nclass = np.max([nclass1, nclass2])
 
-  C = np.zeros([nclass, nclass])
+  C = np.zeros([nclass1, nclass2])
   for ii in range(nclass1):
     for jj in range(nclass2):
       C[ii, jj] = np.sum((groups1 == labels1[ii])*(groups2 == labels2[jj]))
 
   row_ind, col_ind = linear_sum_assignment(-C)
-  new_groups1 = np.zeros(groups1.shape)
+  new_groups1 = np.zeros(groups1.shape, dtype=np.int32)
   for ii in row_ind:
     new_groups1[groups1 == labels1[ii]] = labels2[col_ind[ii]]
   return new_groups1
