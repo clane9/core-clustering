@@ -16,13 +16,13 @@ import torch
 import torch.optim as optim
 
 from datasets import SynthUoSDataset
-from models import GSManifoldClusterModel, ManifoldClusterModel, SubspaceModel
+from models import ManifoldClusterModel, SubspaceModel
 import utils as ut
 
 import ipdb
 
-CHKP_FREQ = 10
-STOP_FREQ = 500
+CHKP_FREQ = 1000
+STOP_FREQ = 200
 LR_INCR_FREQ = 100
 
 
@@ -49,12 +49,12 @@ def main():
   # construct model
   group_models = [SubspaceModel(args.d, args.D, args.affine)
       for _ in range(args.n)]
-  # model = ManifoldClusterModel(args.n, args.d, args.D, N,
-  #     args.C_sigma, group_models)
-  model = GSManifoldClusterModel(args.n, args.d, args.D, N, group_models)
+  model = ManifoldClusterModel(args.n, args.d, args.D, N, group_models)
+  # model = GSManifoldClusterModel(args.n, args.d, args.D, N, group_models)
 
   # objective function
   def objfun(model, ii, x):
+
     x_ = model(ii)
     # measure whether reconstruction x_ is close in size to x.
     norm_x = torch.norm(x.detach(), 2, dim=1)
@@ -62,11 +62,13 @@ def main():
     norm_x_ = torch.mean(norm_x_ / (norm_x + 1e-8))
     # loss, reg, obj
     loss = torch.mean(torch.sum((x - x_)**2, dim=1))
-    # Ureg, Vreg, Creg = model.reg(ii)
-    # reg = args.UV_lamb*(Ureg + Vreg) + args.C_gamma*Creg
-    reg = args.UV_lamb*model.reg(ii)
+    Ureg, Vreg, Creg = model.reg(ii)
+    reg = args.U_lamb*Ureg + args.V_lamb*Vreg + args.C_gamma*Creg
+    # reg = args.UV_lamb*model.reg(ii)
+    # Ureg, Vreg = model.reg(ii)
+    # reg = args.U_lamb*Ureg + args.V_lamb*Vreg
     obj = loss + reg
-    return obj, loss, reg, norm_x_
+    return obj, loss, reg, Ureg, Vreg, Creg, norm_x_
 
   # optimizer & lr schedule
   optimizer = optim.SGD(model.parameters(), lr=args.init_lr,
@@ -75,9 +77,10 @@ def main():
       factor=0.5, patience=50, threshold=1e-4)
 
   printformstr = ('(epoch {:d}/{:d}) lr={:.3e} err={:.4f} obj={:.3e} '
-      'loss={:.3e} reg={:.3e} |x_|={:.3e} samp/s={:.0f}')
-  logheader = 'Epoch,LR,Err,Obj,Loss,Reg,Norm.x_,Samp.s'
-  logformstr = '{:d},{:.9e},{:.9f},{:.9e},{:.9e},{:.9e},{:.9e},{:.0f}'
+      'loss={:.3e} reg(U)(V)(C)={:.3e},{:.3e},{:.3e},{:.3e} '
+      '|x_|={:.3e} samp/s={:.0f}')
+  logheader = 'Epoch,LR,Err,Obj,Loss,Reg,U.reg,V.reg,C.reg,Norm.x_,Samp.s'
+  logformstr = '{:d},{:.9e},{:.9f},{:.9e},{:.9e},{:.9e},{:.9e},{:.9e},{:.0f}'
   val_logf = '{}/val_log.csv'.format(args.out_dir)
   with open(val_logf, 'w') as f:
     print(logheader, file=f)
@@ -85,17 +88,17 @@ def main():
   # training loop
   best_obj = float('inf')
   for epoch in range(args.epochs):
-    obj, loss, reg, norm_x_, sampsec = train_epoch(model, objfun,
-        synth_data_loader, device, optimizer)
+    obj, loss, reg, Ureg, Vreg, Creg, norm_x_, sampsec = train_epoch(
+        model, objfun, synth_data_loader, device, optimizer)
     cluster_error, groups = ut.eval_cluster_error(model.get_groups(),
         synth_dataset.groups)
     lr = ut.get_learning_rate(optimizer)
 
     with open(val_logf, 'a') as f:
       print(logformstr.format(epoch, lr, cluster_error, obj, loss, reg,
-          norm_x_, sampsec), file=f)
+          Ureg, Vreg, Creg, norm_x_, sampsec), file=f)
     print(printformstr.format(epoch, args.epochs, lr, cluster_error, obj, loss,
-        reg, norm_x_, sampsec))
+        reg, Ureg, Vreg, Creg, norm_x_, sampsec))
 
     is_best = obj < best_obj
     best_obj = min(obj, best_obj)
@@ -122,12 +125,14 @@ def main():
 
 def train_epoch(model, objfun, data_loader, device, optimizer):
   model.train()
-  obj, loss, reg, norm_x_, sampsec = [ut.AverageMeter() for _ in range(5)]
+  (obj, loss, reg, Ureg, Vreg,
+      Creg, norm_x_, sampsec) = [ut.AverageMeter() for _ in range(8)]
   tic = time.time()
   for kk, (ii, x) in enumerate(data_loader):
     # forward
     ii, x = ii.to(device), x.to(device)
-    batch_obj, batch_loss, batch_reg, batch_norm_x_ = objfun(model, ii, x)
+    (batch_obj, batch_loss, batch_reg, batch_Ureg, batch_Vreg,
+        batch_Creg, batch_norm_x_) = objfun(model, ii, x)
     batch_size = x.size(0)
 
     # backward
@@ -138,6 +143,9 @@ def train_epoch(model, objfun, data_loader, device, optimizer):
     obj.update(batch_obj, batch_size)
     loss.update(batch_loss, batch_size)
     reg.update(batch_reg, batch_size)
+    Ureg.update(batch_Ureg, batch_size)
+    Vreg.update(batch_Vreg, batch_size)
+    Creg.update(batch_Creg, batch_size)
     norm_x_.update(batch_norm_x_, batch_size)
 
     batch_time = time.time() - tic
@@ -147,7 +155,8 @@ def train_epoch(model, objfun, data_loader, device, optimizer):
     divergence = torch.isnan(batch_obj)
     if divergence:
       raise RuntimeError('Divergence! NaN objective.')
-  return obj.avg, loss.avg, reg.avg, norm_x_.avg, sampsec.avg
+  return (obj.avg, loss.avg, reg.avg,
+      Ureg.avg, Vreg.avg, Creg.avg, norm_x_.avg, sampsec.avg)
 
 
 if __name__ == '__main__':
@@ -170,12 +179,16 @@ if __name__ == '__main__':
   parser.add_argument('--data-seed', type=int, default=1904,
                       help='Data random seed [default: 1904]')
   # model settings
-  parser.add_argument('--UV-lamb', type=float, default=.01,
-                      help='U, V l2 reg parameter [default: .01]')
+  # parser.add_argument('--UV-lamb', type=float, default=.01,
+  #                     help='U, V l2 reg parameter [default: .01]')
+  parser.add_argument('--U-lamb', type=float, default=.01,
+                      help='U reg parameter [default: .01]')
+  parser.add_argument('--V-lamb', type=float, default=.01,
+                      help='V reg parameter [default: .01]')
   parser.add_argument('--C-gamma', type=float, default=.01,
                       help='C l1 reg parameter [default: .01]')
-  parser.add_argument('--C-sigma', type=float, default=0.,
-                      help='C noise sigma [default: 0.]')
+  # parser.add_argument('--C-sigma', type=float, default=0.,
+  #                     help='C noise sigma [default: 0.]')
   # training settings
   parser.add_argument('--batch-size', type=int, default=-1,
                       help='Input batch size for training [default: -1]')

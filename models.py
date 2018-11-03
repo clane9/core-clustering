@@ -6,7 +6,6 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.autograd import Variable
 
 
 class GSManifoldClusterModel(nn.Module):
@@ -23,12 +22,9 @@ class GSManifoldClusterModel(nn.Module):
       # quick check to make sure group models constructed correctly
       assert (len(group_models) == n and group_models[0].d == d and
           group_models[0].D == D)
-      self.group_models = group_models
     else:
       group_models = [SubspaceModel(d, D) for _ in range(n)]
-    # add group models as sub-modules
-    for ii in range(n):
-      self.add_module('gm{}'.format(ii), group_models[ii])
+    self.group_models = nn.ModuleList(group_models)
 
     # coefficient matrices, used with sparse embedding.
     self.V = nn.Parameter(torch.Tensor(N, n, d))
@@ -37,7 +33,7 @@ class GSManifoldClusterModel(nn.Module):
 
   def reset_parameters(self):
     """Initialize V with entries drawn from normal with std 1/sqrt(d)."""
-    V_std = 1. / np.sqrt(self.d)
+    V_std = .1 / np.sqrt(self.d)
     self.V.data.normal_(0., V_std)
     return
 
@@ -49,21 +45,27 @@ class GSManifoldClusterModel(nn.Module):
         enumerate(self.group_models)))
     return x
 
-  def reg(self, ii=None):
+  def reg(self, ii):
     """compute regularization on model parameters and representation
     coefficients."""
-    # Ureg = sum((gm.reg() for gm in self.group_models))
+    # NOTE: switched reg form from product to sum with squared l2 on U
+    # this will change meaning of reg parameters used in tests on 10/22/18.
+    Ureg = sum((gm.reg() for gm in self.group_models))
+    # NOTE: added division by N on afternoon of 10/23, to try to address
+    # regularization imbalance issue.
+    Ureg = Ureg / self.N
     # group sparsity norm on V: summing l2 norms of each of n coefficient
     # vectors (size d).
-    # Vreg = sum((torch.norm(F.embedding(ii, self.V[:, jj, :]), 2, dim=1)
-    #     for jj in range(self.n)))
-    # Vreg = torch.mean(Vreg)
-    Ureg = [gm.reg() for gm in self.group_models]
-    # NOTE: was torch.sum during test of batch size
-    Vreg = [torch.mean(torch.norm(F.embedding(ii, self.V[:, jj, :]), 2, dim=1))
-        for jj in range(self.n)]
-    reg = sum((ureg*vreg for ureg, vreg in zip(Ureg, Vreg)))
-    return reg
+    Vreg = sum((torch.norm(F.embedding(ii, self.V[:, jj, :]), 2, dim=1)
+        for jj in range(self.n)))
+    Vreg = torch.mean(Vreg)
+    # reg = Ureg + Vreg
+    # Ureg = [gm.reg() for gm in self.group_models]
+    # NOTE: was torch.sum during first test of batch size on 10/22/18
+    # Vreg = [torch.mean(torch.norm(F.embedding(ii, self.V[:,jj,:]), 2, dim=1))
+    #     for jj in range(self.n)]
+    # reg = sum((ureg*vreg for ureg, vreg in zip(Ureg, Vreg)))
+    return Ureg, Vreg
 
   def get_groups(self):
     """return group assignment."""
@@ -83,85 +85,58 @@ class ManifoldClusterModel(nn.Module):
     self.D = D  # ambient dimension
     self.N = N  # number of data points
 
-    # assignment "activation" function
-    # self.C_activ = nn.ReLU()
-    # assignment noise
-    self.C_sigma = C_sigma
-    self.register_buffer('C_noise', Variable(torch.Tensor(n)))
-
     if group_models:
       # quick check to make sure group models constructed correctly
       assert (len(group_models) == n and group_models[0].d == d and
           group_models[0].D == D)
-      self.group_models = group_models
     else:
       group_models = [SubspaceModel(d, D) for _ in range(n)]
-    # add group models as sub-modules
-    for ii in range(n):
-      self.add_module('gm{}'.format(ii), group_models[ii])
+    self.group_models = nn.ModuleList(group_models)
 
     # assignment and coefficient matrices, used with sparse embedding.
     self.C = nn.Parameter(torch.Tensor(N, n))
-    self.V = nn.Parameter(torch.Tensor(N, d))
+    self.V = nn.Parameter(torch.Tensor(N, n, d))
     self.reset_parameters()
     return
 
   def reset_parameters(self):
     """Initialize V with entries drawn from normal with std 1/sqrt(d), and C
     with entries uniform in [0, 1]."""
-    V_std = 1. / np.sqrt(self.d)
+    V_std = .1 / np.sqrt(self.d)
     self.V.data.normal_(0., V_std)
-    # C_mean = 1. / self.n
-    # C_std = 0.5 / self.n
-    # self.C.data.uniform_(C_mean - C_std, C_mean + C_std)
-    self.C.data.normal_(0., 1.)
+    C_mean = 1. / self.n
+    C_std = 0.1 / self.n
+    self.C.data.uniform_(C_mean - C_std, C_mean + C_std)
     return
 
   def forward(self, ii):
     """compute manifold embedding for ith data point(s)."""
-    # find cluster assignment and manifold coefficients for current data points
+    # find cluster assignment and compute "activation"
     c = F.embedding(ii, self.C)
-    v = F.embedding(ii, self.V)
-
-    # assignment noise
-    if self.training and self.C_sigma > 0:
-      self.C_noise.normal_(0., self.C_sigma)
-      # c += torch.abs(self.C_noise)
-      c += self.C_noise
-    # assignment "activation"
-    c = F.softmax(c, dim=1)
-
-    # compute embeddings for each group
-    X = torch.stack([gm(v) for gm in self.group_models], dim=2)
-    X = X*c.view(-1, 1, self.n)
-    x = torch.sum(X, dim=2)
+    c = torch.abs(c)
+    # compute embeddings for each group and weighted sum
+    # NOTE: is this efficient on gpu/cpu?
+    x = sum((c[:, jj].view(-1, 1)*gm(F.embedding(ii, self.V[:, jj, :]))
+        for jj, gm in enumerate(self.group_models)))
     return x
 
-  def reg(self, ii=None):
+  def reg(self, ii):
     """compute regularization on model parameters and representation
     coefficients."""
     Ureg = sum((gm.reg() for gm in self.group_models))
-
-    if ii is None:
-      c = self.C
-      v = self.V
-    else:
-      c = F.embedding(ii, self.C)
-      v = F.embedding(ii, self.V)
-
-    # NOTE: average over N dimension, this might not be well justified. But
-    # intuitively I don't want the strength of the regularization parameter
-    # changing with N (same as with loss)
-    Vreg = 0.5*torch.mean(torch.sum(v**2, dim=1))
-    # Creg = torch.mean(torch.sum(torch.abs(c), 1))
-    # NOTE: cross-entropy loss with max entry = target to encourage 1-sparse
-    # assignment. bit of a hack.
-    maxc, _ = torch.max(c, dim=1, keepdim=True)
-    Creg = torch.mean(torch.log(torch.sum(torch.exp(c - maxc), dim=1)))
+    Ureg = Ureg / self.N
+    # mean l2 squared regularization on V
+    Vreg = 0.5*sum((torch.mean(
+        torch.sum(F.embedding(ii, self.V[:, jj, :])**2, dim=1))
+        for jj in range(self.n)))
+    # mean l1 regularization on C
+    c = F.embedding(ii, self.C)
+    c = torch.abs(c)
+    Creg = torch.mean(torch.sum(c, dim=1))
     return Ureg, Vreg, Creg
 
   def get_groups(self):
-    groups = torch.argmax(self.C, dim=1).numpy()
+    groups = torch.argmax(self.C.data.detach(), dim=1).numpy()
     return groups
 
 
@@ -187,7 +162,7 @@ class SubspaceModel(nn.Module):
 
   def reset_parameters(self):
     """Initialize U, b with entries drawn from normal with std 1/sqrt(D)."""
-    std = 1. / np.sqrt(self.D)
+    std = .1 / np.sqrt(self.D)
     self.U.data.normal_(0., std)
     if self.b is not None:
       self.b.data.normal_(0., std)
@@ -200,8 +175,8 @@ class SubspaceModel(nn.Module):
 
   def reg(self):
     """Compute L2 regularization on subspace basis."""
-    # reg = 0.5*torch.sum(self.U**2)
-    reg = torch.norm(self.U)
+    reg = 0.5*torch.sum(self.U**2)
+    # reg = torch.norm(self.U)
     return reg
 
 
