@@ -16,13 +16,13 @@ import torch
 import torch.optim as optim
 
 from datasets import SynthUoSDataset
-from models import ManifoldClusterModel, SubspaceModel
+import models as mo
 import utils as ut
 
 import ipdb
 
 CHKP_FREQ = 1000
-STOP_FREQ = 200
+STOP_FREQ = 1000
 LR_INCR_FREQ = 100
 
 
@@ -47,28 +47,26 @@ def main():
       batch_size=batch_size, shuffle=(batch_size != N), **kwargs)
 
   # construct model
-  group_models = [SubspaceModel(args.d, args.D, args.affine)
+  group_models = [mo.SubspaceModel(args.d, args.D, args.affine)
       for _ in range(args.n)]
-  model = ManifoldClusterModel(args.n, args.d, args.D, N, group_models)
-  # model = GSManifoldClusterModel(args.n, args.d, args.D, N, group_models)
+  if args.model == 'seg':
+    model = mo.SegManifoldClusterModel(args.n, args.d, args.D, N, group_models)
+  elif args.model == 'gs':
+    model = mo.GSManifoldClusterModel(args.n, args.d, args.D, N, group_models)
+  else:
+    raise ValueError('model {} not supported'.format(args.model))
 
   # objective function
   def objfun(model, ii, x):
-
-    x_ = model(ii)
-    # measure whether reconstruction x_ is close in size to x.
-    norm_x = torch.norm(x.detach(), 2, dim=1)
-    norm_x_ = torch.norm(x_.detach(), 2, dim=1)
-    norm_x_ = torch.mean(norm_x_ / (norm_x + 1e-8))
+    x_, Ureg, Vreg, sprs = model(ii)
     # loss, reg, obj
     loss = torch.mean(torch.sum((x - x_)**2, dim=1))
-    Ureg, Vreg, Creg = model.reg(ii)
-    reg = args.U_lamb*Ureg + args.V_lamb*Vreg + args.C_gamma*Creg
-    # reg = args.UV_lamb*model.reg(ii)
-    # Ureg, Vreg = model.reg(ii)
-    # reg = args.U_lamb*Ureg + args.V_lamb*Vreg
+    reg = args.U_lamb*Ureg + args.V_lamb*Vreg
     obj = loss + reg
-    return obj, loss, reg, Ureg, Vreg, Creg, norm_x_
+    # measure also whether reconstruction x_ is close in size to x.
+    norm_x_ = torch.mean(torch.norm(x_.detach(), 2, dim=1) /
+        (torch.norm(x.detach(), 2, dim=1) + 1e-8))
+    return obj, loss, reg, Ureg, Vreg, sprs, norm_x_
 
   # optimizer & lr schedule
   optimizer = optim.SGD(model.parameters(), lr=args.init_lr,
@@ -77,18 +75,20 @@ def main():
       factor=0.5, patience=50, threshold=1e-4)
 
   printformstr = ('(epoch {:d}/{:d}) lr={:.3e} err={:.4f} obj={:.3e} '
-      'loss={:.3e} reg(U)(V)(C)={:.3e},{:.3e},{:.3e},{:.3e} '
+      'loss={:.3e} reg(U)(V)={:.3e},{:.3e},{:.3e} sprs={:.2f} '
       '|x_|={:.3e} samp/s={:.0f}')
-  logheader = 'Epoch,LR,Err,Obj,Loss,Reg,U.reg,V.reg,C.reg,Norm.x_,Samp.s'
-  logformstr = '{:d},{:.9e},{:.9f},{:.9e},{:.9e},{:.9e},{:.9e},{:.9e},{:.0f}'
+  logheader = 'Epoch,LR,Err,Obj,Loss,Reg,U.reg,V.reg,Sprs,Norm.x_,Samp.s'
+  logformstr = '{:d},{:.9e},{:.9f},{:.9e},{:.9e},{:.9e},{:.9f},{:.9e},{:.0f}'
   val_logf = '{}/val_log.csv'.format(args.out_dir)
   with open(val_logf, 'w') as f:
     print(logheader, file=f)
 
+  ipdb.set_trace()
+
   # training loop
   best_obj = float('inf')
   for epoch in range(args.epochs):
-    obj, loss, reg, Ureg, Vreg, Creg, norm_x_, sampsec = train_epoch(
+    obj, loss, reg, Ureg, Vreg, sprs, norm_x_, sampsec = train_epoch(
         model, objfun, synth_data_loader, device, optimizer)
     cluster_error, groups = ut.eval_cluster_error(model.get_groups(),
         synth_dataset.groups)
@@ -96,9 +96,9 @@ def main():
 
     with open(val_logf, 'a') as f:
       print(logformstr.format(epoch, lr, cluster_error, obj, loss, reg,
-          Ureg, Vreg, Creg, norm_x_, sampsec), file=f)
+          Ureg, Vreg, sprs, norm_x_, sampsec), file=f)
     print(printformstr.format(epoch, args.epochs, lr, cluster_error, obj, loss,
-        reg, Ureg, Vreg, Creg, norm_x_, sampsec))
+        reg, Ureg, Vreg, sprs, norm_x_, sampsec))
 
     is_best = obj < best_obj
     best_obj = min(obj, best_obj)
@@ -126,13 +126,13 @@ def main():
 def train_epoch(model, objfun, data_loader, device, optimizer):
   model.train()
   (obj, loss, reg, Ureg, Vreg,
-      Creg, norm_x_, sampsec) = [ut.AverageMeter() for _ in range(8)]
+      sprs, norm_x_, sampsec) = [ut.AverageMeter() for _ in range(8)]
   tic = time.time()
   for kk, (ii, x) in enumerate(data_loader):
     # forward
     ii, x = ii.to(device), x.to(device)
     (batch_obj, batch_loss, batch_reg, batch_Ureg, batch_Vreg,
-        batch_Creg, batch_norm_x_) = objfun(model, ii, x)
+        batch_sprs, batch_norm_x_) = objfun(model, ii, x)
     batch_size = x.size(0)
 
     # backward
@@ -145,7 +145,7 @@ def train_epoch(model, objfun, data_loader, device, optimizer):
     reg.update(batch_reg, batch_size)
     Ureg.update(batch_Ureg, batch_size)
     Vreg.update(batch_Vreg, batch_size)
-    Creg.update(batch_Creg, batch_size)
+    sprs.update(batch_sprs, batch_size)
     norm_x_.update(batch_norm_x_, batch_size)
 
     batch_time = time.time() - tic
@@ -156,7 +156,7 @@ def train_epoch(model, objfun, data_loader, device, optimizer):
     if divergence:
       raise RuntimeError('Divergence! NaN objective.')
   return (obj.avg, loss.avg, reg.avg,
-      Ureg.avg, Vreg.avg, Creg.avg, norm_x_.avg, sampsec.avg)
+      Ureg.avg, Vreg.avg, sprs.avg, norm_x_.avg, sampsec.avg)
 
 
 if __name__ == '__main__':
@@ -179,16 +179,12 @@ if __name__ == '__main__':
   parser.add_argument('--data-seed', type=int, default=1904,
                       help='Data random seed [default: 1904]')
   # model settings
-  # parser.add_argument('--UV-lamb', type=float, default=.01,
-  #                     help='U, V l2 reg parameter [default: .01]')
+  parser.add_argument('--model', type=str, default='seg',
+                      help='Cluster model (seg or gs) [default: seg].')
   parser.add_argument('--U-lamb', type=float, default=.01,
                       help='U reg parameter [default: .01]')
   parser.add_argument('--V-lamb', type=float, default=.01,
                       help='V reg parameter [default: .01]')
-  parser.add_argument('--C-gamma', type=float, default=.01,
-                      help='C l1 reg parameter [default: .01]')
-  # parser.add_argument('--C-sigma', type=float, default=0.,
-  #                     help='C noise sigma [default: 0.]')
   # training settings
   parser.add_argument('--batch-size', type=int, default=-1,
                       help='Input batch size for training [default: -1]')

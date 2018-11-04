@@ -7,9 +7,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+import ipdb
+
 
 class GSManifoldClusterModel(nn.Module):
-  """Model of union of low-dimensional manifolds."""
+  """Model of union of low-dimensional manifolds with segmentation coded by
+  group sparsity pattern."""
   def __init__(self, n, d, D, N, group_models=None):
     super(GSManifoldClusterModel, self).__init__()
 
@@ -27,7 +30,7 @@ class GSManifoldClusterModel(nn.Module):
     self.group_models = nn.ModuleList(group_models)
 
     # coefficient matrices, used with sparse embedding.
-    self.V = nn.Parameter(torch.Tensor(N, n, d))
+    self.V = nn.Parameter(torch.Tensor(N, d, n))
     self.reset_parameters()
     return
 
@@ -41,31 +44,25 @@ class GSManifoldClusterModel(nn.Module):
     """compute manifold embedding for ith data point(s)."""
     # compute embeddings for each group and sum
     # NOTE: is this efficient on gpu/cpu?
-    x = sum((gm(F.embedding(ii, self.V[:, jj, :])) for jj, gm in
-        enumerate(self.group_models)))
-    return x
+    ipdb.set_trace()
+    v = [F.embedding(ii, self.V[:, :, jj]) for jj in range(self.n)]
+    x_ = sum((gm(v[jj]) for jj, gm in enumerate(self.group_models)))
 
-  def reg(self, ii):
-    """compute regularization on model parameters and representation
-    coefficients."""
-    # NOTE: switched reg form from product to sum with squared l2 on U
-    # this will change meaning of reg parameters used in tests on 10/22/18.
+    # evaluate regularizer
     Ureg = sum((gm.reg() for gm in self.group_models))
-    # NOTE: added division by N on afternoon of 10/23, to try to address
-    # regularization imbalance issue.
+    # NOTE: division by N used to try to balance U & V regularizers
     Ureg = Ureg / self.N
-    # group sparsity norm on V: summing l2 norms of each of n coefficient
-    # vectors (size d).
-    Vreg = sum((torch.norm(F.embedding(ii, self.V[:, jj, :]), 2, dim=1)
-        for jj in range(self.n)))
+    Vnorms = torch.stack([torch.norm(v[jj], 2, dim=1)
+        for jj in range(self.n)], dim=1)
+    Vreg = torch.sum(Vnorms, dim=1)
     Vreg = torch.mean(Vreg)
-    # reg = Ureg + Vreg
-    # Ureg = [gm.reg() for gm in self.group_models]
-    # NOTE: was torch.sum during first test of batch size on 10/22/18
-    # Vreg = [torch.mean(torch.norm(F.embedding(ii, self.V[:,jj,:]), 2, dim=1))
-    #     for jj in range(self.n)]
-    # reg = sum((ureg*vreg for ureg, vreg in zip(Ureg, Vreg)))
-    return Ureg, Vreg
+
+    # and robust sparsity.
+    Vnorms = Vnorms.detach()
+    Vmaxnorm, _ = torch.max(Vnorms, dim=1, keepdim=True)
+    sprs = torch.sum(Vnorms / Vmaxnorm, dim=1)
+    sprs = torch.mean(sprs)
+    return x_, Ureg, Vreg, sprs
 
   def get_groups(self):
     """return group assignment."""
@@ -74,11 +71,10 @@ class GSManifoldClusterModel(nn.Module):
     return groups
 
 
-class ManifoldClusterModel(nn.Module):
-  """Model of union of low-dimensional manifolds."""
-  def __init__(self, n, d, D, N, C_sigma=0.,
-        group_models=None):
-    super(ManifoldClusterModel, self).__init__()
+class SegManifoldClusterModel(nn.Module):
+  """Model of union of low-dimensional manifolds with explicit segmentation."""
+  def __init__(self, n, d, D, N, group_models=None):
+    super(SegManifoldClusterModel, self).__init__()
 
     self.n = n  # number of groups
     self.d = d  # dimension of manifold
@@ -95,45 +91,42 @@ class ManifoldClusterModel(nn.Module):
 
     # assignment and coefficient matrices, used with sparse embedding.
     self.C = nn.Parameter(torch.Tensor(N, n))
-    self.V = nn.Parameter(torch.Tensor(N, n, d))
+    self.V = nn.Parameter(torch.Tensor(N, d, n))
     self.reset_parameters()
     return
 
   def reset_parameters(self):
-    """Initialize V with entries drawn from normal with std 1/sqrt(d), and C
-    with entries uniform in [0, 1]."""
+    """Initialize V with entries drawn from normal with std 0.1/sqrt(d), and C
+    with entries from normal distribution, sigma=0.1."""
     V_std = .1 / np.sqrt(self.d)
     self.V.data.normal_(0., V_std)
-    C_mean = 1. / self.n
-    C_std = 0.1 / self.n
-    self.C.data.uniform_(C_mean - C_std, C_mean + C_std)
+    self.C.data.normal_(0., 0.1)
     return
 
   def forward(self, ii):
     """compute manifold embedding for ith data point(s)."""
-    # find cluster assignment and compute "activation"
+    # find cluster assignment and compute softmax "activation"
     c = F.embedding(ii, self.C)
-    c = torch.abs(c)
+    c = F.softmax(c, dim=1)
     # compute embeddings for each group and weighted sum
     # NOTE: is this efficient on gpu/cpu?
-    x = sum((c[:, jj].view(-1, 1)*gm(F.embedding(ii, self.V[:, jj, :]))
-        for jj, gm in enumerate(self.group_models)))
-    return x
+    v = [F.embedding(ii, self.V[:, :, jj]) for jj in range(self.n)]
+    x_ = sum((c[:, jj].view(-1, 1)*gm(v[jj]) for jj, gm in
+        enumerate(self.group_models)))
 
-  def reg(self, ii):
-    """compute regularization on model parameters and representation
-    coefficients."""
+    # evaluate regularizer
     Ureg = sum((gm.reg() for gm in self.group_models))
+    # NOTE: division by N used to try to balance U & V regularizers
     Ureg = Ureg / self.N
-    # mean l2 squared regularization on V
-    Vreg = 0.5*sum((torch.mean(
-        torch.sum(F.embedding(ii, self.V[:, jj, :])**2, dim=1))
-        for jj in range(self.n)))
-    # mean l1 regularization on C
-    c = F.embedding(ii, self.C)
-    c = torch.abs(c)
-    Creg = torch.mean(torch.sum(c, dim=1))
-    return Ureg, Vreg, Creg
+    Vreg = 0.5*sum((torch.sum(v[jj]**2, dim=1) for jj in range(self.n)))
+    Vreg = torch.mean(Vreg)
+
+    # and robust sparsity
+    c = c.detach()
+    cmax, _ = torch.max(c, dim=1, keepdim=True)
+    sprs = torch.sum(c / cmax, dim=1)
+    sprs = torch.mean(sprs)
+    return x_, Ureg, Vreg, sprs
 
   def get_groups(self):
     groups = torch.argmax(self.C.data.detach(), dim=1).numpy()
@@ -176,7 +169,6 @@ class SubspaceModel(nn.Module):
   def reg(self):
     """Compute L2 regularization on subspace basis."""
     reg = 0.5*torch.sum(self.U**2)
-    # reg = torch.norm(self.U)
     return reg
 
 
