@@ -17,6 +17,7 @@ import torch.optim as optim
 
 from datasets import SynthUoSDataset
 import models as mo
+import optimizers as op
 import utils as ut
 
 import ipdb
@@ -60,8 +61,13 @@ def main():
     raise ValueError('model {} not supported'.format(args.model))
 
   # optimizer & lr schedule
-  optimizer = optim.SGD(model.parameters(), lr=args.init_lr,
-      momentum=0.0)
+  param_groups = [{'name': 'C', 'params': [model.c]},
+      {'name': 'V', 'params': [model.v]},
+      {'name': 'U', 'params': model.group_models.parameters()}]
+  optimizer = op.KManifoldSparseSGD(param_groups, N, lr=args.init_lr,
+      momentum=0.9, nesterov=True)
+  # optimizer = optim.SGD(model.parameters(), lr=args.init_lr,
+  #     momentum=0.0)
   # optimizer = optim.SGD(model.parameters(), lr=args.init_lr,
   #     momentum=0.9, nesterov=True)
   # optimizer = optim.Adam(model.parameters(), lr=args.init_lr,
@@ -135,7 +141,7 @@ def train_epoch(model, data_loader, device, optimizer):
     # backward
     optimizer.zero_grad()
     batch_obj.backward()
-    optimizer.step()
+    optimizer.step(ii)
     model.update_full(ii)
 
     obj.update(batch_obj, batch_size)
