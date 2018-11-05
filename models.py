@@ -7,8 +7,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-import ipdb
-
 
 class GSManifoldClusterModel(nn.Module):
   """Model of union of low-dimensional manifolds with segmentation coded by
@@ -44,25 +42,42 @@ class GSManifoldClusterModel(nn.Module):
     """compute manifold embedding for ith data point(s)."""
     # compute embeddings for each group and sum
     # NOTE: is this efficient on gpu/cpu?
-    ipdb.set_trace()
-    v = [F.embedding(ii, self.V[:, :, jj]) for jj in range(self.n)]
-    x_ = sum((gm(v[jj]) for jj, gm in enumerate(self.group_models)))
+    v = torch.stack([F.embedding(ii, self.V[:, :, jj])
+        for jj in range(self.n)], dim=2)
+    x_ = sum((gm(v[:, :, jj]) for jj, gm in enumerate(self.group_models)))
+    return x_, v
+
+  def objective(self, ii, x, U_lamb, V_lamb):
+    """evaluate objective, loss, regularizer, and auxiliary measures."""
+    x_, v = self(ii)
+
+    # evaluate least-squares loss
+    loss = torch.mean(torch.sum((x - x_)**2, dim=1))
 
     # evaluate regularizer
     Ureg = sum((gm.reg() for gm in self.group_models))
     # NOTE: division by N used to try to balance U & V regularizers
     Ureg = Ureg / self.N
-    Vnorms = torch.stack([torch.norm(v[jj], 2, dim=1)
-        for jj in range(self.n)], dim=1)
+    Vnorms = torch.norm(v, 2, dim=1)
     Vreg = torch.sum(Vnorms, dim=1)
     Vreg = torch.mean(Vreg)
 
-    # and robust sparsity.
+    # compute objective
+    reg = U_lamb*Ureg + V_lamb*Vreg
+    obj = loss + reg
+
+    # measure robust sparsity
     Vnorms = Vnorms.detach()
     Vmaxnorm, _ = torch.max(Vnorms, dim=1, keepdim=True)
     sprs = torch.sum(Vnorms / Vmaxnorm, dim=1)
     sprs = torch.mean(sprs)
-    return x_, Ureg, Vreg, sprs
+
+    # also whether reconstruction x_ is close in size to x.
+    x_ = x_.detach()
+    x = x.detach()
+    norm_x_ = torch.mean(torch.norm(x_, 2, dim=1) /
+        (torch.norm(x, 2, dim=1) + 1e-8))
+    return obj, loss, reg, Ureg, Vreg, sprs, norm_x_
 
   def get_groups(self):
     """return group assignment."""
@@ -110,23 +125,125 @@ class SegManifoldClusterModel(nn.Module):
     c = F.softmax(c, dim=1)
     # compute embeddings for each group and weighted sum
     # NOTE: is this efficient on gpu/cpu?
-    v = [F.embedding(ii, self.V[:, :, jj]) for jj in range(self.n)]
-    x_ = sum((c[:, jj].view(-1, 1)*gm(v[jj]) for jj, gm in
+    v = torch.stack([F.embedding(ii, self.V[:, :, jj])
+        for jj in range(self.n)], dim=2)
+    x_ = sum((c[:, jj].view(-1, 1)*gm(v[:, :, jj]) for jj, gm in
         enumerate(self.group_models)))
+    return x_, c, v
+
+  def objective(self, ii, x, U_lamb, V_lamb):
+    """evaluate objective, loss, regularizer, and auxiliary measures."""
+    x_, c, v = self(ii)
+
+    # evaluate least-squares loss
+    loss = torch.mean(torch.sum((x - x_)**2, dim=1))
 
     # evaluate regularizer
     Ureg = sum((gm.reg() for gm in self.group_models))
     # NOTE: division by N used to try to balance U & V regularizers
     Ureg = Ureg / self.N
-    Vreg = 0.5*sum((torch.sum(v[jj]**2, dim=1) for jj in range(self.n)))
+    Vreg = 0.5*torch.sum(v.view(-1, self.d*self.n)**2, dim=1)
     Vreg = torch.mean(Vreg)
 
-    # and robust sparsity
+    # compute objective
+    reg = U_lamb*Ureg + V_lamb*Vreg
+    obj = loss + reg
+
+    # measure robust sparsity
     c = c.detach()
     cmax, _ = torch.max(c, dim=1, keepdim=True)
     sprs = torch.sum(c / cmax, dim=1)
     sprs = torch.mean(sprs)
-    return x_, Ureg, Vreg, sprs
+
+    # measure also whether reconstruction x_ is close in size to x.
+    x_ = x_.detach()
+    x = x.detach()
+    norm_x_ = torch.mean(torch.norm(x_, 2, dim=1) /
+        (torch.norm(x, 2, dim=1) + 1e-8))
+    return obj, loss, reg, Ureg, Vreg, sprs, norm_x_
+
+  def get_groups(self):
+    groups = torch.argmax(self.C.data.detach(), dim=1).numpy()
+    return groups
+
+
+class KManifoldClusterModel(nn.Module):
+  """Model of union of low-dimensional manifolds generalizing
+  k-means/k-subspaces."""
+  def __init__(self, n, d, D, N, group_models=None):
+    super(KManifoldClusterModel, self).__init__()
+
+    self.n = n  # number of groups
+    self.d = d  # dimension of manifold
+    self.D = D  # ambient dimension
+    self.N = N  # number of data points
+
+    if group_models:
+      # quick check to make sure group models constructed correctly
+      assert (len(group_models) == n and group_models[0].d == d and
+          group_models[0].D == D)
+    else:
+      group_models = [SubspaceModel(d, D) for _ in range(n)]
+    self.group_models = nn.ModuleList(group_models)
+
+    # assignment and coefficient matrices, used with sparse embedding.
+    self.C = nn.Parameter(torch.Tensor(N, n))
+    self.V = nn.Parameter(torch.Tensor(N, d, n))
+    self.reset_parameters()
+    return
+
+  def reset_parameters(self):
+    """Initialize V with entries drawn from normal with std 0.1/sqrt(d), and C
+    with entries from normal distribution, sigma=0.1."""
+    V_std = .1 / np.sqrt(self.d)
+    self.V.data.normal_(0., V_std)
+    self.C.data.normal_(0., 0.1)
+    return
+
+  def forward(self, ii):
+    """compute manifold embedding for ith data point(s)."""
+    # find cluster assignment and compute softmax "activation"
+    c = F.embedding(ii, self.C)
+    c = F.softmax(c, dim=1)
+    # compute embeddings for each group and concatenate
+    # NOTE: is this efficient on gpu/cpu?
+    v = torch.stack([F.embedding(ii, self.V[:, :, jj])
+        for jj in range(self.n)], dim=2)
+    x_ = torch.stack([gm(v[:, :, jj])
+        for jj, gm in enumerate(self.group_models)], dim=2)
+    return x_, c, v
+
+  def objective(self, ii, x, U_lamb, V_lamb):
+    """evaluate objective, loss, regularizer, and auxiliary measures."""
+    x_, c, v = self(ii)
+
+    # evaluate loss: least-squares weighted by assignment, as in k-means.
+    loss = torch.sum((x.view(-1, self.D, 1) - x_)**2, dim=1)
+    loss = torch.mean(torch.sum(c*loss, dim=1))
+
+    # evaluate reg: l2 squared, weighted by assignment in case of V.
+    Ureg = sum((gm.reg() for gm in self.group_models))
+    # NOTE: division by N used to try to balance U & V regularizers
+    Ureg = Ureg / self.N
+    Vreg = 0.5*torch.sum(c*torch.sum(v**2, dim=1), dim=1)
+    Vreg = torch.mean(Vreg)
+
+    # compute objective
+    reg = U_lamb*Ureg + V_lamb*Vreg
+    obj = loss + reg
+
+    # measure robust sparsity
+    c = c.detach()
+    cmax, _ = torch.max(c, dim=1, keepdim=True)
+    sprs = torch.sum(c / cmax, dim=1)
+    sprs = torch.mean(sprs)
+
+    # and also whether reconstruction x_ is close in size to x.
+    x = x.detach()
+    x_ = x_.detach()
+    norm_x_ = torch.sum(c*torch.norm(x_, 2, dim=1), dim=1)
+    norm_x_ = torch.mean(norm_x_ / (torch.norm(x, 2, dim=1) + 1e-8))
+    return obj, loss, reg, Ureg, Vreg, sprs, norm_x_
 
   def get_groups(self):
     groups = torch.argmax(self.C.data.detach(), dim=1).numpy()

@@ -22,7 +22,7 @@ import utils as ut
 import ipdb
 
 CHKP_FREQ = 1000
-STOP_FREQ = 1000
+STOP_FREQ = 100
 LR_INCR_FREQ = 100
 
 
@@ -49,24 +49,14 @@ def main():
   # construct model
   group_models = [mo.SubspaceModel(args.d, args.D, args.affine)
       for _ in range(args.n)]
-  if args.model == 'seg':
+  if args.model == 'k':
+    model = mo.KManifoldClusterModel(args.n, args.d, args.D, N, group_models)
+  elif args.model == 'seg':
     model = mo.SegManifoldClusterModel(args.n, args.d, args.D, N, group_models)
   elif args.model == 'gs':
     model = mo.GSManifoldClusterModel(args.n, args.d, args.D, N, group_models)
   else:
     raise ValueError('model {} not supported'.format(args.model))
-
-  # objective function
-  def objfun(model, ii, x):
-    x_, Ureg, Vreg, sprs = model(ii)
-    # loss, reg, obj
-    loss = torch.mean(torch.sum((x - x_)**2, dim=1))
-    reg = args.U_lamb*Ureg + args.V_lamb*Vreg
-    obj = loss + reg
-    # measure also whether reconstruction x_ is close in size to x.
-    norm_x_ = torch.mean(torch.norm(x_.detach(), 2, dim=1) /
-        (torch.norm(x.detach(), 2, dim=1) + 1e-8))
-    return obj, loss, reg, Ureg, Vreg, sprs, norm_x_
 
   # optimizer & lr schedule
   optimizer = optim.SGD(model.parameters(), lr=args.init_lr,
@@ -89,7 +79,7 @@ def main():
   best_obj = float('inf')
   for epoch in range(args.epochs):
     obj, loss, reg, Ureg, Vreg, sprs, norm_x_, sampsec = train_epoch(
-        model, objfun, synth_data_loader, device, optimizer)
+        model, synth_data_loader, device, optimizer)
     cluster_error, groups = ut.eval_cluster_error(model.get_groups(),
         synth_dataset.groups)
     lr = ut.get_learning_rate(optimizer)
@@ -123,7 +113,7 @@ def main():
   return
 
 
-def train_epoch(model, objfun, data_loader, device, optimizer):
+def train_epoch(model, data_loader, device, optimizer):
   model.train()
   (obj, loss, reg, Ureg, Vreg,
       sprs, norm_x_, sampsec) = [ut.AverageMeter() for _ in range(8)]
@@ -131,8 +121,8 @@ def train_epoch(model, objfun, data_loader, device, optimizer):
   for kk, (ii, x) in enumerate(data_loader):
     # forward
     ii, x = ii.to(device), x.to(device)
-    (batch_obj, batch_loss, batch_reg, batch_Ureg, batch_Vreg,
-        batch_sprs, batch_norm_x_) = objfun(model, ii, x)
+    (batch_obj, batch_loss, batch_reg, batch_Ureg, batch_Vreg, batch_sprs,
+        batch_norm_x_) = model.objective(ii, x, args.U_lamb, args.V_lamb)
     batch_size = x.size(0)
 
     # backward
@@ -180,7 +170,7 @@ if __name__ == '__main__':
                       help='Data random seed [default: 1904]')
   # model settings
   parser.add_argument('--model', type=str, default='seg',
-                      help='Cluster model (seg or gs) [default: seg].')
+                      help='Cluster model (k, seg, gs) [default: k].')
   parser.add_argument('--U-lamb', type=float, default=.01,
                       help='U reg parameter [default: .01]')
   parser.add_argument('--V-lamb', type=float, default=.01,
