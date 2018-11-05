@@ -50,7 +50,8 @@ def main():
   group_models = [mo.SubspaceModel(args.d, args.D, args.affine)
       for _ in range(args.n)]
   if args.model == 'k':
-    model = mo.KManifoldClusterModel(args.n, args.d, args.D, N, group_models)
+    model = mo.KManifoldClusterModel(args.n, args.d, args.D, N,
+        args.batch_size, group_models)
   elif args.model == 'seg':
     model = mo.SegManifoldClusterModel(args.n, args.d, args.D, N, group_models)
   elif args.model == 'gs':
@@ -133,6 +134,7 @@ def train_epoch(model, data_loader, device, optimizer):
     optimizer.zero_grad()
     batch_obj.backward()
     optimizer.step()
+    model.update_full(ii)
 
     obj.update(batch_obj, batch_size)
     loss.update(batch_loss, batch_size)

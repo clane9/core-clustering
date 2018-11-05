@@ -180,7 +180,7 @@ class SegManifoldClusterModel(nn.Module):
 class KManifoldClusterModel(nn.Module):
   """Model of union of low-dimensional manifolds generalizing
   k-means/k-subspaces."""
-  def __init__(self, n, d, D, N, group_models=None, C_sigma=0.0):
+  def __init__(self, n, d, D, N, batch_size, group_models=None, C_sigma=0.0):
     super(KManifoldClusterModel, self).__init__()
 
     self.n = n  # number of groups
@@ -188,6 +188,7 @@ class KManifoldClusterModel(nn.Module):
     self.D = D  # ambient dimension
     self.N = N  # number of data points
 
+    self.batch_size = batch_size
     self.C_sigma = C_sigma
 
     if group_models:
@@ -199,8 +200,10 @@ class KManifoldClusterModel(nn.Module):
     self.group_models = nn.ModuleList(group_models)
 
     # assignment and coefficient matrices, used with sparse embedding.
-    self.C = nn.Parameter(torch.Tensor(N, n))
-    self.V = nn.Parameter(torch.Tensor(N, d, n))
+    self.C = torch.Tensor(N, n)
+    self.V = torch.Tensor(N, d, n)
+    self.c = nn.Parameter(torch.Tensor(batch_size, n))
+    self.v = nn.Parameter(torch.Tensor(batch_size, d, n))
     self.reset_parameters()
     return
 
@@ -215,28 +218,31 @@ class KManifoldClusterModel(nn.Module):
 
   def forward(self, ii):
     """compute manifold embedding for ith data point(s)."""
-    # find cluster assignment and compute "activation"
-    c = F.embedding(ii, self.C, sparse=EMBED_SPARSE)
-    c = self.segactiv(c)
+    # copy mini-batch segmentation and coefficients from full
+    # NOTE: also tried sharing data using set_, but for some reason it didn't
+    # work despite a restricted example working fine in console. Copying might
+    # be safer anyway.
+    self.c.data.copy_(self.C.data[ii, :])
+    self.v.data.copy_(self.V.data[ii, :, :])
+    # segmentation "activation"
+    c = self.segactiv(self.c)
     # compute embeddings for each group and concatenate
     # NOTE: is this efficient on gpu/cpu?
-    v = torch.stack([F.embedding(ii, self.V[:, :, jj], sparse=EMBED_SPARSE)
-        for jj in range(self.n)], dim=2)
-    x_ = torch.stack([gm(v[:, :, jj])
+    x_ = torch.stack([gm(self.v[:, :, jj])
         for jj, gm in enumerate(self.group_models)], dim=2)
-    return x_, c, v
+    return x_, c, self.v
 
   def segactiv(self, c):
     """compute cluster assignment "activation"."""
     # c = F.softmax(c, dim=1)
+    # NOTE: no more in place operations, might create problems for backward
     if self.training and self.C_sigma > 0:
       cmax, _ = torch.max(c.detach(), dim=1, keepdim=True)
-      c.add_(self.C_sigma*(torch.randn(*c.shape)*cmax))
-    c.pow_(2)
-    # c.add_(.01)
+      c = c + self.C_sigma*(torch.randn(*c.shape)*cmax)
+    c = c**2
     csum = torch.sum(c, dim=1, keepdim=True)
-    c.div_(csum + 1e-8)
-    c.clamp_(0.1/self.n, 1.0)
+    c = c / (csum + 1e-8)
+    c = torch.clamp(c, 0.1/self.n, 1.0)
     return c
 
   def objective(self, ii, x, U_lamb, V_lamb):
@@ -270,6 +276,13 @@ class KManifoldClusterModel(nn.Module):
     norm_x_ = torch.sum(c*torch.norm(x_, 2, dim=1), dim=1)
     norm_x_ = torch.mean(norm_x_ / (torch.norm(x, 2, dim=1) + 1e-8))
     return obj, loss, reg, Ureg, Vreg, sprs, norm_x_
+
+  def update_full(self, ii):
+    """update full segmentation coefficients with values from current
+    mini-batch."""
+    self.C[ii, :] = self.c.data.clone()
+    self.V[ii, :, :] = self.v.data.clone()
+    return
 
   def get_groups(self):
     groups = torch.argmax(self.C.data.detach(), dim=1).numpy()
