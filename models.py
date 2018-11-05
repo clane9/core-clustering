@@ -7,6 +7,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+# NOTE: sparse gradients are necessary to avoid O(N) cost per iteration
+# (absolutely necessary for good performance!!). But currently they cause
+# failure during backward.
+EMBED_SPARSE = False
+
 
 class GSManifoldClusterModel(nn.Module):
   """Model of union of low-dimensional manifolds with segmentation coded by
@@ -42,7 +47,7 @@ class GSManifoldClusterModel(nn.Module):
     """compute manifold embedding for ith data point(s)."""
     # compute embeddings for each group and sum
     # NOTE: is this efficient on gpu/cpu?
-    v = torch.stack([F.embedding(ii, self.V[:, :, jj])
+    v = torch.stack([F.embedding(ii, self.V[:, :, jj], sparse=EMBED_SPARSE)
         for jj in range(self.n)], dim=2)
     x_ = sum((gm(v[:, :, jj]) for jj, gm in enumerate(self.group_models)))
     return x_, v
@@ -121,15 +126,20 @@ class SegManifoldClusterModel(nn.Module):
   def forward(self, ii):
     """compute manifold embedding for ith data point(s)."""
     # find cluster assignment and compute softmax "activation"
-    c = F.embedding(ii, self.C)
-    c = F.softmax(c, dim=1)
+    c = F.embedding(ii, self.C, sparse=EMBED_SPARSE)
+    c = self.segactiv(c)
     # compute embeddings for each group and weighted sum
     # NOTE: is this efficient on gpu/cpu?
-    v = torch.stack([F.embedding(ii, self.V[:, :, jj])
+    v = torch.stack([F.embedding(ii, self.V[:, :, jj], sparse=EMBED_SPARSE)
         for jj in range(self.n)], dim=2)
     x_ = sum((c[:, jj].view(-1, 1)*gm(v[:, :, jj]) for jj, gm in
         enumerate(self.group_models)))
     return x_, c, v
+
+  def segactiv(self, c):
+    """compute cluster assignment "activation"."""
+    c = F.softmax(c, dim=1)
+    return c
 
   def objective(self, ii, x, U_lamb, V_lamb):
     """evaluate objective, loss, regularizer, and auxiliary measures."""
@@ -170,13 +180,15 @@ class SegManifoldClusterModel(nn.Module):
 class KManifoldClusterModel(nn.Module):
   """Model of union of low-dimensional manifolds generalizing
   k-means/k-subspaces."""
-  def __init__(self, n, d, D, N, group_models=None):
+  def __init__(self, n, d, D, N, group_models=None, C_sigma=0.0):
     super(KManifoldClusterModel, self).__init__()
 
     self.n = n  # number of groups
     self.d = d  # dimension of manifold
     self.D = D  # ambient dimension
     self.N = N  # number of data points
+
+    self.C_sigma = C_sigma
 
     if group_models:
       # quick check to make sure group models constructed correctly
@@ -197,21 +209,35 @@ class KManifoldClusterModel(nn.Module):
     with entries from normal distribution, sigma=0.1."""
     V_std = .1 / np.sqrt(self.d)
     self.V.data.normal_(0., V_std)
-    self.C.data.normal_(0., 0.1)
+    # self.C.data.normal_(0., 0.1)
+    self.C.data.normal_(1., 0.01)
     return
 
   def forward(self, ii):
     """compute manifold embedding for ith data point(s)."""
-    # find cluster assignment and compute softmax "activation"
-    c = F.embedding(ii, self.C)
-    c = F.softmax(c, dim=1)
+    # find cluster assignment and compute "activation"
+    c = F.embedding(ii, self.C, sparse=EMBED_SPARSE)
+    c = self.segactiv(c)
     # compute embeddings for each group and concatenate
     # NOTE: is this efficient on gpu/cpu?
-    v = torch.stack([F.embedding(ii, self.V[:, :, jj])
+    v = torch.stack([F.embedding(ii, self.V[:, :, jj], sparse=EMBED_SPARSE)
         for jj in range(self.n)], dim=2)
     x_ = torch.stack([gm(v[:, :, jj])
         for jj, gm in enumerate(self.group_models)], dim=2)
     return x_, c, v
+
+  def segactiv(self, c):
+    """compute cluster assignment "activation"."""
+    # c = F.softmax(c, dim=1)
+    if self.training and self.C_sigma > 0:
+      cmax, _ = torch.max(c.detach(), dim=1, keepdim=True)
+      c.add_(self.C_sigma*(torch.randn(*c.shape)*cmax))
+    c.pow_(2)
+    # c.add_(.01)
+    csum = torch.sum(c, dim=1, keepdim=True)
+    c.div_(csum + 1e-8)
+    c.clamp_(0.1/self.n, 1.0)
+    return c
 
   def objective(self, ii, x, U_lamb, V_lamb):
     """evaluate objective, loss, regularizer, and auxiliary measures."""
