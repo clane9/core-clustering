@@ -229,14 +229,14 @@ class KManifoldClusterModel(nn.Module):
   def segactiv(self, c):
     """compute cluster assignment "activation"."""
     # c = F.softmax(c, dim=1)
+    # NOTE: no more in place operations, might create problems for backward
     if self.training and self.C_sigma > 0:
       cmax, _ = torch.max(c.detach(), dim=1, keepdim=True)
-      c.add_(self.C_sigma*(torch.randn(*c.shape)*cmax))
-    c.pow_(2)
-    # c.add_(.01)
+      c = c + self.C_sigma*(torch.randn(*c.shape)*cmax)
+    c = c**2
     csum = torch.sum(c, dim=1, keepdim=True)
-    c.div_(csum + 1e-8)
-    c.clamp_(0.1/self.n, 1.0)
+    c = c / (csum + 1e-8)
+    c = torch.clamp(c, 0.1/self.n, 1.0)
     return c
 
   def objective(self, ii, x, U_lamb, V_lamb):
