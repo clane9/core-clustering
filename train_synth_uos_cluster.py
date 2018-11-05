@@ -59,10 +59,10 @@ def main():
     raise ValueError('model {} not supported'.format(args.model))
 
   # optimizer & lr schedule
-  optimizer = optim.SGD(model.parameters(), lr=args.init_lr,
-      momentum=0.0)
   # optimizer = optim.SGD(model.parameters(), lr=args.init_lr,
-  #     momentum=0.9, nesterov=True)
+  #     momentum=0.0)
+  optimizer = optim.SGD(model.parameters(), lr=args.init_lr,
+      momentum=0.9, nesterov=True)
   # optimizer = optim.Adam(model.parameters(), lr=args.init_lr,
   #     amsgrad=False)
   # optimizer = optim.RMSprop(model.parameters(), lr=args.init_lr,
