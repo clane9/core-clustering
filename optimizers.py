@@ -5,7 +5,7 @@ import numpy as np
 import torch
 import torch.optim as optim
 
-C_EPS = .05
+C_EPS = .005
 
 
 class KManifoldSparseSGD(optim.Optimizer):
@@ -49,10 +49,9 @@ class KManifoldSparseSGD(optim.Optimizer):
     return
 
   def set_soft_assign(self, soft_assign=0.0):
-    if soft_assign < 0.0 or soft_assign >= 1.0:
-      raise ValueError("soft assignment must be in [0, 1)")
+    if soft_assign < 0.0:
+      raise ValueError("soft assignment must be >= 0")
     self.soft_assign = soft_assign
-    self.l2_tau = soft_assign*(1./np.sqrt(self.n)) + (1-soft_assign)*1
     return
 
   def step(self, ii, losses, prevc):
@@ -75,7 +74,7 @@ class KManifoldSparseSGD(optim.Optimizer):
           p.data.zero_()
           p.data.scatter_(1, minidx, 1)
         else:
-          p.data.copy_(find_soft_assign(losses, self.l2_tau))
+          p.data.copy_(find_soft_assign(losses, self.soft_assign))
         # NOTE: add small eps to avoid divide by zero in case using V_scale
         # this will also affect U updates very slightly.
         p.data.add_(C_EPS / self.n)
@@ -122,7 +121,18 @@ class KManifoldSparseSGD(optim.Optimizer):
     return
 
 
-def find_soft_assign(losses, l2_tau=1.0, maxit=10):
+def find_soft_assign(losses, T=1.):
+  """heuristic soft assignment found by shifting up negative losses by T."""
+  # normalize loss to that T has consistent interpretation.
+  loss_min, _ = losses.min(dim=1, keepdim=True)
+  # NOTE: minimum loss can't be exactly zero
+  losses = losses.div(loss_min)
+  c = torch.clamp(-losses + 1. + T, min=0)
+  c = c.div(c.sum(dim=1, keepdim=True))
+  return c
+
+
+def find_soft_assign_exact(losses, l2_tau=1.0, maxit=10):
   """soft assignment based on losses, using l2 constraint. Solved by
   naive bisection."""
   batch_size, n = losses.shape
