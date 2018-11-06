@@ -65,7 +65,7 @@ def main():
       {'name': 'V', 'params': [model.v]},
       {'name': 'U', 'params': model.group_models.parameters()}]
   optimizer = op.KManifoldSparseSGD(param_groups, N, lr=args.init_lr,
-      momentum=0.9, nesterov=True)
+      momentum=0.9, nesterov=True, C_exact=True, V_scale=True)
   # optimizer = optim.SGD(model.parameters(), lr=args.init_lr,
   #     momentum=0.0)
   # optimizer = optim.SGD(model.parameters(), lr=args.init_lr,
@@ -135,13 +135,14 @@ def train_epoch(model, data_loader, device, optimizer):
     # forward
     ii, x = ii.to(device), x.to(device)
     (batch_obj, batch_loss, batch_reg, batch_Ureg, batch_Vreg, batch_sprs,
-        batch_norm_x_) = model.objective(ii, x, args.U_lamb, args.V_lamb)
+        batch_norm_x_, losses, cactiv) = model.objective(ii, x,
+            args.U_lamb, args.V_lamb)
     batch_size = x.size(0)
 
     # backward
     optimizer.zero_grad()
     batch_obj.backward()
-    optimizer.step(ii)
+    optimizer.step(ii, losses, cactiv)
     model.update_full(ii)
 
     obj.update(batch_obj, batch_size)

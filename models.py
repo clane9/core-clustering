@@ -11,6 +11,7 @@ import torch.nn.functional as F
 # (absolutely necessary for good performance!!). But currently they cause
 # failure during backward.
 EMBED_SPARSE = False
+C_EPS = .05
 
 
 class GSManifoldClusterModel(nn.Module):
@@ -180,16 +181,14 @@ class SegManifoldClusterModel(nn.Module):
 class KManifoldClusterModel(nn.Module):
   """Model of union of low-dimensional manifolds generalizing
   k-means/k-subspaces."""
-  def __init__(self, n, d, D, N, batch_size, group_models=None, C_sigma=0.0):
+  def __init__(self, n, d, D, N, batch_size, group_models=None):
     super(KManifoldClusterModel, self).__init__()
 
     self.n = n  # number of groups
     self.d = d  # dimension of manifold
     self.D = D  # ambient dimension
     self.N = N  # number of data points
-
     self.batch_size = batch_size
-    self.C_sigma = C_sigma
 
     if group_models:
       # quick check to make sure group models constructed correctly
@@ -234,15 +233,10 @@ class KManifoldClusterModel(nn.Module):
 
   def segactiv(self, c):
     """compute cluster assignment "activation"."""
-    # c = F.softmax(c, dim=1)
-    # NOTE: no more in place operations, might create problems for backward
-    if self.training and self.C_sigma > 0:
-      cmax, _ = torch.max(c.detach(), dim=1, keepdim=True)
-      c = c + self.C_sigma*(torch.randn(*c.shape)*cmax)
-    c = c**2
+    c = c.abs()
     csum = torch.sum(c, dim=1, keepdim=True)
     c = c / (csum + 1e-8)
-    c = torch.clamp(c, 0.1/self.n, 1.0)
+    c = torch.clamp(c, C_EPS/self.n, 1.0)
     return c
 
   def objective(self, ii, x, U_lamb, V_lamb):
@@ -250,8 +244,9 @@ class KManifoldClusterModel(nn.Module):
     x_, c, v = self(ii)
 
     # evaluate loss: least-squares weighted by assignment, as in k-means.
-    loss = torch.sum((x.view(-1, self.D, 1) - x_)**2, dim=1)
-    loss = torch.mean(torch.sum(c*loss, dim=1))
+    losses = torch.sum((x.unsqueeze(2) - x_)**2, dim=1)
+    loss = torch.mean(torch.sum(c*losses, dim=1))
+    losses = losses.detach()
 
     # evaluate reg: l2 squared, weighted by assignment in case of V.
     Ureg = sum((gm.reg() for gm in self.group_models))
@@ -275,7 +270,7 @@ class KManifoldClusterModel(nn.Module):
     x_ = x_.detach()
     norm_x_ = torch.sum(c*torch.norm(x_, 2, dim=1), dim=1)
     norm_x_ = torch.mean(norm_x_ / (torch.norm(x, 2, dim=1) + 1e-8))
-    return obj, loss, reg, Ureg, Vreg, sprs, norm_x_
+    return obj, loss, reg, Ureg, Vreg, sprs, norm_x_, losses, c
 
   def update_full(self, ii):
     """update full segmentation coefficients with values from current
