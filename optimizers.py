@@ -1,7 +1,6 @@
 from __future__ import print_function
 from __future__ import division
 
-import numpy as np
 import torch
 import torch.optim as optim
 
@@ -49,8 +48,10 @@ class KManifoldSparseSGD(optim.Optimizer):
     return
 
   def set_soft_assign(self, soft_assign=0.0):
-    if soft_assign < 0.0:
-      raise ValueError("soft assignment must be >= 0")
+    """set soft assignment parameter. larger values mean softer, closer to
+    uniform distribution."""
+    if soft_assign <= 0.0:
+      raise ValueError("soft assignment must be > 0")
     self.soft_assign = soft_assign
     return
 
@@ -60,6 +61,9 @@ class KManifoldSparseSGD(optim.Optimizer):
     Args:
       ii (LongTensor): indices corresponding to current mini-batch. Used to
         look up correct momentum buffers for C, V.
+      losses (Tensor): (batch_size, n) losses for exact C update.
+      prevc (Tensor): (batch_size, n) previous segmentation coefficients for
+        scaling V gradients.
     """
     for group in self.param_groups:
       group_name = group['name']
@@ -122,51 +126,30 @@ class KManifoldSparseSGD(optim.Optimizer):
 
 
 def find_soft_assign(losses, T=1.):
-  """heuristic soft assignment found by shifting up negative losses by T."""
+  """soft assignment found by shifting up negative losses by T, thresholding
+  and normalizing.
+
+  Args:
+    losses (Tensor): (batch_size, n) matrix of loss values.
+    T (float): soft assignment parameter in (0, \infty).
+
+  .. note::
+    For any T there is a tau such that the returned c is a solution to
+
+      min_c c^T l  s.t.  c >= 0, c^T 1 = 1, ||c||_2^2 <= tau
+
+    Since the optimality conditions of this problem yield
+
+      c^* = 1/gamma( lambda \1 - l)_+
+
+    for gamma, lambda Lagrange multipliers.
+  """
+  if T <= 0:
+    raise ValueError("soft assignment T must be > 0.")
   # normalize loss to that T has consistent interpretation.
-  loss_min, _ = losses.min(dim=1, keepdim=True)
   # NOTE: minimum loss can't be exactly zero
-  losses = losses.div(loss_min)
-  c = torch.clamp(-losses + 1. + T, min=0)
-  c = c.div(c.sum(dim=1, keepdim=True))
-  return c
-
-
-def find_soft_assign_exact(losses, l2_tau=1.0, maxit=10):
-  """soft assignment based on losses, using l2 constraint. Solved by
-  naive bisection."""
-  batch_size, n = losses.shape
-  if l2_tau <= np.sqrt(1./n):
-    raise ValueError("l2 constraint must be strictly greater than sqrt(1/n)")
-
-  # normalize loss to that shrinkage has consistent scale.
   loss_min, _ = losses.min(dim=1, keepdim=True)
-  # NOTE: minimum loss can't be exactly zero
   losses = losses.div(loss_min)
-
-  ones = torch.ones_like(losses)
-  shrink_scale = 0.5*torch.ones(batch_size, 1)
-  shrink_min = torch.zeros(batch_size, 1)
-  shrink_max = torch.ones(batch_size, 1)
-
-  c = torch.clamp(ones - shrink_scale*losses, min=0)
+  c = torch.clamp(T + 1. - losses, min=0.)
   c = c.div(c.sum(dim=1, keepdim=True))
-  for kk in range(maxit):
-    cnorm = torch.norm(c, 2, dim=1, keepdim=True)
-
-    # norm is too big, need to decrease scale to make assignment more uniform
-    bigmask = cnorm > l2_tau
-    shrink_max[bigmask] = shrink_scale[bigmask]
-    shrink_scale[bigmask] = 0.5*(shrink_scale[bigmask] +
-        shrink_min[bigmask])
-
-    # norm is too small, need to increase scale to make assignment more peaked
-    smallmask = cnorm <= l2_tau
-    shrink_min[smallmask] = shrink_scale[smallmask]
-    shrink_scale[smallmask] = 0.5*(shrink_scale[smallmask] +
-        shrink_max[smallmask])
-
-    # update assignment
-    c = torch.clamp(ones - shrink_scale*losses, min=0)
-    c = c.div(c.sum(dim=1, keepdim=True))
   return c
