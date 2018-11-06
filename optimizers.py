@@ -122,22 +122,22 @@ class KManifoldSparseSGD(optim.Optimizer):
     return
 
 
-def find_soft_assign(losses, l2_tau=1.0, maxit=20):
+def find_soft_assign(losses, l2_tau=1.0, maxit=10):
   """soft assignment based on losses, using l2 constraint. Solved by
   naive bisection."""
-  n = losses.shape[1]
+  batch_size, n = losses.shape
   if l2_tau <= np.sqrt(1./n):
     raise ValueError("l2 constraint must be strictly greater than sqrt(1/n)")
 
   # normalize loss to that shrinkage has consistent scale.
-  loss_min = losses.min(dim=1, keepdim=True)
+  loss_min, _ = losses.min(dim=1, keepdim=True)
   # NOTE: minimum loss can't be exactly zero
   losses = losses.div(loss_min)
 
   ones = torch.ones_like(losses)
-  shrink_scale = 0.5*torch.ones_like(losses)
-  shrink_min = torch.zeros_like(losses)
-  shrink_max = torch.ones_like(losses)
+  shrink_scale = 0.5*torch.ones(batch_size, 1)
+  shrink_min = torch.zeros(batch_size, 1)
+  shrink_max = torch.ones(batch_size, 1)
 
   c = torch.clamp(ones - shrink_scale*losses, min=0)
   c = c.div(c.sum(dim=1, keepdim=True))
