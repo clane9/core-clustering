@@ -43,7 +43,8 @@ class SynthUoSDataset(Dataset):
       self.groups[ii*Ng:(ii+1)*Ng] = ii
 
     if sigma > 0.:
-      self.X += sigma*rng.randn(D, self.N)
+      E = (sigma/np.sqrt(D))*rng.randn(D, self.N)
+      self.X += E
 
     self.X = torch.tensor(self.X, dtype=torch.float32)
     return
