@@ -4,7 +4,7 @@ from __future__ import division
 import torch
 import torch.optim as optim
 
-C_EPS = .005
+C_EPS = .01
 
 
 class KManifoldSparseSGD(optim.Optimizer):
