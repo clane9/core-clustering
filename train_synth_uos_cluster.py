@@ -22,7 +22,7 @@ import utils as ut
 
 import ipdb
 
-CHKP_FREQ = 100
+CHKP_FREQ = 50
 STOP_FREQ = -1
 
 
@@ -32,6 +32,7 @@ def main():
 
   use_cuda = args.cuda and torch.cuda.is_available()
   device = torch.device('cuda' if use_cuda else 'cpu')
+  torch.set_num_threads(args.num_threads)
 
   # construct dataset
   synth_dataset = dat.SynthUoSDataset(args.n, args.d, args.D, args.Ng,
@@ -40,7 +41,7 @@ def main():
   batch_size = args.batch_size
   if args.batch_size <= 0 or args.batch_size > N:
     batch_size = N
-  kwargs = {'num_workers': 1}
+  kwargs = {'num_workers': 0}
   if use_cuda:
     kwargs['pin_memory'] = True
   synth_data_loader = torch.utils.data.DataLoader(synth_dataset,
@@ -65,7 +66,8 @@ def main():
       'loss={:.3e} reg(U)(V)={:.3e},{:.3e},{:.3e} sprs={:.2f} '
       '|x_|={:.3e} samp/s={:.0f}')
   logheader = 'Epoch,LR,Err,Obj,Loss,Reg,U.reg,V.reg,Sprs,Norm.x_,Samp.s'
-  logformstr = '{:d},{:.9e},{:.9f},{:.9e},{:.9e},{:.9e},{:.9f},{:.9e},{:.0f}'
+  logformstr = ('{:d},{:.9e},{:.9f},{:.9e},{:.9e},{:.9e},{:.9e},{:.9e},'
+      '{:.9e},{:.9e},{:.0f}')
   val_logf = '{}/val_log.csv'.format(args.out_dir)
   with open(val_logf, 'w') as f:
     print(logheader, file=f)
@@ -87,7 +89,7 @@ def main():
 
     is_best = obj < best_obj
     best_obj = min(obj, best_obj)
-    if is_best or epoch == 1 or epoch % CHKP_FREQ == 0:
+    if epoch == 1 or epoch % CHKP_FREQ == 0:
       ut.save_checkpoint({
           'epoch': epoch,
           'model': model.state_dict(),
@@ -95,7 +97,7 @@ def main():
           'err': cluster_error,
           'obj': obj},
           is_best,
-          filename='{}/checkpoint.pth.tar'.format(args.out_dir),
+          filename='{}/checkpoint{}.pth.tar'.format(args.out_dir, epoch),
           best_filename='{}/model_best.pth.tar'.format(args.out_dir))
 
     scheduler.step(obj)
@@ -180,6 +182,8 @@ if __name__ == '__main__':
                       help='Initial learning rate [default: 0.5]')
   parser.add_argument('--cuda', action='store_true', default=False,
                       help='Enables CUDA training')
+  parser.add_argument('--num-threads', type=int, default=4,
+                      help='Number of parallel threads to use [default: 4]')
   parser.add_argument('--seed', type=int, default=2018,
                       help='Training random seed [default: 2018]')
   args = parser.parse_args()
