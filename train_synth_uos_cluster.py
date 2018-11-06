@@ -50,30 +50,15 @@ def main():
   # construct model
   group_models = [mo.SubspaceModel(args.d, args.D, args.affine)
       for _ in range(args.n)]
-  if args.model == 'k':
-    model = mo.KManifoldClusterModel(args.n, args.d, args.D, N,
-        args.batch_size, group_models)
-  elif args.model == 'seg':
-    model = mo.SegManifoldClusterModel(args.n, args.d, args.D, N, group_models)
-  elif args.model == 'gs':
-    model = mo.GSManifoldClusterModel(args.n, args.d, args.D, N, group_models)
-  else:
-    raise ValueError('model {} not supported'.format(args.model))
+  model = mo.KManifoldClusterModel(args.n, args.d, args.D, N,
+      args.batch_size, group_models)
 
   # optimizer & lr schedule
   param_groups = [{'name': 'C', 'params': [model.c]},
       {'name': 'V', 'params': [model.v]},
       {'name': 'U', 'params': model.group_models.parameters()}]
-  optimizer = op.KManifoldSparseSGD(param_groups, N, lr=args.init_lr,
-      momentum=0.9, nesterov=True, C_exact=True, V_scale=True)
-  # optimizer = optim.SGD(model.parameters(), lr=args.init_lr,
-  #     momentum=0.0)
-  # optimizer = optim.SGD(model.parameters(), lr=args.init_lr,
-  #     momentum=0.9, nesterov=True)
-  # optimizer = optim.Adam(model.parameters(), lr=args.init_lr,
-  #     amsgrad=False)
-  # optimizer = optim.RMSprop(model.parameters(), lr=args.init_lr,
-  #     momentum=0.9)
+  optimizer = op.KManifoldSparseSGD(param_groups, args.n, N, lr=args.init_lr,
+      momentum=0.9, nesterov=True, soft_assign=args.soft_assign)
   scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer,
       factor=0.5, patience=50, threshold=1e-4)
 
@@ -90,7 +75,7 @@ def main():
 
   # training loop
   best_obj = float('inf')
-  for epoch in range(args.epochs):
+  for epoch in range(1, args.epochs+1):
     obj, loss, reg, Ureg, Vreg, sprs, norm_x_, sampsec = train_epoch(
         model, synth_data_loader, device, optimizer)
     cluster_error, groups = ut.eval_cluster_error(model.get_groups(),
@@ -107,7 +92,7 @@ def main():
     best_obj = min(obj, best_obj)
     if is_best or epoch % CHKP_FREQ == 0:
       ut.save_checkpoint({
-          'epoch': epoch+1,
+          'epoch': epoch,
           'model': model.state_dict(),
           'optimizer': optimizer.state_dict(),
           'err': cluster_error,
@@ -117,12 +102,10 @@ def main():
           best_filename='{}/model_best.pth.tar'.format(args.out_dir))
 
     scheduler.step(obj)
+    optimizer.set_soft_assign(args.soft_assign/(epoch+1))
 
     if epoch % STOP_FREQ == 0:
       ipdb.set_trace()
-
-    # if epoch % LR_INCR_FREQ == 0:
-    #   ut.adjust_learning_rate(optimizer, 1.1*lr)
   return
 
 
@@ -135,14 +118,13 @@ def train_epoch(model, data_loader, device, optimizer):
     # forward
     ii, x = ii.to(device), x.to(device)
     (batch_obj, batch_loss, batch_reg, batch_Ureg, batch_Vreg, batch_sprs,
-        batch_norm_x_, losses, cactiv) = model.objective(ii, x,
-            args.U_lamb, args.V_lamb)
+        batch_norm_x_, losses, c) = model.objective(ii, x, args.lamb)
     batch_size = x.size(0)
 
     # backward
     optimizer.zero_grad()
     batch_obj.backward()
-    optimizer.step(ii, losses, cactiv)
+    optimizer.step(ii, losses, c)
     model.update_full(ii)
 
     obj.update(batch_obj, batch_size)
@@ -184,19 +166,17 @@ if __name__ == '__main__':
   parser.add_argument('--data-seed', type=int, default=1904,
                       help='Data random seed [default: 1904]')
   # model settings
-  parser.add_argument('--model', type=str, default='seg',
-                      help='Cluster model (k, seg, gs) [default: k].')
-  parser.add_argument('--U-lamb', type=float, default=.01,
-                      help='U reg parameter [default: .01]')
-  parser.add_argument('--V-lamb', type=float, default=.01,
-                      help='V reg parameter [default: .01]')
+  parser.add_argument('--lamb', type=float, default=.1,
+                      help='reg parameter [default: .1]')
+  parser.add_argument('--soft-assign', type=float, default=0.0,
+                      help='soft assignment parameter [default: 0.0]')
   # training settings
-  parser.add_argument('--batch-size', type=int, default=-1,
-                      help='Input batch size for training [default: -1]')
-  parser.add_argument('--epochs', type=int, default=5000,
-                      help='Number of epochs to train [default: 500]')
-  parser.add_argument('--init-lr', type=float, default=0.01,
-                      help='Initial learning rate [default: 0.01]')
+  parser.add_argument('--batch-size', type=int, default=20,
+                      help='Input batch size for training [default: 20]')
+  parser.add_argument('--epochs', type=int, default=1000,
+                      help='Number of epochs to train [default: 1000]')
+  parser.add_argument('--init-lr', type=float, default=0.5,
+                      help='Initial learning rate [default: 0.5]')
   parser.add_argument('--no-cuda', action='store_true', default=False,
                       help='Disables CUDA training')
   parser.add_argument('--seed', type=int, default=2018,

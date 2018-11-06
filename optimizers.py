@@ -1,10 +1,9 @@
 from __future__ import print_function
 from __future__ import division
 
+import numpy as np
 import torch
 import torch.optim as optim
-
-import ipdb
 
 C_EPS = .05
 
@@ -17,16 +16,17 @@ class KManifoldSparseSGD(optim.Optimizer):
     params (iterable): iterable of parameter group dicts. assumes each group
       has a 'name' key, and takes special care of 'C' and 'V' groups where
       gradients are sparse.
-    N (int): number of examples in dataset.
+    n (int): number of groups
+    N (int): number of examples in dataset
     lr (float): learning rate
     momentum (float, optional): momentum factor (default: 0)
     nesterov (bool, optional): enables Nesterov momentum (default: False)
-    C_exact (bool, optional): update segmentation C in closed form.
-    V_scale (bool, optional): scale V step by 1/C to accelerate.
+    soft_assign (float, optional): update segmentation using soft assignment.
+      0=exact, 1=uniform assignment (default: 0)
   """
 
-  def __init__(self, params, N, lr, momentum=0., nesterov=False,
-        C_exact=False, V_scale=False):
+  def __init__(self, params, n, N, lr, momentum=0., nesterov=False,
+        soft_assign=0.0):
     if lr < 0.0:
       raise ValueError("Invalid learning rate: {}".format(lr))
     if momentum < 0.0:
@@ -37,9 +37,9 @@ class KManifoldSparseSGD(optim.Optimizer):
     defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov)
     super(KManifoldSparseSGD, self).__init__(params, defaults)
 
+    self.n = n
     self.N = N
-    self.C_exact = C_exact
-    self.V_scale = V_scale
+    self.set_soft_assign(soft_assign)
     return
 
   def __setstate__(self, state):
@@ -48,7 +48,14 @@ class KManifoldSparseSGD(optim.Optimizer):
       group.setdefault('nesterov', False)
     return
 
-  def step(self, ii, losses=None, cactiv=None):
+  def set_soft_assign(self, soft_assign=0.0):
+    if soft_assign < 0.0 or soft_assign >= 1.0:
+      raise ValueError("soft assignment must be in [0, 1)")
+    self.soft_assign = soft_assign
+    self.l2_tau = soft_assign*(1./np.sqrt(self.n)) + (1-soft_assign)*1
+    return
+
+  def step(self, ii, losses, prevc):
     """Performs a single optimization step.
 
     Args:
@@ -60,15 +67,19 @@ class KManifoldSparseSGD(optim.Optimizer):
       momentum = group['momentum']
       nesterov = group['nesterov']
 
-      if group_name == 'C' and self.C_exact and (not losses is None):
+      if group_name == 'C':
         # update C in closed form
         p = group['params'][0]
-        assignidx = torch.argmin(losses, dim=1, keepdim=True)
+        if self.soft_assign <= 0:
+          minidx = losses.argmin(dim=1, keepdim=True)
+          p.data.zero_()
+          p.data.scatter_(1, minidx, 1)
+        else:
+          p.data.copy_(find_soft_assign(losses, self.l2_tau))
         # NOTE: add small eps to avoid divide by zero in case using V_scale
         # this will also affect U updates very slightly.
-        n = p.data.shape[1]
-        p.data.zero_().add_(C_EPS / n)
-        p.data.scatter_(1, assignidx, 1-C_EPS*(n-1)/n)
+        p.data.add_(C_EPS / self.n)
+        p.data.div_(p.data.sum(dim=1, keepdim=True))
         continue
 
       for p in group['params']:
@@ -76,9 +87,9 @@ class KManifoldSparseSGD(optim.Optimizer):
           continue
         d_p = p.grad.data
 
-        if group_name == 'V' and self.V_scale and (not cactiv is None):
+        if group_name == 'V':
           # rescale gradients to compensate for c scaling on objective wrt V.
-          d_p.div_(cactiv.unsqueeze(1))
+          d_p.div_(prevc.unsqueeze(1))
 
         if momentum != 0:
           param_state = self.state[p]
@@ -109,3 +120,43 @@ class KManifoldSparseSGD(optim.Optimizer):
 
         p.data.add_(-group['lr'], d_p)
     return
+
+
+def find_soft_assign(losses, l2_tau=1.0, maxit=20):
+  """soft assignment based on losses, using l2 constraint. Solved by
+  naive bisection."""
+  n = losses.shape[1]
+  if l2_tau <= np.sqrt(1./n):
+    raise ValueError("l2 constraint must be strictly greater than sqrt(1/n)")
+
+  # normalize loss to that shrinkage has consistent scale.
+  loss_min = losses.min(dim=1, keepdim=True)
+  # NOTE: minimum loss can't be exactly zero
+  losses = losses.div(loss_min)
+
+  ones = torch.ones_like(losses)
+  shrink_scale = 0.5*torch.ones_like(losses)
+  shrink_min = torch.zeros_like(losses)
+  shrink_max = torch.ones_like(losses)
+
+  c = torch.clamp(ones - shrink_scale*losses, min=0)
+  c = c.div(c.sum(dim=1, keepdim=True))
+  for kk in range(maxit):
+    cnorm = torch.norm(c, 2, dim=1, keepdim=True)
+
+    # norm is too big, need to decrease scale to make assignment more uniform
+    bigmask = cnorm > l2_tau
+    shrink_max[bigmask] = shrink_scale[bigmask]
+    shrink_scale[bigmask] = 0.5*(shrink_scale[bigmask] +
+        shrink_min[bigmask])
+
+    # norm is too small, need to increase scale to make assignment more peaked
+    smallmask = cnorm <= l2_tau
+    shrink_min[smallmask] = shrink_scale[smallmask]
+    shrink_scale[smallmask] = 0.5*(shrink_scale[smallmask] +
+        shrink_max[smallmask])
+
+    # update assignment
+    c = torch.clamp(ones - shrink_scale*losses, min=0)
+    c = c.div(c.sum(dim=1, keepdim=True))
+  return c
