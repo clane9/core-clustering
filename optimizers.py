@@ -50,8 +50,8 @@ class KManifoldSparseSGD(optim.Optimizer):
   def set_soft_assign(self, soft_assign=0.0):
     """set soft assignment parameter. larger values mean softer, closer to
     uniform distribution."""
-    if soft_assign <= 0.0:
-      raise ValueError("soft assignment must be > 0")
+    if soft_assign < 0.0:
+      raise ValueError("soft assignment must be >= 0")
     self.soft_assign = soft_assign
     return
 
