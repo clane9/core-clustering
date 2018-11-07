@@ -161,18 +161,16 @@ class ResidualManifoldModel(nn.Module):
     self.res_lamb = res_lamb  # residual weights regularization parameter
 
     self.subspace_embedding = SubspaceModel(d, D, affine=True)
-    self.res_fc1 = nn.Linear(D, self.H, bias=True)
+    self.res_fc1 = nn.Linear(d, self.H, bias=False)
     self.res_fc2 = nn.Linear(self.H, D, bias=False)
     return
 
   def forward(self, v):
     """Compute residual manifold embedding using coefficients v."""
     x = self.subspace_embedding(v)
-    # NOTE: residual computed on x, but perhaps it should be computed on v?
-    # Shouldn't make a difference since both are d-dimensional.
-    z = F.relu(self.res_fc1(x))
+    z = F.relu(self.res_fc1(v))
     z = F.dropout(z, p=self.drop_p, training=self.training)
-    z = self.fc2(z)
+    z = self.res_fc2(z)
     x = x + z
     return x
 
