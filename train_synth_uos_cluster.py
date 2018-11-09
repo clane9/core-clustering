@@ -158,7 +158,7 @@ if __name__ == '__main__':
                       help='Subspace dimension [default: 10]')
   parser.add_argument('--D', type=int, default=100,
                       help='Ambient dimension [default: 100]')
-  parser.add_argument('--Ng', type=int, default=100,
+  parser.add_argument('--Ng', type=int, default=1000,
                       help='Points per group [default: 100]')
   parser.add_argument('--affine', action='store_true',
                       help='Affine setting')
@@ -169,21 +169,21 @@ if __name__ == '__main__':
   # model settings
   parser.add_argument('--lamb', type=float, default=.1,
                       help='reg parameter [default: .1]')
-  parser.add_argument('--soft-assign', type=float, default=0.0,
-                      help='soft assignment parameter [default: 0.0]')
+  parser.add_argument('--soft-assign', type=float, default=0.1,
+                      help='soft assignment parameter [default: 0.1]')
   parser.add_argument('--soft-assign-decay', action='store_true',
                       help='decay soft assignment parameter at a rate 1/k')
   # training settings
-  parser.add_argument('--batch-size', type=int, default=20,
-                      help='Input batch size for training [default: 20]')
+  parser.add_argument('--batch-size', type=int, default=100,
+                      help='Input batch size for training [default: 100]')
   parser.add_argument('--epochs', type=int, default=1000,
                       help='Number of epochs to train [default: 1000]')
   parser.add_argument('--init-lr', type=float, default=0.5,
                       help='Initial learning rate [default: 0.5]')
   parser.add_argument('--cuda', action='store_true', default=False,
                       help='Enables CUDA training')
-  parser.add_argument('--num-threads', type=int, default=4,
-                      help='Number of parallel threads to use [default: 4]')
+  parser.add_argument('--num-threads', type=int, default=1,
+                      help='Number of parallel threads to use [default: 1]')
   parser.add_argument('--seed', type=int, default=2018,
                       help='Training random seed [default: 2018]')
   args = parser.parse_args()
