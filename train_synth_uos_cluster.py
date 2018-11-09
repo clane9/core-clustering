@@ -23,7 +23,7 @@ import utils as ut
 import ipdb
 
 CHKP_FREQ = 50
-STOP_FREQ = -1
+STOP_FREQ = 10
 
 
 def main():
@@ -52,41 +52,41 @@ def main():
       for _ in range(args.n)]
   model = mod.KManifoldClusterModel(args.n, args.d, args.D, N,
       batch_size, group_models)
+  model = model.to(device)
 
   # optimizer & lr schedule
-  param_groups = [{'name': 'C', 'params': [model.c]},
-      {'name': 'V', 'params': [model.v]},
-      {'name': 'U', 'params': model.group_models.parameters()}]
-  optimizer = opt.KManifoldSparseSGD(param_groups, args.n, N, lr=args.init_lr,
-      momentum=0.9, nesterov=True, soft_assign=args.soft_assign)
+  optimizer = opt.KManifoldAltSGD(model, lr=args.init_lr, lamb_U=args.lamb,
+      lamb_V=args.lamb, momentum=0.9, nesterov=True,
+      soft_assign=args.soft_assign, maxit_V=args.maxit_V)
   scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer,
       factor=0.5, patience=50, threshold=1e-4)
 
   printformstr = ('(epoch {:d}/{:d}) lr={:.3e} err={:.4f} obj={:.3e} '
-      'loss={:.3e} reg(U)(V)={:.3e},{:.3e},{:.3e} sprs={:.2f} '
+      'loss={:.3e} reg(U)(V)={:.3e},{:.3e},{:.3e} Vdecr={:.3e} sprs={:.2f} '
       '|x_|={:.3e} samp/s={:.0f}')
-  logheader = 'Epoch,LR,Err,Obj,Loss,Reg,U.reg,V.reg,Sprs,Norm.x_,Samp.s'
+  logheader = ('Epoch,LR,Err,Obj,Loss,Reg,U.reg,V.reg,'
+      'V.decr,Sprs,Norm.x_,Samp.s')
   logformstr = ('{:d},{:.9e},{:.9f},{:.9e},{:.9e},{:.9e},{:.9e},{:.9e},'
-      '{:.9e},{:.9e},{:.0f}')
+      '{:.9e},{:.9e},{:.9e},{:.0f}')
   val_logf = '{}/val_log.csv'.format(args.out_dir)
   with open(val_logf, 'w') as f:
     print(logheader, file=f)
 
   # training loop
+  ipdb.set_trace()
   best_obj = float('inf')
+  model.train()
   for epoch in range(1, args.epochs+1):
-    obj, loss, reg, Ureg, Vreg, sprs, norm_x_, sampsec = train_epoch(
-        model, synth_data_loader, device, optimizer)
+    metrics = train_epoch(synth_data_loader, device, optimizer)
     cluster_error, _ = ut.eval_cluster_error(model.get_groups(),
         synth_dataset.groups)
     lr = ut.get_learning_rate(optimizer)
 
     with open(val_logf, 'a') as f:
-      print(logformstr.format(epoch, lr, cluster_error, obj, loss, reg,
-          Ureg, Vreg, sprs, norm_x_, sampsec), file=f)
-    print(printformstr.format(epoch, args.epochs, lr, cluster_error, obj, loss,
-        reg, Ureg, Vreg, sprs, norm_x_, sampsec))
+      print(logformstr.format(epoch, lr, cluster_error, *metrics), file=f)
+    print(printformstr.format(epoch, args.epochs, lr, cluster_error, *metrics))
 
+    obj = metrics[0]
     is_best = obj < best_obj
     best_obj = min(obj, best_obj)
     if epoch == 1 or epoch % CHKP_FREQ == 0:
@@ -109,30 +109,24 @@ def main():
   return
 
 
-def train_epoch(model, data_loader, device, optimizer):
+def train_epoch(data_loader, device, optimizer):
   """train model for one epoch and record convergence measures."""
-  model.train()
   (obj, loss, reg, Ureg, Vreg,
-      sprs, norm_x_, sampsec) = [ut.AverageMeter() for _ in range(8)]
+      Vdecr, sprs, norm_x_, sampsec) = [ut.AverageMeter() for _ in range(9)]
   tic = time.time()
   for kk, (ii, x) in enumerate(data_loader):
     # forward
     ii, x = ii.to(device), x.to(device)
-    (batch_obj, batch_loss, batch_reg, batch_Ureg, batch_Vreg, batch_sprs,
-        batch_norm_x_, losses, prevc) = model.objective(ii, x, args.lamb)
+    (batch_obj, batch_loss, batch_reg, batch_Ureg, batch_Vreg,
+        batch_Vdecr, batch_sprs, batch_norm_x_) = optimizer.step(ii, x)
     batch_size = x.size(0)
-
-    # backward
-    optimizer.zero_grad()
-    batch_obj.backward()
-    optimizer.step(ii, losses, prevc)
-    model.update_full(ii)
 
     obj.update(batch_obj, batch_size)
     loss.update(batch_loss, batch_size)
     reg.update(batch_reg, batch_size)
     Ureg.update(batch_Ureg, batch_size)
     Vreg.update(batch_Vreg, batch_size)
+    Vdecr.update(batch_Vdecr, batch_size)
     sprs.update(batch_sprs, batch_size)
     norm_x_.update(batch_norm_x_, batch_size)
 
@@ -144,7 +138,7 @@ def train_epoch(model, data_loader, device, optimizer):
     if divergence:
       raise RuntimeError('Divergence! NaN objective.')
   return (obj.avg, loss.avg, reg.avg,
-      Ureg.avg, Vreg.avg, sprs.avg, norm_x_.avg, sampsec.avg)
+      Ureg.avg, Vreg.avg, Vdecr.avg, sprs.avg, norm_x_.avg, sampsec.avg)
 
 
 if __name__ == '__main__':
@@ -158,8 +152,8 @@ if __name__ == '__main__':
                       help='Subspace dimension [default: 10]')
   parser.add_argument('--D', type=int, default=100,
                       help='Ambient dimension [default: 100]')
-  parser.add_argument('--Ng', type=int, default=100,
-                      help='Points per group [default: 100]')
+  parser.add_argument('--Ng', type=int, default=1000,
+                      help='Points per group [default: 1000]')
   parser.add_argument('--affine', action='store_true',
                       help='Affine setting')
   parser.add_argument('--sigma', type=float, default=0.,
@@ -169,21 +163,23 @@ if __name__ == '__main__':
   # model settings
   parser.add_argument('--lamb', type=float, default=.1,
                       help='reg parameter [default: .1]')
-  parser.add_argument('--soft-assign', type=float, default=0.0,
-                      help='soft assignment parameter [default: 0.0]')
+  parser.add_argument('--soft-assign', type=float, default=0.1,
+                      help='soft assignment parameter [default: 0.1]')
   parser.add_argument('--soft-assign-decay', action='store_true',
                       help='decay soft assignment parameter at a rate 1/k')
   # training settings
-  parser.add_argument('--batch-size', type=int, default=20,
-                      help='Input batch size for training [default: 20]')
+  parser.add_argument('--batch-size', type=int, default=100,
+                      help='Input batch size for training [default: 100]')
   parser.add_argument('--epochs', type=int, default=1000,
                       help='Number of epochs to train [default: 1000]')
   parser.add_argument('--init-lr', type=float, default=0.5,
                       help='Initial learning rate [default: 0.5]')
+  parser.add_argument('--maxit-V', type=int, default=1,
+                      help='Number of iterations for V update [default: 1]')
   parser.add_argument('--cuda', action='store_true', default=False,
                       help='Enables CUDA training')
-  parser.add_argument('--num-threads', type=int, default=4,
-                      help='Number of parallel threads to use [default: 4]')
+  parser.add_argument('--num-threads', type=int, default=1,
+                      help='Number of parallel threads to use [default: 1]')
   parser.add_argument('--seed', type=int, default=2018,
                       help='Training random seed [default: 2018]')
   args = parser.parse_args()

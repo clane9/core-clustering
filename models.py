@@ -29,8 +29,8 @@ class KManifoldClusterModel(nn.Module):
     self.group_models = nn.ModuleList(group_models)
 
     # assignment and coefficient matrices, used with sparse embedding.
-    self.C = torch.Tensor(N, n)
-    self.V = torch.Tensor(N, d, n)
+    self.register_buffer('C', torch.Tensor(N, n))
+    self.register_buffer('V', torch.Tensor(N, d, n))
     self.c = nn.Parameter(torch.Tensor(batch_size, n))
     self.v = nn.Parameter(torch.Tensor(batch_size, d, n))
     self.reset_parameters()
@@ -45,56 +45,85 @@ class KManifoldClusterModel(nn.Module):
     self.C.data.div_(self.C.data.sum(dim=1, keepdim=True))
     return
 
-  def forward(self, ii):
+  def forward(self, ii=None):
     """compute manifold embedding for ith data point(s)."""
-    # copy mini-batch segmentation and coefficients from full
-    # NOTE: also tried sharing data using set_, but for some reason it didn't
-    # work despite a restricted example working fine in console. Copying might
-    # be safer anyway.
-    self.c.data.copy_(self.C.data[ii, :])
-    self.v.data.copy_(self.V.data[ii, :, :])
+    if ii is not None:
+      self.set_cv(ii)
     # compute embeddings for each group and concatenate
     # NOTE: is this efficient on gpu/cpu?
     x_ = torch.stack([gm(self.v[:, :, jj])
         for jj, gm in enumerate(self.group_models)], dim=2)
     return x_
 
-  def objective(self, ii, x, lamb):
-    """evaluate objective, loss, regularizer, and auxiliary measures."""
-    x_ = self(ii)
+  def objective(self, x, ii=None, lamb_U=.01, lamb_V=None, wrt='all'):
+    if wrt not in ['all', 'V', 'C', 'U']:
+      raise ValueError(("Objective must be computed wrt 'all', "
+          "'V', 'C', or 'U'"))
+    lamb_V = lamb_U if lamb_V is None else lamb_V
 
     # evaluate loss: least-squares weighted by assignment, as in k-means.
-    losses = torch.sum((x.unsqueeze(2) - x_)**2, dim=1)
-    loss = torch.mean(torch.sum(self.c*losses, dim=1))
+    x_ = self(ii)
+    loss = torch.sum((x.unsqueeze(2) - x_)**2, dim=1)
+    if wrt in ['all', 'U']:
+      loss = torch.mean(torch.sum(self.c*loss, dim=1))
+    elif wrt == 'V':
+      loss = torch.mean(torch.sum(loss, dim=1))
+    # for wrt C, use Nb x n matrix of losses for computing closed form
+    # assignment.
 
-    # evaluate reg: l2 squared, weighted by assignment in case of V.
-    Ureg = sum((gm.reg() for gm in self.group_models))
-    # NOTE: division by N used to try to balance U & V regularizers
-    Ureg = Ureg / self.N
-    Vregs = 0.5*(torch.sum(self.v**2, dim=1))
-    Vreg = torch.mean(torch.sum(self.c*Vregs, dim=1))
+    # evaluate U regularizer
+    if wrt in ['all', 'U']:
+      Ureg = sum((gm.reg() for gm in self.group_models))
+      # NOTE: division by N used to try to balance U & V regularizers
+      Ureg = Ureg / self.N
+    else:
+      Ureg = 0.0
 
-    # compute objective
-    reg = lamb*(Ureg + Vreg)
+    # evaluate V l2 squared regularizer
+    # NOTE: is there a strong need to have a U only case where Vreg is not
+    # computed?
+    if wrt in ['all', 'V', 'C']:
+      Vreg = 0.5*(torch.sum(self.v**2, dim=1))
+      if wrt == 'all':
+        Vreg = torch.mean(torch.sum(self.c*Vreg, dim=1))
+      elif wrt == 'V':
+        Vreg = torch.mean(torch.sum(Vreg, dim=1))
+      # for wrt C, use Nb x n matrix of V reg values for closed form
+      # assignment.
+    else:
+      Vreg = 0.0
+
+    reg = lamb_U*Ureg + lamb_V*Vreg
     obj = loss + reg
+    return obj, loss, reg, Ureg, Vreg, x_
 
-    # measure robust sparsity
-    c = self.c.clone()
+  def eval_sprs(self):
+    """measure robust sparsity of current assignment subset c"""
+    c = self.c.data
     cmax, _ = torch.max(c, dim=1, keepdim=True)
     sprs = torch.sum(c / cmax, dim=1)
     sprs = torch.mean(sprs)
+    return sprs
 
-    # and also whether reconstruction x_ is close in size to x.
-    x = x.detach()
-    x_ = x_.detach()
+  def eval_shrink(self, x, x_):
+    """measure shrinkage of reconstruction wrt data"""
+    c = self.c.data
+    x = x.data
+    x_ = x_.data
     norm_x_ = torch.sum(c*torch.norm(x_, 2, dim=1), dim=1)
     norm_x_ = torch.mean(norm_x_ / (torch.norm(x, 2, dim=1) + 1e-8))
+    return norm_x_
 
-    # and finally, objective wrt c
-    losses = losses.detach() + lamb*Vregs.detach()
-    return obj, loss, reg, Ureg, Vreg, sprs, norm_x_, losses, c
+  def set_cv(self, ii):
+    """set c, v to reflect subset of C, V given by ii."""
+    # NOTE: also tried sharing data using set_, but for some reason it didn't
+    # work despite a restricted example working fine in console. Copying might
+    # be safer anyway.
+    self.c.data.copy_(self.C.data[ii, :])
+    self.v.data.copy_(self.V.data[ii, :, :])
+    return
 
-  def update_full(self, ii):
+  def set_CV(self, ii):
     """update full segmentation coefficients with values from current
     mini-batch."""
     self.C[ii, :] = self.c.data.clone()
