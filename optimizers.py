@@ -6,8 +6,6 @@ import torch
 import torch.optim as optim
 from models import KManifoldClusterModel
 
-# import ipdb
-
 C_EPS = .01
 
 
@@ -205,6 +203,43 @@ class KManifoldAltSGD(optim.Optimizer):
       p.data.add_(-lr, d_p)
     self.zero_grad()
     return
+
+
+class KSubspaceAltSGD(KManifoldAltSGD):
+  """Implements variant of SGD for special k-subspace case. Alternates between
+  (1) closed form v solution by solving least-squares, (2) closed form update
+  to (soft) assignment C, (3) stochastic gradient update on U (manifold model
+  variables).
+
+  Args:
+    KMmodel (KManifoldClusterModel instance): model to optimize.
+    lr (float): learning rate
+    lamb_U (float): U regularization parameter
+    lamb_V (float): V regularization parameter.
+    momentum (float, optional): momentum factor (default: 0)
+    nesterov (bool, optional): enables Nesterov momentum (default: False)
+    soft_assign (float, optional): update segmentation using soft assignment.
+      0=exact, 1=uniform assignment (default: 0)
+  """
+  def _step_V(self, _, x):
+    """closed form least-squares update to V variable (coefficients)."""
+    v = self.KMmodel.v
+    d = v.data.shape[1]
+    batch_size = x.data.shape[0]
+    init_obj = self.KMmodel.objective(x, lamb_V=self.lamb_V, wrt='V')[0].data
+    for jj in range(self.n):
+      B = x.data.transpose(0, 1)
+      U = self.KMmodel.group_models[jj].U.data
+      b = self.KMmodel.group_models[jj].b
+      if b is not None:
+        B = B - b.data.view(-1, 1)
+      # concatenate regularization part of least-squares problem
+      A = torch.cat((U, np.sqrt(self.lamb_V)*torch.eye(d)), dim=0)
+      B = torch.cat((B, torch.zeros(d, batch_size)), dim=0)
+      vt, _ = torch.gels(B, A)
+      v.data[:, :, jj] = vt[:d, :].transpose(0, 1)
+    obj = self.KMmodel.objective(x, lamb_V=self.lamb_V, wrt='V')[0].data
+    return (init_obj - obj)/init_obj
 
 
 def find_soft_assign(losses, T=1.):

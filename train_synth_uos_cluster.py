@@ -55,9 +55,12 @@ def main():
   model = model.to(device)
 
   # optimizer & lr schedule
-  optimizer = opt.KManifoldAltSGD(model, lr=args.init_lr, lamb_U=args.lamb,
+  optimizer = opt.KSubspaceAltSGD(model, lr=args.init_lr, lamb_U=args.lamb,
       lamb_V=args.lamb, momentum=0.9, nesterov=True,
-      soft_assign=args.soft_assign, maxit_V=args.maxit_V)
+      soft_assign=args.soft_assign)
+  # optimizer = opt.KManifoldAltSGD(model, lr=args.init_lr, lamb_U=args.lamb,
+  #     lamb_V=args.lamb, momentum=0.9, nesterov=True,
+  #     soft_assign=args.soft_assign, maxit_V=args.maxit_V)
   scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer,
       factor=0.5, patience=50, threshold=1e-4)
 
