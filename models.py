@@ -83,7 +83,7 @@ class KManifoldClusterModel(nn.Module):
     # NOTE: is there a strong need to have a U only case where Vreg is not
     # computed?
     if wrt in ['all', 'V', 'C']:
-      Vreg = 0.5*(torch.sum(self.v**2, dim=1))
+      Vreg = torch.sum(self.v**2, dim=1)
       if wrt == 'all':
         Vreg = torch.mean(torch.sum(self.c*Vreg, dim=1))
       elif wrt == 'V':
@@ -170,7 +170,7 @@ class SubspaceModel(nn.Module):
 
   def reg(self):
     """Compute L2 regularization on subspace basis."""
-    reg = 0.5*torch.sum(self.U**2)
+    reg = torch.sum(self.U**2)
     return reg
 
 
@@ -206,11 +206,11 @@ class ResidualManifoldModel(nn.Module):
   def reg(self):
     """Compute L2 squared regularization on subspace basis and residual
     module."""
-    reg = 0.5*torch.sum(self.subspace_embedding.U**2)
+    reg = torch.sum(self.subspace_embedding.U**2)
     # Intuition is for weights of residual module to be strongly regularized so
     # that residual is Lipschitz with a small constant, controlling the
     # curvature of the manifold.
-    reg += self.res_lamb*0.5*(torch.sum(self.res_fc1.weight**2) +
+    reg += self.res_lamb*(torch.sum(self.res_fc1.weight**2) +
         torch.sum(self.res_fc2.weight**2))
     return reg
 
