@@ -84,8 +84,9 @@ class KManifoldAltSGD(optim.Optimizer):
       x (FloatTensor): current minibatch data
     """
     self.KMmodel.set_cv(ii)
-    obj_decr_V = self._step_V(ii, x)
-    self._step_C(x)
+    # obj_decr_V = self._step_V(ii, x)
+    obj_decr_V = 0.0
+    # self._step_C(x)
     self._step_U(x)
     self.KMmodel.set_CV(ii)
 
@@ -93,6 +94,8 @@ class KManifoldAltSGD(optim.Optimizer):
         lamb_U=self.lamb_U, lamb_V=self.lamb_V, wrt='all')
     sprs = self.KMmodel.eval_sprs()
     norm_x_ = self.KMmodel.eval_shrink(x, x_)
+
+    torch.cuda.empty_cache()
     return obj, loss, reg, Ureg, Vreg, obj_decr_V, sprs, norm_x_
 
   def _step_V(self, ii, x):
@@ -153,7 +156,9 @@ class KManifoldAltSGD(optim.Optimizer):
     """update assignment c in closed form."""
     c = self.params_dict['C']['params'][0]
     # Nb x n matrix of loss + V reg values.
-    obj = self.KMmodel.objective(x, lamb_V=self.lamb_V, wrt='C')[0]
+    with torch.no_grad():
+      # obj = self.KMmodel.objective(x, lamb_V=self.lamb_V, wrt='C')[0]
+      obj, _, _, _, _, _ = self.KMmodel.objective(x, lamb_V=self.lamb_V, wrt='C')
     if self.soft_assign <= 0:
       minidx = obj.argmin(dim=1, keepdim=True)
       c.data.zero_()
@@ -182,7 +187,8 @@ class KManifoldAltSGD(optim.Optimizer):
       for p in self.params_dict[name]['params']:
         p.requires_grad = False
 
-    obj = self.KMmodel.objective(x, lamb_U=self.lamb_U, wrt='U')[0]
+    # obj = self.KMmodel.objective(x, lamb_U=self.lamb_U, wrt='U')[0]
+    obj, _, _, _, _, _ = self.KMmodel.objective(x, lamb_U=self.lamb_U, wrt='U')
     self.zero_grad()
     obj.backward()
 
@@ -226,7 +232,10 @@ class KSubspaceAltSGD(KManifoldAltSGD):
     v = self.KMmodel.v
     d = v.data.shape[1]
     batch_size = x.data.shape[0]
-    init_obj = self.KMmodel.objective(x, lamb_V=self.lamb_V, wrt='V')[0].data
+
+    # with torch.no_grad():
+    #   init_obj = self.KMmodel.objective(x, lamb_V=self.lamb_V, wrt='V')[0].data
+
     for jj in range(self.n):
       B = x.data.transpose(0, 1)
       U = self.KMmodel.group_models[jj].U.data
@@ -234,13 +243,19 @@ class KSubspaceAltSGD(KManifoldAltSGD):
       if b is not None:
         B = B - b.data.view(-1, 1)
       # concatenate regularization part of least-squares problem
-      A = torch.cat((U, np.sqrt(self.lamb_V)*torch.eye(d)), dim=0)
-      B = torch.cat((B, torch.zeros(d, batch_size)), dim=0)
+      lambeye = torch.eye(d, dtype=U.dtype,
+          device=U.device).mul(np.sqrt(self.lamb_V))
+      A = torch.cat((U, lambeye), dim=0)
+      zero = torch.zeros(d, batch_size, dtype=B.dtype, device=B.device)
+      B = torch.cat((B, zero), dim=0)
       vt, _ = torch.gels(B, A)
       v.data[:, :, jj] = vt[:d, :].transpose(0, 1)
-    obj = self.KMmodel.objective(x, lamb_V=self.lamb_V, wrt='V')[0].data
-    return (init_obj - obj)/init_obj
 
+    # with torch.no_grad():
+    #   obj = self.KMmodel.objective(x, lamb_V=self.lamb_V, wrt='V')[0].data
+    # obj_decr = (init_obj - obj)/init_obj
+    obj_decr = 0.0
+    return obj_decr
 
 def find_soft_assign(losses, T=1.):
   """soft assignment found by shifting up negative losses by T, thresholding

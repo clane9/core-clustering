@@ -29,12 +29,13 @@ STOP_FREQ = 10
 def main():
   torch.manual_seed(args.seed)
   np.random.seed(args.seed)
-
+  
   use_cuda = args.cuda and torch.cuda.is_available()
   device = torch.device('cuda' if use_cuda else 'cpu')
   torch.set_num_threads(args.num_threads)
 
   # construct dataset
+  ipdb.set_trace()
   synth_dataset = dat.SynthUoSDataset(args.n, args.d, args.D, args.Ng,
       args.affine, args.sigma, args.data_seed)
   N = args.n*args.Ng
@@ -76,7 +77,6 @@ def main():
     print(logheader, file=f)
 
   # training loop
-  ipdb.set_trace()
   best_obj = float('inf')
   model.train()
   for epoch in range(1, args.epochs+1):
@@ -119,6 +119,7 @@ def train_epoch(data_loader, device, optimizer):
   tic = time.time()
   for kk, (ii, x) in enumerate(data_loader):
     # forward
+    ipdb.set_trace()
     ii, x = ii.to(device), x.to(device)
     (batch_obj, batch_loss, batch_reg, batch_Ureg, batch_Vreg,
         batch_Vdecr, batch_sprs, batch_norm_x_) = optimizer.step(ii, x)

@@ -7,6 +7,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+import ipdb
+import gc
+
 
 class KManifoldClusterModel(nn.Module):
   """Model of union of low-dimensional manifolds generalizing
@@ -29,11 +32,15 @@ class KManifoldClusterModel(nn.Module):
     self.group_models = nn.ModuleList(group_models)
 
     # assignment and coefficient matrices, used with sparse embedding.
-    self.register_buffer('C', torch.Tensor(N, n))
-    self.register_buffer('V', torch.Tensor(N, d, n))
+    # NOTE: don't want these potentially huge variables ever sent to gpu
+    self.C = torch.Tensor(N, n)
+    self.V = torch.Tensor(N, d, n)
     self.c = nn.Parameter(torch.Tensor(batch_size, n))
     self.v = nn.Parameter(torch.Tensor(batch_size, d, n))
     self.reset_parameters()
+
+    # residuals buffer to try to avoid memory leak
+    self.register_buffer('sqrres', torch.Tensor(batch_size, D, n))
     return
 
   def reset_parameters(self):
@@ -63,7 +70,22 @@ class KManifoldClusterModel(nn.Module):
 
     # evaluate loss: least-squares weighted by assignment, as in k-means.
     x_ = self(ii)
-    loss = torch.sum((x.unsqueeze(2) - x_)**2, dim=1)
+    # NOTE: very strange. this call introduces memory leak of size (batch_size, D, n)
+    # every iteration, but *only* on call to objective in _step_V just before
+    # return, i.e. after v variable is updates.
+    # loss = torch.sum((x.unsqueeze(2) - x_)**2, dim=1)
+    # splitting up to see which step is responsible
+    # xunsq = x.unsqueeze(2)
+    # res = xunsq.sub(x_)
+    # memory leak happens here
+    # sqrres = res.pow(2)
+    # this didn't help
+    # sqrres = res.mul(res)
+    # this didn't help
+    # self.sqrres = xunsq.sub(x_).pow(2)
+    xexpand = x.unsqueeze(2).expand(-1, -1, self.n)
+    sqrres = F.mse_loss(xexpand, x_, reduction='none')
+    loss = torch.sum(sqrres, dim=1)
     if wrt in ['all', 'U']:
       loss = torch.mean(torch.sum(self.c*loss, dim=1))
     elif wrt == 'V':
@@ -119,19 +141,22 @@ class KManifoldClusterModel(nn.Module):
     # NOTE: also tried sharing data using set_, but for some reason it didn't
     # work despite a restricted example working fine in console. Copying might
     # be safer anyway.
-    self.c.data.copy_(self.C.data[ii, :])
-    self.v.data.copy_(self.V.data[ii, :, :])
+    # NOTE: in the case this is transferring cpu to gpu, would it be faster by
+    # pinning memory?
+    self.c.data.copy_(self.C[ii, :])
+    self.v.data.copy_(self.V[ii, :, :])
     return
 
   def set_CV(self, ii):
     """update full segmentation coefficients with values from current
     mini-batch."""
-    self.C[ii, :] = self.c.data.clone()
-    self.V[ii, :, :] = self.v.data.clone()
+    self.C[ii, :] = self.c.data.cpu()
+    self.V[ii, :, :] = self.v.data.cpu()
     return
 
   def get_groups(self):
-    groups = torch.argmax(self.C.data.detach(), dim=1).numpy()
+    """compute group assignment."""
+    groups = torch.argmax(self.C.data, dim=1).cpu().numpy()
     return groups
 
 
