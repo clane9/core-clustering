@@ -7,9 +7,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-import ipdb
-import gc
-
 
 class KManifoldClusterModel(nn.Module):
   """Model of union of low-dimensional manifolds generalizing
@@ -38,9 +35,6 @@ class KManifoldClusterModel(nn.Module):
     self.c = nn.Parameter(torch.Tensor(batch_size, n))
     self.v = nn.Parameter(torch.Tensor(batch_size, d, n))
     self.reset_parameters()
-
-    # residuals buffer to try to avoid memory leak
-    self.register_buffer('sqrres', torch.Tensor(batch_size, D, n))
     return
 
   def reset_parameters(self):
@@ -58,6 +52,7 @@ class KManifoldClusterModel(nn.Module):
       self.set_cv(ii)
     # compute embeddings for each group and concatenate
     # NOTE: is this efficient on gpu/cpu?
+    # NOTE: could use jit trace to get some optimization.
     x_ = torch.stack([gm(self.v[:, :, jj])
         for jj, gm in enumerate(self.group_models)], dim=2)
     return x_
@@ -70,22 +65,11 @@ class KManifoldClusterModel(nn.Module):
 
     # evaluate loss: least-squares weighted by assignment, as in k-means.
     x_ = self(ii)
-    # NOTE: very strange. this call introduces memory leak of size (batch_size, D, n)
-    # every iteration, but *only* on call to objective in _step_V just before
-    # return, i.e. after v variable is updates.
-    # loss = torch.sum((x.unsqueeze(2) - x_)**2, dim=1)
-    # splitting up to see which step is responsible
-    # xunsq = x.unsqueeze(2)
-    # res = xunsq.sub(x_)
-    # memory leak happens here
-    # sqrres = res.pow(2)
-    # this didn't help
-    # sqrres = res.mul(res)
-    # this didn't help
-    # self.sqrres = xunsq.sub(x_).pow(2)
-    xexpand = x.unsqueeze(2).expand(-1, -1, self.n)
-    sqrres = F.mse_loss(xexpand, x_, reduction='none')
-    loss = torch.sum(sqrres, dim=1)
+    # NOTE: this call introduces memory leak of size (batch_size, D, n)
+    # every iteration of AltSGD algorithm. Very strange..
+    # Fixed once made sure all objective calls not requiring gradient were
+    # wrapped in torch.no_grad(). Still strange though...
+    loss = torch.sum((x.unsqueeze(2) - x_)**2, dim=1)
     if wrt in ['all', 'U']:
       loss = torch.mean(torch.sum(self.c*loss, dim=1))
     elif wrt == 'V':

@@ -29,13 +29,12 @@ STOP_FREQ = 10
 def main():
   torch.manual_seed(args.seed)
   np.random.seed(args.seed)
-  
+
   use_cuda = args.cuda and torch.cuda.is_available()
   device = torch.device('cuda' if use_cuda else 'cpu')
   torch.set_num_threads(args.num_threads)
 
   # construct dataset
-  ipdb.set_trace()
   synth_dataset = dat.SynthUoSDataset(args.n, args.d, args.D, args.Ng,
       args.affine, args.sigma, args.data_seed)
   N = args.n*args.Ng
@@ -61,7 +60,7 @@ def main():
       soft_assign=args.soft_assign)
   # optimizer = opt.KManifoldAltSGD(model, lr=args.init_lr, lamb_U=args.lamb,
   #     lamb_V=args.lamb, momentum=0.9, nesterov=True,
-  #     soft_assign=args.soft_assign, maxit_V=args.maxit_V)
+  #     maxit_V=args.maxit_V, soft_assign=args.soft_assign)
   scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer,
       factor=0.5, patience=50, threshold=1e-4)
 
@@ -119,7 +118,6 @@ def train_epoch(data_loader, device, optimizer):
   tic = time.time()
   for kk, (ii, x) in enumerate(data_loader):
     # forward
-    ipdb.set_trace()
     ii, x = ii.to(device), x.to(device)
     (batch_obj, batch_loss, batch_reg, batch_Ureg, batch_Vreg,
         batch_Vdecr, batch_sprs, batch_norm_x_) = optimizer.step(ii, x)
@@ -138,9 +136,9 @@ def train_epoch(data_loader, device, optimizer):
     sampsec.update(batch_size/batch_time, batch_size)
     tic = time.time()
 
-    divergence = torch.isnan(batch_obj)
-    if divergence:
+    if torch.isnan(batch_obj):
       raise RuntimeError('Divergence! NaN objective.')
+
   return (obj.avg, loss.avg, reg.avg,
       Ureg.avg, Vreg.avg, Vdecr.avg, sprs.avg, norm_x_.avg, sampsec.avg)
 

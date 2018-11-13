@@ -22,12 +22,13 @@ class KManifoldAltSGD(optim.Optimizer):
     lamb_V (float): V regularization parameter.
     momentum (float, optional): momentum factor (default: 0)
     nesterov (bool, optional): enables Nesterov momentum (default: False)
+    maxit_V (int, optional): number of gradient iterations for V update
+      (default: 1).
     soft_assign (float, optional): update segmentation using soft assignment.
       0=exact, 1=uniform assignment (default: 0)
-    maxit_V (int, optional): number of gradient iterations for V update.
   """
   def __init__(self, KMmodel, lr, lamb_U, lamb_V=None, momentum=0.0,
-        nesterov=False, soft_assign=0.0, maxit_V=1):
+        nesterov=False, maxit_V=1, soft_assign=0.0):
 
     lamb_V = lamb_U if lamb_V is None else lamb_V
 
@@ -58,8 +59,8 @@ class KManifoldAltSGD(optim.Optimizer):
     self.N = KMmodel.N
     self.lamb_U = lamb_U
     self.lamb_V = lamb_V
-    self.set_soft_assign(soft_assign)
     self.maxit_V = maxit_V
+    self.set_soft_assign(soft_assign)
     return
 
   def __setstate__(self, state):
@@ -84,18 +85,18 @@ class KManifoldAltSGD(optim.Optimizer):
       x (FloatTensor): current minibatch data
     """
     self.KMmodel.set_cv(ii)
-    # obj_decr_V = self._step_V(ii, x)
-    obj_decr_V = 0.0
-    # self._step_C(x)
+    obj_decr_V = self._step_V(ii, x)
+    self._step_C(x)
     self._step_U(x)
     self.KMmodel.set_CV(ii)
 
-    obj, loss, reg, Ureg, Vreg, x_ = self.KMmodel.objective(x,
-        lamb_U=self.lamb_U, lamb_V=self.lamb_V, wrt='all')
+    with torch.no_grad():
+      obj, loss, reg, Ureg, Vreg, x_ = self.KMmodel.objective(x,
+          lamb_U=self.lamb_U, lamb_V=self.lamb_V, wrt='all')
     sprs = self.KMmodel.eval_sprs()
     norm_x_ = self.KMmodel.eval_shrink(x, x_)
 
-    torch.cuda.empty_cache()
+    # torch.cuda.empty_cache()
     return obj, loss, reg, Ureg, Vreg, obj_decr_V, sprs, norm_x_
 
   def _step_V(self, ii, x):
@@ -116,6 +117,7 @@ class KManifoldAltSGD(optim.Optimizer):
       if 'momentum_buffer' not in v_state:
         v_state['momentum_buffer'] = torch.zeros_like(self.KMmodel.V)
       buf = v_state['momentum_buffer'][ii, :, :]
+      buf = buf.to(v.data.device)
 
     # freeze C, U
     v.requires_grad = True
@@ -124,7 +126,7 @@ class KManifoldAltSGD(optim.Optimizer):
         p.requires_grad = False
 
     # gradient descent iteration with O(1/k) decaying steps
-    obj = self.KMmodel.objective(x, lamb_V=self.lamb_V, wrt='V')[0]
+    obj, _, _, _, _, _ = self.KMmodel.objective(x, lamb_V=self.lamb_V, wrt='V')
     init_obj = obj.data
     for kk in range(1, self.maxit_V+1):
       # bw pass
@@ -142,13 +144,15 @@ class KManifoldAltSGD(optim.Optimizer):
       # NOTE: What's the best way to choose step sizes here?
       v.data.add_(-lr/kk, d_v)
 
-      obj = self.KMmodel.objective(x, lamb_V=self.lamb_V, wrt='V')[0]
+      obj, _, _, _, _, _ = self.KMmodel.objective(x, lamb_V=self.lamb_V, wrt='V')
 
     # update subset of momentum buffer for next iteration.
+    buf = buf.to(v_state['momentum_buffer'].device)
     v_state['momentum_buffer'][ii, :, :] = buf
 
-    self.zero_grad()
-
+    # NOTE: will you get a memory leak due to lingering graph from last
+    # objective call? reference to obj is lost outside this function, so maybe
+    # graph will get cleared.
     obj_decr = (init_obj - obj.data)/init_obj
     return obj_decr
 
@@ -157,14 +161,13 @@ class KManifoldAltSGD(optim.Optimizer):
     c = self.params_dict['C']['params'][0]
     # Nb x n matrix of loss + V reg values.
     with torch.no_grad():
-      # obj = self.KMmodel.objective(x, lamb_V=self.lamb_V, wrt='C')[0]
       obj, _, _, _, _, _ = self.KMmodel.objective(x, lamb_V=self.lamb_V, wrt='C')
     if self.soft_assign <= 0:
       minidx = obj.argmin(dim=1, keepdim=True)
       c.data.zero_()
       c.data.scatter_(1, minidx, 1)
     else:
-      c.data.copy_(find_soft_assign(obj, self.soft_assign))
+      c.data.copy_(find_soft_assign(obj.data, self.soft_assign))
     # NOTE: add small eps, seems to help U updates slightly. But probably
     # should prune this once find the right soft assignment setting.
     # this will also affect U updates very slightly.
@@ -187,7 +190,6 @@ class KManifoldAltSGD(optim.Optimizer):
       for p in self.params_dict[name]['params']:
         p.requires_grad = False
 
-    # obj = self.KMmodel.objective(x, lamb_U=self.lamb_U, wrt='U')[0]
     obj, _, _, _, _, _ = self.KMmodel.objective(x, lamb_U=self.lamb_U, wrt='U')
     self.zero_grad()
     obj.backward()
@@ -207,7 +209,6 @@ class KManifoldAltSGD(optim.Optimizer):
         else:
           d_p = buf
       p.data.add_(-lr, d_p)
-    self.zero_grad()
     return
 
 
@@ -233,9 +234,12 @@ class KSubspaceAltSGD(KManifoldAltSGD):
     d = v.data.shape[1]
     batch_size = x.data.shape[0]
 
-    # with torch.no_grad():
-    #   init_obj = self.KMmodel.objective(x, lamb_V=self.lamb_V, wrt='V')[0].data
-
+    with torch.no_grad():
+      init_obj, _, _, _, _, _ = self.KMmodel.objective(x, lamb_V=self.lamb_V,
+          wrt='V')
+      init_obj = init_obj.data
+    
+    # NOTE: could be done more efficiently by batch solving linear systems?
     for jj in range(self.n):
       B = x.data.transpose(0, 1)
       U = self.KMmodel.group_models[jj].U.data
@@ -251,10 +255,10 @@ class KSubspaceAltSGD(KManifoldAltSGD):
       vt, _ = torch.gels(B, A)
       v.data[:, :, jj] = vt[:d, :].transpose(0, 1)
 
-    # with torch.no_grad():
-    #   obj = self.KMmodel.objective(x, lamb_V=self.lamb_V, wrt='V')[0].data
-    # obj_decr = (init_obj - obj)/init_obj
-    obj_decr = 0.0
+    with torch.no_grad():
+      obj, _, _, _, _, _ = self.KMmodel.objective(x, lamb_V=self.lamb_V,
+          wrt='V')
+    obj_decr = (init_obj - obj.data)/init_obj
     return obj_decr
 
 def find_soft_assign(losses, T=1.):
