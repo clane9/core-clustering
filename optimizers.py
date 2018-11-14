@@ -144,7 +144,8 @@ class KManifoldAltSGD(optim.Optimizer):
       # NOTE: What's the best way to choose step sizes here?
       v.data.add_(-lr/kk, d_v)
 
-      obj, _, _, _, _, _ = self.KMmodel.objective(x, lamb_V=self.lamb_V, wrt='V')
+      obj, _, _, _, _, _ = self.KMmodel.objective(x, lamb_V=self.lamb_V,
+          wrt='V')
 
     # update subset of momentum buffer for next iteration.
     buf = buf.to(v_state['momentum_buffer'].device)
@@ -161,7 +162,8 @@ class KManifoldAltSGD(optim.Optimizer):
     c = self.params_dict['C']['params'][0]
     # Nb x n matrix of loss + V reg values.
     with torch.no_grad():
-      obj, _, _, _, _, _ = self.KMmodel.objective(x, lamb_V=self.lamb_V, wrt='C')
+      obj, _, _, _, _, _ = self.KMmodel.objective(x, lamb_V=self.lamb_V,
+          wrt='C')
     if self.soft_assign <= 0:
       minidx = obj.argmin(dim=1, keepdim=True)
       c.data.zero_()
@@ -232,34 +234,42 @@ class KSubspaceAltSGD(KManifoldAltSGD):
     """closed form least-squares update to V variable (coefficients)."""
     v = self.KMmodel.v
     d = v.data.shape[1]
-    batch_size = x.data.shape[0]
 
     with torch.no_grad():
       init_obj, _, _, _, _, _ = self.KMmodel.objective(x, lamb_V=self.lamb_V,
           wrt='V')
       init_obj = init_obj.data
-    
-    # NOTE: could be done more efficiently by batch solving linear systems?
-    for jj in range(self.n):
-      B = x.data.transpose(0, 1)
-      U = self.KMmodel.group_models[jj].U.data
-      b = self.KMmodel.group_models[jj].b
-      if b is not None:
-        B = B - b.data.view(-1, 1)
-      # concatenate regularization part of least-squares problem
-      lambeye = torch.eye(d, dtype=U.dtype,
-          device=U.device).mul(np.sqrt(self.lamb_V))
-      A = torch.cat((U, lambeye), dim=0)
-      zero = torch.zeros(d, batch_size, dtype=B.dtype, device=B.device)
-      B = torch.cat((B, zero), dim=0)
-      vt, _ = torch.gels(B, A)
-      v.data[:, :, jj] = vt[:d, :].transpose(0, 1)
+
+    # solve least squares by computing batched solution to normal equations.
+    # (n x D x d)
+    U = torch.stack([self.KMmodel.group_models[jj].U.data
+        for jj in range(self.n)], dim=0)
+    # (n x d x d)
+    Ut = U.transpose(1, 2)
+    UtU = torch.matmul(Ut, U)
+    # (d x d)
+    lambeye = torch.eye(d, dtype=UtU.dtype, device=UtU.device).mul(self.lamb_V)
+    # (n x d x d)
+    A = UtU.add(lambeye.unsqueeze(0))
+
+    # (n x D x batch_size)
+    B = x.data.t().unsqueeze(0).expand(self.n, -1, -1)
+    if self.KMmodel.group_models[0].affine:
+      B = B.sub(torch.stack([self.KMmodel.group_models[jj].b.data
+          for jj in range(self.n)], dim=0).unsqueeze(2))
+    # (n x d x batch_size)
+    B = torch.matmul(Ut, B)
+
+    # (n x d x batch_size)
+    vt, _ = torch.gesv(B, A)
+    v.data.copy_(vt.permute(2, 1, 0))
 
     with torch.no_grad():
       obj, _, _, _, _, _ = self.KMmodel.objective(x, lamb_V=self.lamb_V,
           wrt='V')
     obj_decr = (init_obj - obj.data)/init_obj
     return obj_decr
+
 
 def find_soft_assign(losses, T=1.):
   """soft assignment found by shifting up negative losses by T, thresholding
