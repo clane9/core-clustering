@@ -23,7 +23,7 @@ import utils as ut
 import ipdb
 
 CHKP_FREQ = 50
-STOP_FREQ = 10
+STOP_FREQ = -1
 
 
 def main():
@@ -58,19 +58,19 @@ def main():
   optimizer = opt.KSubspaceAltSGD(model, lr=args.init_lr, lamb_U=args.lamb,
       lamb_V=args.lamb, momentum=0.9, nesterov=True,
       soft_assign=args.soft_assign)
-  # optimizer = opt.KManifoldAltSGD(model, lr=args.init_lr, lamb_U=args.lamb,
+  # optimizer = opt.KManifoldSGD(model, lr=args.init_lr, lamb_U=args.lamb,
   #     lamb_V=args.lamb, momentum=0.9, nesterov=True,
-  #     maxit_V=args.maxit_V, soft_assign=args.soft_assign)
+  #     soft_assign=args.soft_assign)
   scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer,
       factor=0.5, patience=50, threshold=1e-4)
 
   printformstr = ('(epoch {:d}/{:d}) lr={:.3e} err={:.4f} obj={:.3e} '
-      'loss={:.3e} reg(U)(V)={:.3e},{:.3e},{:.3e} Vdecr={:.3e} sprs={:.2f} '
+      'loss={:.3e} reg(U)(V)={:.3e},{:.3e},{:.3e} sprs={:.2f} '
       '|x_|={:.3e} samp/s={:.0f}')
   logheader = ('Epoch,LR,Err,Obj,Loss,Reg,U.reg,V.reg,'
-      'V.decr,Sprs,Norm.x_,Samp.s')
+      'Sprs,Norm.x_,Samp.s')
   logformstr = ('{:d},{:.9e},{:.9f},{:.9e},{:.9e},{:.9e},{:.9e},{:.9e},'
-      '{:.9e},{:.9e},{:.9e},{:.0f}')
+      '{:.9e},{:.9e},{:.0f}')
   val_logf = '{}/val_log.csv'.format(args.out_dir)
   with open(val_logf, 'w') as f:
     print(logheader, file=f)
@@ -114,13 +114,13 @@ def main():
 def train_epoch(data_loader, device, optimizer):
   """train model for one epoch and record convergence measures."""
   (obj, loss, reg, Ureg, Vreg,
-      Vdecr, sprs, norm_x_, sampsec) = [ut.AverageMeter() for _ in range(9)]
+      sprs, norm_x_, sampsec) = [ut.AverageMeter() for _ in range(9)]
   tic = time.time()
   for kk, (ii, x) in enumerate(data_loader):
     # forward
     ii, x = ii.to(device), x.to(device)
     (batch_obj, batch_loss, batch_reg, batch_Ureg, batch_Vreg,
-        batch_Vdecr, batch_sprs, batch_norm_x_) = optimizer.step(ii, x)
+        batch_sprs, batch_norm_x_) = optimizer.step(ii, x)
     batch_size = x.size(0)
 
     obj.update(batch_obj, batch_size)
@@ -128,7 +128,6 @@ def train_epoch(data_loader, device, optimizer):
     reg.update(batch_reg, batch_size)
     Ureg.update(batch_Ureg, batch_size)
     Vreg.update(batch_Vreg, batch_size)
-    Vdecr.update(batch_Vdecr, batch_size)
     sprs.update(batch_sprs, batch_size)
     norm_x_.update(batch_norm_x_, batch_size)
 
@@ -140,7 +139,7 @@ def train_epoch(data_loader, device, optimizer):
       raise RuntimeError('Divergence! NaN objective.')
 
   return (obj.avg, loss.avg, reg.avg,
-      Ureg.avg, Vreg.avg, Vdecr.avg, sprs.avg, norm_x_.avg, sampsec.avg)
+      Ureg.avg, Vreg.avg, sprs.avg, norm_x_.avg, sampsec.avg)
 
 
 if __name__ == '__main__':
@@ -176,8 +175,8 @@ if __name__ == '__main__':
                       help='Number of epochs to train [default: 1000]')
   parser.add_argument('--init-lr', type=float, default=0.5,
                       help='Initial learning rate [default: 0.5]')
-  parser.add_argument('--maxit-V', type=int, default=1,
-                      help='Number of iterations for V update [default: 1]')
+  parser.add_argument('--maxit-V', type=int, default=20,
+                      help='Number of iterations for V update [default: 20]')
   parser.add_argument('--cuda', action='store_true', default=False,
                       help='Enables CUDA training')
   parser.add_argument('--num-threads', type=int, default=1,
