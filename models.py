@@ -11,7 +11,8 @@ import torch.nn.functional as F
 class KManifoldClusterModel(nn.Module):
   """Model of union of low-dimensional manifolds generalizing
   k-means/k-subspaces."""
-  def __init__(self, n, d, D, N, batch_size, group_models=None):
+  def __init__(self, n, d, D, N, batch_size, group_models=None,
+      use_cuda=False):
     super(KManifoldClusterModel, self).__init__()
 
     self.n = n  # number of groups
@@ -19,6 +20,7 @@ class KManifoldClusterModel(nn.Module):
     self.D = D  # ambient dimension
     self.N = N  # number of data points
     self.batch_size = batch_size
+    self.use_cuda = use_cuda
 
     if group_models:
       # quick check to make sure group models constructed correctly
@@ -32,6 +34,10 @@ class KManifoldClusterModel(nn.Module):
     # NOTE: don't want these potentially huge variables ever sent to gpu
     self.C = torch.Tensor(N, n)
     self.V = torch.Tensor(N, d, n)
+    if use_cuda:
+      # should speed up copy to cuda memory
+      self.C = self.C.pin_memory()
+      self.V = self.V.pin_memory()
     self.c = nn.Parameter(torch.Tensor(batch_size, n))
     self.v = nn.Parameter(torch.Tensor(batch_size, d, n))
     self.reset_parameters()
