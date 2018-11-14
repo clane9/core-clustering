@@ -6,6 +6,8 @@ import torch
 import torch.optim as optim
 from models import KManifoldClusterModel
 
+import ipdb
+
 C_EPS = .01
 
 
@@ -28,7 +30,7 @@ class KManifoldAltSGD(optim.Optimizer):
       0=exact, 1=uniform assignment (default: 0)
   """
   def __init__(self, KMmodel, lr, lamb_U, lamb_V=None, momentum=0.0,
-        nesterov=False, maxit_V=1, soft_assign=0.0):
+        nesterov=False, maxit_V=50, soft_assign=0.0):
 
     lamb_V = lamb_U if lamb_V is None else lamb_V
 
@@ -53,6 +55,11 @@ class KManifoldAltSGD(optim.Optimizer):
 
     super(KManifoldAltSGD, self).__init__(params, defaults)
     self.params_dict = {group['name']: group for group in self.param_groups}
+
+    # NOTE: momentum, nesterov not used for V, C
+    for name in ['V', 'C']:
+      self.params_dict[name]['momentum'] = 0.0
+      self.params_dict[name]['nesterov'] = False
 
     self.KMmodel = KMmodel
     self.n = KMmodel.n
@@ -101,23 +108,16 @@ class KManifoldAltSGD(optim.Optimizer):
 
   def _step_V(self, ii, x):
     """one or a few exact gradient steps on V variable (manifold
-    coefficients)."""
+    coefficients). no acceleration."""
     group = self.params_dict['V']
-    momentum = group['momentum']
-    nesterov = group['nesterov']
     lr = group['lr']
-
     v = group['params'][0]
-    v_state = self.state[v]
 
-    # NOTE: how useful is it to maintain a global momentum buffer? Maybe these
-    # get stale quickly with all the U updates?
-    if momentum > 0:
-      # initialize momentum buffer for full dataset
-      if 'momentum_buffer' not in v_state:
-        v_state['momentum_buffer'] = torch.zeros_like(self.KMmodel.V)
-      buf = v_state['momentum_buffer'][ii, :, :]
-      buf = buf.to(v.data.device)
+    # adaptive step size constants following trust region framework
+    lr_decr, lr_min, lr_max = 0.5, 1e-4, 1e4
+    success_thr, fail_thr = 0.9, .01
+    # NOTE: should these scalars be transferred off the gpu if using cuda?
+    tol = torch.norm(v.data).mul(1e-5)
 
     # freeze C, U
     v.requires_grad = True
@@ -125,31 +125,56 @@ class KManifoldAltSGD(optim.Optimizer):
       for p in self.params_dict[name]['params']:
         p.requires_grad = False
 
-    # gradient descent iteration with O(1/k) decaying steps
+    # gradient descent iteration with steps chosen by trust region success
+    # condition
+    # NOTE: will this strategy work well if manifold embedding is not smooth?
     obj, _, _, _, _, _ = self.KMmodel.objective(x, lamb_V=self.lamb_V, wrt='V')
-    init_obj = obj.data
-    for kk in range(1, self.maxit_V+1):
+    prev_obj = init_obj = obj.data
+    g_norm = torch.ones_like(tol).mul(np.inf)
+    backtracking = False
+    itr = 0
+    # NOTE: to terminate loop, must either (a) do maxit successful or lr
+    # min iters, or (b) achieve stopping tolerance.
+    ipdb.set_trace()
+    while itr < self.maxit_V and g_norm >= tol:
       # bw pass
-      self.zero_grad()
-      obj.backward()
+      if not backtracking:
+        self.zero_grad()
+        obj.backward()
+        g_v = v.grad.data
+        g_normsqr = g_v.pow(2).sum()
+        g_norm = g_normsqr.sqrt()
 
-      # momentum step
-      d_v = v.grad.data
-      if momentum > 0:
-        buf.mul_(momentum).add_(d_v)
-        if nesterov:
-          d_v = d_v.add(momentum, buf)
-        else:
-          d_v = buf
-      # NOTE: What's the best way to choose step sizes here?
-      v.data.add_(-lr/kk, d_v)
-
+      # grad step
+      v.data.add_(-lr, g_v)
       obj, _, _, _, _, _ = self.KMmodel.objective(x, lamb_V=self.lamb_V,
           wrt='V')
 
-    # update subset of momentum buffer for next iteration.
-    buf = buf.to(v_state['momentum_buffer'].device)
-    v_state['momentum_buffer'][ii, :, :] = buf
+      # adaptive step size using trust region success condition
+      pred_decr = g_normsqr.mul(lr)
+      obs_decr = prev_obj - obj.data
+      model_fit = obs_decr/pred_decr
+      if model_fit < fail_thr:
+        # failure case
+        # reset variable and decrease step
+        v.data.add_(lr, g_v)
+        if lr <= lr_min:
+          # increment iteration counter if already hit lr_min
+          itr += 1
+        else:
+          lr = np.clip(lr_decr*lr, lr_min, lr_max)
+        backtracking = True
+      else:
+        if model_fit > success_thr:
+          # very successful case, increase step
+          lr = np.clip(lr/lr_decr, lr_min, lr_max)
+        prev_obj = obj.data
+        itr += 1
+        backtracking = False
+
+      print(('k={:d}, obj={:.5e}, |g|={:.3e}, pd={:.3e}, od={:.3e}, '
+          'fit={:.3f}, lr={:.3e}').format(itr, obj.data, g_norm, pred_decr,
+              obs_decr, model_fit, lr))
 
     # NOTE: will you get a memory leak due to lingering graph from last
     # objective call? reference to obj is lost outside this function, so maybe
