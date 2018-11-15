@@ -25,7 +25,7 @@ class SynthUoSDataset(Dataset):
     self.Us = np.zeros([D, d, n])
     self.Vs = np.zeros([d, Ng, n])
     self.bs = np.zeros([D, n]) if affine else None
-    self.X = np.zeros([D, self.N])
+    self.X = np.zeros([self.N, D])
     self.groups = np.zeros(self.N, dtype=np.int32)
 
     # sample data from randomnly generated (linear or affine) subspaces
@@ -41,21 +41,27 @@ class SynthUoSDataset(Dataset):
         self.bs[:, ii] = b
         Xi += b
 
-      self.X[:, ii*Ng:(ii+1)*Ng] = Xi
+      self.X[ii*Ng:(ii+1)*Ng, :] = Xi.T
       self.groups[ii*Ng:(ii+1)*Ng] = ii
 
     if sigma > 0.:
-      E = (sigma/np.sqrt(D))*rng.randn(D, self.N)
+      E = (sigma/np.sqrt(D))*rng.randn(self.N, D)
       self.X += E
 
+    # permute order of data
+    self.perm = np.random.permutation(self.N)
+    self.X = self.X[self.perm, :]
+    self.groups = self.groups[self.perm]
+
     self.X = torch.tensor(self.X, dtype=torch.float32)
+    self.groups = torch.from_numpy(self.groups)
     return
 
   def __len__(self):
     return self.N
 
   def __getitem__(self, ii):
-    return torch.tensor(ii), self.X[:, ii]
+    return torch.tensor(ii), self.X[ii, :], self.groups[ii]
 
 
 class SynthUoMDataset(Dataset):
@@ -93,8 +99,10 @@ class SynthUoMDataset(Dataset):
     # generate true groups and segmentation
     self.groups = np.arange(n, dtype=np.int64).reshape(-1, 1)
     self.groups = np.tile(self.groups, (1, Ng)).reshape(-1)
-    self.planted_model.C.zero_().scatter_(1,
-        torch.from_numpy(self.groups).view(-1, 1), 1)
+    self.groups = torch.from_numpy(self.groups)
+
+    self.planted_model.C.zero_()
+    self.planted_model.C.scatter_(1, self.groups.view(-1, 1), 1)
 
     # generate union of manifold data
     ii = torch.arange(self.N, dtype=torch.int64)
@@ -103,12 +111,17 @@ class SynthUoMDataset(Dataset):
     self.X = self.X.sum(dim=2)
 
     if sigma > 0.:
-      E = (sigma/np.sqrt(D))*torch.randn(self.N, D)
+      E = torch.randn(self.N, D).mul(sigma/np.sqrt(D))
       self.X += E
+
+    # permute order of data
+    self.perm = np.random.permutation(self.N)
+    self.X = self.X[self.perm, :]
+    self.groups = self.groups[self.perm]
     return
 
   def __len__(self):
     return self.N
 
   def __getitem__(self, ii):
-    return torch.tensor(ii), self.X[ii, :]
+    return torch.tensor(ii), self.X[ii, :], self.groups[ii]
