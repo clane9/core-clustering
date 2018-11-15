@@ -18,6 +18,8 @@ import models as mod
 import optimizers as opt
 import training as tr
 
+import ipdb
+
 CHKP_FREQ = 50
 STOP_FREQ = 10
 
@@ -46,21 +48,16 @@ def main():
   np.random.seed(args.seed)
 
   # construct model
-  group_models = [mod.SubspaceModel(args.d, args.D, args.affine)
+  ipdb.set_trace()
+  group_models = [mod.SubspaceAEModel(args.d, args.D, args.affine)
       for _ in range(args.n)]
-  model = mod.KManifoldClusterModel(args.n, args.d, args.D, N,
-      batch_size, group_models, use_cuda)
+  model = mod.KManifoldAEClusterModel(args.n, args.d, args.D, N,
+      batch_size, group_models)
   model = model.to(device)
 
   # optimizer & lr schedule
-  if args.alt_opt:
-    optimizer = opt.KSubspaceAltSGD(model, lr=args.init_lr, lamb_U=args.lamb,
-        lamb_V=args.lamb, momentum=0.9, nesterov=True,
-        soft_assign=args.soft_assign)
-  else:
-    optimizer = opt.KManifoldSGD(model, lr=args.init_lr, lamb_U=args.lamb,
-        lamb_V=args.lamb, momentum=0.9, nesterov=True,
-        soft_assign=args.soft_assign)
+  optimizer = opt.KManifoldAESGD(model, lr=args.init_lr, lamb=args.lamb,
+      momentum=0.9, nesterov=True, soft_assign=args.soft_assign)
 
   tr.train_loop(model, synth_data_loader, device, optimizer,
       args.out_dir, args.epochs, CHKP_FREQ, STOP_FREQ)

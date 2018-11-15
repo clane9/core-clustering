@@ -16,10 +16,10 @@ def train_loop(model, data_loader, device, optimizer, out_dir,
   """Train k-manifold model for series of epochs.
 
   Args:
-    model: k-manifold model instance.
+    model: k-manifold ae model instance.
     data_loader: training dataset loader
     device: torch compute device id
-    optimizer: k-manifold optimizer instance
+    optimizer: k-manifold ae optimizer instance
     out_dir: path to output directory, must already exist
     epochs: number of epochs to run for (default: 200)
     chkp_freq: how often to save checkpoint (default: 50)
@@ -27,11 +27,10 @@ def train_loop(model, data_loader, device, optimizer, out_dir,
   """
 
   printformstr = ('(epoch {:d}/{:d}) lr={:.3e} err={:.4f} obj={:.3e} '
-      'loss={:.3e} reg(U)(V)={:.3e},{:.3e},{:.3e} sprs={:.2f} '
-      '|x_|={:.3e} samp/s={:.0f} rtime={:.3f}')
-  logheader = ('Epoch,LR,Err,Obj,Loss,Reg,U.reg,V.reg,'
-      'Sprs,Norm.x_,Samp.s,RT')
-  logformstr = ('{:d},{:.9e},{:.9f},{:.9e},{:.9e},{:.9e},{:.9e},{:.9e},'
+      'loss={:.3e} reg={:.3e} sprs={:.2f} |x_|={:.3e} '
+      'samp/s={:.0f} rtime={:.3f}')
+  logheader = ('Epoch,LR,Err,Obj,Loss,Reg,Sprs,Norm.x_,Samp.s,RT')
+  logformstr = ('{:d},{:.9e},{:.9f},{:.9e},{:.9e},{:.9e},'
       '{:.9e},{:.9e},{:.0f},{:.9f}')
   val_logf = '{}/val_log.csv'.format(out_dir)
   with open(val_logf, 'w') as f:
@@ -48,20 +47,14 @@ def train_loop(model, data_loader, device, optimizer, out_dir,
   ipdb.set_trace()
   for epoch in range(1, epochs+1):
     try:
-      tic = time.time()
       metrics = train_epoch(data_loader, optimizer, device)
-      rtime = time.time() - tic
-      metrics += (rtime,)
-      # NOTE: instead could compute cluster error in more "online" fashion
-      cluster_error = ut.eval_cluster_error(model.get_groups(),
-          data_loader.dataset.groups)
       lr = ut.get_learning_rate(optimizer)
 
       with open(val_logf, 'a') as f:
-        print(logformstr.format(epoch, lr, cluster_error, *metrics), file=f)
-      print(printformstr.format(epoch, epochs, lr, cluster_error, *metrics))
+        print(logformstr.format(epoch, lr, *metrics), file=f)
+      print(printformstr.format(epoch, epochs, lr, *metrics))
 
-      obj = metrics[0]
+      cluster_error, obj = metrics[:2]
       is_conv = lr <= min_lr or epoch == epochs
       scheduler.step(obj)
     except Exception as err:
@@ -95,29 +88,30 @@ def train_loop(model, data_loader, device, optimizer, out_dir,
 
 def train_epoch(data_loader, optimizer, device):
   """train model for one epoch and record convergence measures."""
-  (obj, loss, reg, Ureg, Vreg,
-      sprs, norm_x_, sampsec) = [ut.AverageMeter() for _ in range(8)]
-  for ii, x, _ in data_loader:
+  (obj, loss, reg, sprs, norm_x_,
+      conf_mat, sampsec) = [ut.AverageMeter() for _ in range(7)]
+  epoch_tic = time.time()
+  for _, x, groups in data_loader:
     # forward
     tic = time.time()
-    ii, x = ii.to(device), x.to(device)
-    (batch_obj, batch_loss, batch_reg, batch_Ureg, batch_Vreg,
-        batch_sprs, batch_norm_x_) = optimizer.step(ii, x)
+    x = x.to(device)
+    (batch_obj, batch_loss, batch_reg, batch_sprs,
+        batch_norm_x_, batch_conf_mat) = optimizer.step(x, groups)
     batch_size = x.size(0)
 
     obj.update(batch_obj, batch_size)
     loss.update(batch_loss, batch_size)
     reg.update(batch_reg, batch_size)
-    Ureg.update(batch_Ureg, batch_size)
-    Vreg.update(batch_Vreg, batch_size)
     sprs.update(batch_sprs, batch_size)
     norm_x_.update(batch_norm_x_, batch_size)
+    conf_mat.update(batch_conf_mat, 1)
 
     batch_time = time.time() - tic
     sampsec.update(batch_size/batch_time, batch_size)
 
     if torch.isnan(batch_obj):
       raise RuntimeError('Divergence! NaN objective.')
-
-  return (obj.avg, loss.avg, reg.avg,
-      Ureg.avg, Vreg.avg, sprs.avg, norm_x_.avg, sampsec.avg)
+  rtime = time.time() - epoch_tic
+  cluster_error = ut.eval_cluster_error(conf_mat.sum)
+  return (cluster_error, obj.avg, loss.avg, reg.avg,
+      sprs.avg, norm_x_.avg, sampsec.avg, rtime)

@@ -7,6 +7,8 @@ from torch.utils.data import Dataset
 
 import models as mod
 
+import ipdb
+
 
 class SynthUoSDataset(Dataset):
   """Synthetic union of subspaces dataset."""
@@ -54,7 +56,6 @@ class SynthUoSDataset(Dataset):
     self.groups = self.groups[self.perm]
 
     self.X = torch.tensor(self.X, dtype=torch.float32)
-    self.groups = torch.from_numpy(self.groups)
     return
 
   def __len__(self):
@@ -82,33 +83,27 @@ class SynthUoMDataset(Dataset):
     if seed is not None:
       torch.manual_seed(seed)
 
-    self.group_models = [mod.ResidualManifoldModel(d, D, H,
+    ipdb.set_trace()
+    self.group_models = [mod.ResidualManifoldAEModel(d, D, H,
         drop_p=0.0, res_lamb=0.0) for _ in range(n)]
     # scale weights to control smoothness
     for gm in self.group_models:
-      gm.res_fc1.weight.data.mul_(res_weight_scale)
-      gm.res_fc2.weight.data.mul_(res_weight_scale)
-
-    self.planted_model = mod.KManifoldClusterModel(n, d, D, self.N, self.N,
-        self.group_models)
-    self.planted_model.eval()
-    # disable gradient computation
-    for p in self.planted_model.parameters():
-      p.requires_grad = False
+      gm.dec_fc1.weight.data.mul_(res_weight_scale)
+      gm.dec_fc2.weight.data.mul_(res_weight_scale)
 
     # generate true groups and segmentation
     self.groups = np.arange(n, dtype=np.int64).reshape(-1, 1)
     self.groups = np.tile(self.groups, (1, Ng)).reshape(-1)
-    self.groups = torch.from_numpy(self.groups)
 
-    self.planted_model.C.zero_()
-    self.planted_model.C.scatter_(1, self.groups.view(-1, 1), 1)
+    C = torch.zeros(self.N, n)
+    C.scatter_(1, torch.from_numpy(self.groups).view(-1, 1), 1)
 
     # generate union of manifold data
-    ii = torch.arange(self.N, dtype=torch.int64)
-    self.X = self.planted_model(ii)
-    self.X.mul_(self.planted_model.C.unsqueeze(1))
-    self.X = self.X.sum(dim=2)
+    V = torch.randn(self.N, d).div(np.sqrt(d))
+    with torch.no_grad():
+      self.X = torch.stack([gm.decode(V) for gm in self.group_models], dim=2)
+      self.X.mul_(C.unsqueeze(1))
+      self.X = self.X.sum(dim=2)
 
     if sigma > 0.:
       E = torch.randn(self.N, D).mul(sigma/np.sqrt(D))
