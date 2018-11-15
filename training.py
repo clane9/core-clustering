@@ -1,0 +1,123 @@
+from __future__ import absolute_import
+from __future__ import division
+from __future__ import print_function
+
+import time
+import torch
+from torch import optim
+
+import utils as ut
+
+import ipdb
+
+
+def train_loop(model, data_loader, device, optimizer, out_dir,
+      epochs=200, chkp_freq=50, stop_freq=-1):
+  """Train k-manifold model for series of epochs.
+
+  Args:
+    model: k-manifold model instance.
+    data_loader: training dataset loader
+    device: torch compute device id
+    optimizer: k-manifold optimizer instance
+    out_dir: path to output directory, must already exist
+    epochs: number of epochs to run for (default: 200)
+    chkp_freq: how often to save checkpoint (default: 50)
+    stop_freq: how often to stop for debugging (default: -1)
+  """
+
+  printformstr = ('(epoch {:d}/{:d}) lr={:.3e} err={:.4f} obj={:.3e} '
+      'loss={:.3e} reg(U)(V)={:.3e},{:.3e},{:.3e} sprs={:.2f} '
+      '|x_|={:.3e} samp/s={:.0f} rtime={:.3f}')
+  logheader = ('Epoch,LR,Err,Obj,Loss,Reg,U.reg,V.reg,'
+      'Sprs,Norm.x_,Samp.s,RT')
+  logformstr = ('{:d},{:.9e},{:.9f},{:.9e},{:.9e},{:.9e},{:.9e},{:.9e},'
+      '{:.9e},{:.9e},{:.0f},{:.9f}')
+  val_logf = '{}/val_log.csv'.format(out_dir)
+  with open(val_logf, 'w') as f:
+    print(logheader, file=f)
+
+  min_lr = 1e-6*ut.get_learning_rate(optimizer)
+  scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer,
+      factor=0.5, patience=10, threshold=1e-4, min_lr=min_lr)
+
+  # training loop
+  best_obj = float('inf')
+  lr = float('inf')
+  model.train()
+  ipdb.set_trace()
+  for epoch in range(1, epochs+1):
+    try:
+      tic = time.time()
+      metrics = train_epoch(data_loader, optimizer, device)
+      rtime = time.time() - tic
+      metrics += (rtime,)
+      # NOTE: instead could compute cluster error in more "online" fashion
+      cluster_error = ut.eval_cluster_error(model.get_groups(),
+          data_loader.dataset.groups)
+      lr = ut.get_learning_rate(optimizer)
+
+      with open(val_logf, 'a') as f:
+        print(logformstr.format(epoch, lr, cluster_error, *metrics), file=f)
+      print(printformstr.format(epoch, epochs, lr, cluster_error, *metrics))
+
+      obj = metrics[0]
+      is_conv = lr <= min_lr or epoch == epochs
+      scheduler.step(obj)
+    except Exception as err:
+      print('Error: {}'.format(err))
+      with open('{}/error'.format(out_dir), 'w') as f:
+        print(err, file=f)
+      obj = float('inf')
+      cluster_error = float('inf')
+      is_conv = True
+
+    is_best = obj < best_obj
+    best_obj = min(obj, best_obj)
+    if epoch == 1 or epoch % chkp_freq == 0 or is_conv:
+      ut.save_checkpoint({
+          'epoch': epoch,
+          'model': model.state_dict(),
+          'optimizer': optimizer.state_dict(),
+          'err': cluster_error,
+          'obj': obj},
+          is_best,
+          filename='{}/checkpoint{}.pth.tar'.format(out_dir, epoch),
+          best_filename='{}/model_best.pth.tar'.format(out_dir))
+
+    if stop_freq > 0 and epoch % stop_freq == 0:
+      ipdb.set_trace()
+
+    if is_conv:
+      break
+  return
+
+
+def train_epoch(data_loader, optimizer, device):
+  """train model for one epoch and record convergence measures."""
+  (obj, loss, reg, Ureg, Vreg,
+      sprs, norm_x_, sampsec) = [ut.AverageMeter() for _ in range(8)]
+  for ii, x, _ in data_loader:
+    # forward
+    tic = time.time()
+    ii, x = ii.to(device), x.to(device)
+    (batch_obj, batch_loss, batch_reg, batch_Ureg, batch_Vreg,
+        batch_sprs, batch_norm_x_) = optimizer.step(ii, x)
+    batch_size = x.size(0)
+
+    obj.update(batch_obj, batch_size)
+    loss.update(batch_loss, batch_size)
+    reg.update(batch_reg, batch_size)
+    Ureg.update(batch_Ureg, batch_size)
+    Vreg.update(batch_Vreg, batch_size)
+    sprs.update(batch_sprs, batch_size)
+    norm_x_.update(batch_norm_x_, batch_size)
+
+    batch_time = time.time() - tic
+    sampsec.update(batch_size/batch_time, batch_size)
+
+    if torch.isnan(batch_obj):
+      raise RuntimeError('Divergence! NaN objective.')
+
+  return (obj.avg, loss.avg, reg.avg,
+      Ureg.avg, Vreg.avg, sprs.avg, norm_x_.avg, sampsec.avg)

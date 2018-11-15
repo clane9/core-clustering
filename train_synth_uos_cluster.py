@@ -9,32 +9,27 @@ import argparse
 import os
 import shutil
 import pickle
-import time
 
 import numpy as np
 import torch
-import torch.optim as optim
 
 import datasets as dat
 import models as mod
 import optimizers as opt
-import utils as ut
-
-import ipdb
+import training as tr
 
 CHKP_FREQ = 50
-STOP_FREQ = -1
+STOP_FREQ = 10
 
 
 def main():
-  torch.manual_seed(args.seed)
-  np.random.seed(args.seed)
-
   use_cuda = args.cuda and torch.cuda.is_available()
   device = torch.device('cuda' if use_cuda else 'cpu')
   torch.set_num_threads(args.num_threads)
 
   # construct dataset
+  torch.manual_seed(args.data_seed)
+  np.random.seed(args.data_seed)
   synth_dataset = dat.SynthUoSDataset(args.n, args.d, args.D, args.Ng,
       args.affine, args.sigma, args.data_seed)
   N = args.n*args.Ng
@@ -47,99 +42,29 @@ def main():
   synth_data_loader = torch.utils.data.DataLoader(synth_dataset,
       batch_size=batch_size, shuffle=(batch_size != N), **kwargs)
 
+  torch.manual_seed(args.seed)
+  np.random.seed(args.seed)
+
   # construct model
   group_models = [mod.SubspaceModel(args.d, args.D, args.affine)
       for _ in range(args.n)]
   model = mod.KManifoldClusterModel(args.n, args.d, args.D, N,
-      batch_size, group_models)
+      batch_size, group_models, use_cuda)
   model = model.to(device)
 
   # optimizer & lr schedule
-  optimizer = opt.KSubspaceAltSGD(model, lr=args.init_lr, lamb_U=args.lamb,
-      lamb_V=args.lamb, momentum=0.9, nesterov=True,
-      soft_assign=args.soft_assign)
-  # optimizer = opt.KManifoldSGD(model, lr=args.init_lr, lamb_U=args.lamb,
-  #     lamb_V=args.lamb, momentum=0.9, nesterov=True,
-  #     soft_assign=args.soft_assign)
-  scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer,
-      factor=0.5, patience=50, threshold=1e-4)
+  if args.alt_opt:
+    optimizer = opt.KSubspaceAltSGD(model, lr=args.init_lr, lamb_U=args.lamb,
+        lamb_V=args.lamb, momentum=0.9, nesterov=True,
+        soft_assign=args.soft_assign)
+  else:
+    optimizer = opt.KManifoldSGD(model, lr=args.init_lr, lamb_U=args.lamb,
+        lamb_V=args.lamb, momentum=0.9, nesterov=True,
+        soft_assign=args.soft_assign)
 
-  printformstr = ('(epoch {:d}/{:d}) lr={:.3e} err={:.4f} obj={:.3e} '
-      'loss={:.3e} reg(U)(V)={:.3e},{:.3e},{:.3e} sprs={:.2f} '
-      '|x_|={:.3e} samp/s={:.0f}')
-  logheader = ('Epoch,LR,Err,Obj,Loss,Reg,U.reg,V.reg,'
-      'Sprs,Norm.x_,Samp.s')
-  logformstr = ('{:d},{:.9e},{:.9f},{:.9e},{:.9e},{:.9e},{:.9e},{:.9e},'
-      '{:.9e},{:.9e},{:.0f}')
-  val_logf = '{}/val_log.csv'.format(args.out_dir)
-  with open(val_logf, 'w') as f:
-    print(logheader, file=f)
-
-  # training loop
-  best_obj = float('inf')
-  model.train()
-  for epoch in range(1, args.epochs+1):
-    metrics = train_epoch(synth_data_loader, device, optimizer)
-    cluster_error, _ = ut.eval_cluster_error(model.get_groups(),
-        synth_dataset.groups)
-    lr = ut.get_learning_rate(optimizer)
-
-    with open(val_logf, 'a') as f:
-      print(logformstr.format(epoch, lr, cluster_error, *metrics), file=f)
-    print(printformstr.format(epoch, args.epochs, lr, cluster_error, *metrics))
-
-    obj = metrics[0]
-    is_best = obj < best_obj
-    best_obj = min(obj, best_obj)
-    if epoch == 1 or epoch % CHKP_FREQ == 0:
-      ut.save_checkpoint({
-          'epoch': epoch,
-          'model': model.state_dict(),
-          'optimizer': optimizer.state_dict(),
-          'err': cluster_error,
-          'obj': obj},
-          is_best,
-          filename='{}/checkpoint{}.pth.tar'.format(args.out_dir, epoch),
-          best_filename='{}/model_best.pth.tar'.format(args.out_dir))
-
-    scheduler.step(obj)
-    if args.soft_assign_decay and args.soft_assign > 0:
-      optimizer.set_soft_assign(args.soft_assign/(epoch+1))
-
-    if STOP_FREQ > 0 and epoch % STOP_FREQ == 0:
-      ipdb.set_trace()
+  tr.train_loop(model, synth_data_loader, device, optimizer,
+      args.out_dir, args.epochs, CHKP_FREQ, STOP_FREQ)
   return
-
-
-def train_epoch(data_loader, device, optimizer):
-  """train model for one epoch and record convergence measures."""
-  (obj, loss, reg, Ureg, Vreg,
-      sprs, norm_x_, sampsec) = [ut.AverageMeter() for _ in range(9)]
-  tic = time.time()
-  for kk, (ii, x) in enumerate(data_loader):
-    # forward
-    ii, x = ii.to(device), x.to(device)
-    (batch_obj, batch_loss, batch_reg, batch_Ureg, batch_Vreg,
-        batch_sprs, batch_norm_x_) = optimizer.step(ii, x)
-    batch_size = x.size(0)
-
-    obj.update(batch_obj, batch_size)
-    loss.update(batch_loss, batch_size)
-    reg.update(batch_reg, batch_size)
-    Ureg.update(batch_Ureg, batch_size)
-    Vreg.update(batch_Vreg, batch_size)
-    sprs.update(batch_sprs, batch_size)
-    norm_x_.update(batch_norm_x_, batch_size)
-
-    batch_time = time.time() - tic
-    sampsec.update(batch_size/batch_time, batch_size)
-    tic = time.time()
-
-    if torch.isnan(batch_obj):
-      raise RuntimeError('Divergence! NaN objective.')
-
-  return (obj.avg, loss.avg, reg.avg,
-      Ureg.avg, Vreg.avg, sprs.avg, norm_x_.avg, sampsec.avg)
 
 
 if __name__ == '__main__':
@@ -169,6 +94,8 @@ if __name__ == '__main__':
   parser.add_argument('--soft-assign-decay', action='store_true',
                       help='decay soft assignment parameter at a rate 1/k')
   # training settings
+  parser.add_argument('--alt-opt', action='store_true', default=False,
+                      help='Use alternating optimization method')
   parser.add_argument('--batch-size', type=int, default=100,
                       help='Input batch size for training [default: 100]')
   parser.add_argument('--epochs', type=int, default=1000,
