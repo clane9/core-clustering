@@ -7,8 +7,6 @@ from torch.utils.data import Dataset
 
 import models as mod
 
-import ipdb
-
 
 class SynthUoSDataset(Dataset):
   """Synthetic union of subspaces dataset."""
@@ -83,7 +81,6 @@ class SynthUoMDataset(Dataset):
     if seed is not None:
       torch.manual_seed(seed)
 
-    ipdb.set_trace()
     self.group_models = [mod.ResidualManifoldAEModel(d, D, H,
         drop_p=0.0, res_lamb=0.0) for _ in range(n)]
     # scale weights to control smoothness

@@ -44,7 +44,6 @@ def train_loop(model, data_loader, device, optimizer, out_dir,
   best_obj = float('inf')
   lr = float('inf')
   model.train()
-  ipdb.set_trace()
   for epoch in range(1, epochs+1):
     try:
       metrics = train_epoch(data_loader, optimizer, device)

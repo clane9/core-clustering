@@ -18,7 +18,7 @@ import models as mod
 import optimizers as opt
 import training as tr
 
-import ipdb
+# import ipdb
 
 CHKP_FREQ = 50
 STOP_FREQ = 10
@@ -46,7 +46,6 @@ def main():
   np.random.seed(args.seed)
 
   # construct model
-  ipdb.set_trace()
   H_ = int(np.ceil(args.H*args.over_param))
   group_models = [mod.ResidualManifoldAEModel(args.d, args.D, H_,
       args.drop_p, args.lamb) for _ in range(args.n)]

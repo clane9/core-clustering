@@ -18,7 +18,7 @@ import models as mod
 import optimizers as opt
 import training as tr
 
-import ipdb
+# import ipdb
 
 CHKP_FREQ = 50
 STOP_FREQ = 10
@@ -48,7 +48,6 @@ def main():
   np.random.seed(args.seed)
 
   # construct model
-  ipdb.set_trace()
   group_models = [mod.SubspaceAEModel(args.d, args.D, args.affine)
       for _ in range(args.n)]
   model = mod.KManifoldAEClusterModel(args.n, args.d, args.D, N,
