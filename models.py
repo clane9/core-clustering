@@ -12,7 +12,7 @@ class KManifoldClusterModel(nn.Module):
   """Model of union of low-dimensional manifolds generalizing
   k-means/k-subspaces."""
   def __init__(self, n, d, D, N, batch_size, group_models=None,
-      use_cuda=False):
+        use_cuda=False):
     super(KManifoldClusterModel, self).__init__()
 
     self.n = n  # number of groups
@@ -144,9 +144,12 @@ class KManifoldClusterModel(nn.Module):
     self.V[ii, :, :] = self.v.data.cpu()
     return
 
-  def get_groups(self):
+  def get_groups(self, full=True):
     """compute group assignment."""
-    groups = torch.argmax(self.C.data, dim=1).cpu().numpy()
+    if full:
+      groups = torch.argmax(self.C.data, dim=1).cpu().numpy()
+    else:
+      groups = torch.argmax(self.c.data, dim=1).cpu().numpy()
     return groups
 
 
