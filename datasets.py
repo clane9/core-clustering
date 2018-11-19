@@ -49,7 +49,7 @@ class SynthUoSDataset(Dataset):
       self.X += E
 
     # permute order of data
-    self.perm = np.random.permutation(self.N)
+    self.perm = rng.permutation(self.N)
     self.X = self.X[self.perm, :]
     self.groups = self.groups[self.perm]
 
