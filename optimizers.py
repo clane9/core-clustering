@@ -104,6 +104,11 @@ class KManifoldSGD(KClusterOptimizer):
   def __init__(self, model, lr, lamb_U, lamb_V=None, momentum=0.0,
         nesterov=False, soft_assign=0.0):
 
+    lamb_V = lamb_U if lamb_V is None else lamb_V
+    min_lamb = np.min([lamb_U, lamb_V])
+    if min_lamb < 0.0:
+      raise ValueError("Invalid regularization lambda: {}".format(min_lamb))
+
     params = [{'name': 'C', 'params': [model.c]},
         {'name': 'V', 'params': [model.v]},
         {'name': 'U', 'params': model.group_models.parameters()}]
@@ -112,7 +117,7 @@ class KManifoldSGD(KClusterOptimizer):
         nesterov, soft_assign)
 
     self.lamb_U = lamb_U
-    self.lamb_V = lamb_U if lamb_V is None else lamb_V
+    self.lamb_V = lamb_V
     return
 
   def step(self, ii, x, groups):
@@ -124,8 +129,8 @@ class KManifoldSGD(KClusterOptimizer):
       groups (numpy ndarray): minibatch true groups
     """
     self.model.set_cv(ii)
-    self._step_C(x)
     obj, loss, reg, Ureg, Vreg, x_ = self._step_U_V(ii, x)
+    self._step_C(x)
     self.model.set_CV(ii)
 
     sprs = self.model.eval_sprs()
@@ -235,9 +240,9 @@ class KManifoldAltSGD(KManifoldSGD):
       groups (numpy ndarray): minibatch true groups
     """
     self.model.set_cv(ii)
+    obj, loss, reg, Ureg, Vreg, x_ = self._step_U(x)
     self._step_V(ii, x)
     self._step_C(x)
-    obj, loss, reg, Ureg, Vreg, x_ = self._step_U(x)
     self.model.set_CV(ii)
 
     sprs = self.model.eval_sprs()
@@ -427,8 +432,8 @@ class KManifoldAESGD(KClusterOptimizer):
       x (FloatTensor): current minibatch data
       groups (numpy ndarray): minibatch true groups
     """
-    self._step_C(x)
     obj, loss, reg, x_ = self._step_U_V(x)
+    self._step_C(x)
     # included for consistency
     Ureg = reg
     Vreg = 0.0
