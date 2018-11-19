@@ -18,7 +18,7 @@ import models as mod
 import optimizers as opt
 import training as tr
 
-import ipdb
+# import ipdb
 
 CHKP_FREQ = 50
 STOP_FREQ = 10

@@ -139,7 +139,7 @@ class KManifoldClusterModel(KClusterModel):
     if wrt in ['all', 'U']:
       Ureg = sum((gm.reg() for gm in self.group_models))
       # NOTE: disabled division by N
-      Ureg = Ureg / self.N
+      # Ureg = Ureg / self.N
     else:
       Ureg = 0.0
 
