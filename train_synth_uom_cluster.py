@@ -63,7 +63,7 @@ def main():
   # optimizer & lr schedule
   if args.auto_enc:
     optimizer = opt.KManifoldAESGD(model, lr=args.init_lr,
-        lamb=args.lamb, momentum=args.momentum, nesterov=args.nesterov,
+        lamb=args.lamb_U, momentum=args.momentum, nesterov=args.nesterov,
         soft_assign=args.soft_assign)
   else:
     if args.alt_opt:
