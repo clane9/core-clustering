@@ -45,23 +45,16 @@ def train_loop(model, data_loader, device, optimizer, out_dir,
   best_obj = float('inf')
   lr = float('inf')
   model.train()
-  ipdb.set_trace()
   for epoch in range(1, epochs+1):
     try:
-      tic = time.time()
       metrics = train_epoch(data_loader, optimizer, device)
-      rtime = time.time() - tic
-      metrics += (rtime,)
-      # NOTE: instead could compute cluster error in more "online" fashion
-      cluster_error = ut.eval_cluster_error(model.get_groups(),
-          data_loader.dataset.groups)
       lr = ut.get_learning_rate(optimizer)
 
       with open(val_logf, 'a') as f:
-        print(logformstr.format(epoch, lr, cluster_error, *metrics), file=f)
-      print(printformstr.format(epoch, epochs, lr, cluster_error, *metrics))
+        print(logformstr.format(epoch, lr, *metrics), file=f)
+      print(printformstr.format(epoch, epochs, lr, *metrics))
 
-      obj = metrics[0]
+      cluster_error, obj = metrics[:2]
       is_conv = lr <= min_lr or epoch == epochs
       scheduler.step(obj)
     except Exception as err:
@@ -95,14 +88,15 @@ def train_loop(model, data_loader, device, optimizer, out_dir,
 
 def train_epoch(data_loader, optimizer, device):
   """train model for one epoch and record convergence measures."""
-  (obj, loss, reg, Ureg, Vreg,
-      sprs, norm_x_, sampsec) = [ut.AverageMeter() for _ in range(8)]
-  for ii, x, _ in data_loader:
+  (obj, loss, reg, Ureg, Vreg, sprs, norm_x_,
+      conf_mat, sampsec) = [ut.AverageMeter() for _ in range(9)]
+  epoch_tic = time.time()
+  for ii, x, groups in data_loader:
     # forward
     tic = time.time()
     ii, x = ii.to(device), x.to(device)
-    (batch_obj, batch_loss, batch_reg, batch_Ureg, batch_Vreg,
-        batch_sprs, batch_norm_x_) = optimizer.step(ii, x)
+    (batch_obj, batch_loss, batch_reg, batch_Ureg, batch_Vreg, batch_sprs,
+        batch_norm_x_, batch_conf_mat) = optimizer.step(ii, x, groups)
     batch_size = x.size(0)
 
     obj.update(batch_obj, batch_size)
@@ -112,12 +106,14 @@ def train_epoch(data_loader, optimizer, device):
     Vreg.update(batch_Vreg, batch_size)
     sprs.update(batch_sprs, batch_size)
     norm_x_.update(batch_norm_x_, batch_size)
+    conf_mat.update(batch_conf_mat, 1)
 
     batch_time = time.time() - tic
     sampsec.update(batch_size/batch_time, batch_size)
 
     if torch.isnan(batch_obj):
       raise RuntimeError('Divergence! NaN objective.')
-
-  return (obj.avg, loss.avg, reg.avg,
-      Ureg.avg, Vreg.avg, sprs.avg, norm_x_.avg, sampsec.avg)
+  rtime = time.time() - epoch_tic
+  cluster_error = ut.eval_cluster_error(conf_mat.sum)
+  return (cluster_error, obj.avg, loss.avg, reg.avg,
+      Ureg.avg, Vreg.avg, sprs.avg, norm_x_.avg, sampsec.avg, rtime)

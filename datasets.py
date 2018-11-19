@@ -49,12 +49,11 @@ class SynthUoSDataset(Dataset):
       self.X += E
 
     # permute order of data
-    self.perm = np.random.permutation(self.N)
+    self.perm = rng.permutation(self.N)
     self.X = self.X[self.perm, :]
     self.groups = self.groups[self.perm]
 
     self.X = torch.tensor(self.X, dtype=torch.float32)
-    self.groups = torch.from_numpy(self.groups)
     return
 
   def __len__(self):
@@ -92,23 +91,21 @@ class SynthUoMDataset(Dataset):
     self.planted_model = mod.KManifoldClusterModel(n, d, D, self.N, self.N,
         self.group_models)
     self.planted_model.eval()
-    # disable gradient computation
-    for p in self.planted_model.parameters():
-      p.requires_grad = False
 
     # generate true groups and segmentation
     self.groups = np.arange(n, dtype=np.int64).reshape(-1, 1)
     self.groups = np.tile(self.groups, (1, Ng)).reshape(-1)
-    self.groups = torch.from_numpy(self.groups)
 
     self.planted_model.C.zero_()
-    self.planted_model.C.scatter_(1, self.groups.view(-1, 1), 1)
+    self.planted_model.C.scatter_(1,
+        torch.from_numpy(self.groups).view(-1, 1), 1)
 
     # generate union of manifold data
     ii = torch.arange(self.N, dtype=torch.int64)
-    self.X = self.planted_model(ii)
-    self.X.mul_(self.planted_model.C.unsqueeze(1))
-    self.X = self.X.sum(dim=2)
+    with torch.no_grad():
+      self.X = self.planted_model(ii)
+      self.X.mul_(self.planted_model.C.unsqueeze(1))
+      self.X = self.X.sum(dim=2)
 
     if sigma > 0.:
       E = torch.randn(self.N, D).mul(sigma/np.sqrt(D))
