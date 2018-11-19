@@ -111,12 +111,12 @@ if __name__ == '__main__':
                       '[default: 1.0]'))
   parser.add_argument('--drop-p', type=float, default=0.0,
                       help='Dropout in manifold models [default: 0.0]')
-  parser.add_argument('--lamb_U', type=float, default=1e-4,
+  parser.add_argument('--lamb-U', type=float, default=1e-4,
                       help='U reg parameter [default: 1e-4]')
-  parser.add_argument('--lamb_V', type=float, default=None,
-                      help='V reg parameter [default: lamb_U]')
-  parser.add_argument('--soft-assign', type=float, default=0.0,
-                      help='soft assignment parameter [default: 0.0]')
+  parser.add_argument('--lamb-V', type=float, default=0.1,
+                      help='V reg parameter [default: 0.1]')
+  parser.add_argument('--soft-assign', type=float, default=0.1,
+                      help='soft assignment parameter [default: 0.1]')
   # training settings
   parser.add_argument('--alt-opt', action='store_true', default=False,
                       help='Use alternating optimization method')

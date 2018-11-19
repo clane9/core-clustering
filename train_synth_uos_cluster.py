@@ -18,7 +18,7 @@ import models as mod
 import optimizers as opt
 import training as tr
 
-# import ipdb
+import ipdb
 
 CHKP_FREQ = 50
 STOP_FREQ = 10
@@ -102,10 +102,10 @@ if __name__ == '__main__':
   # model settings
   parser.add_argument('--auto-enc', action='store_true', default=False,
                       help='use auto-encoder formulation')
-  parser.add_argument('--lamb_U', type=float, default=1e-4,
+  parser.add_argument('--lamb-U', type=float, default=1e-4,
                       help='U reg parameter [default: 1e-4]')
-  parser.add_argument('--lamb_V', type=float, default=None,
-                      help='V reg parameter [default: lamb_U]')
+  parser.add_argument('--lamb-V', type=float, default=0.1,
+                      help='V reg parameter [default: 0.1]')
   parser.add_argument('--soft-assign', type=float, default=0.1,
                       help='soft assignment parameter [default: 0.1]')
   # training settings

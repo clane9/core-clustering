@@ -31,7 +31,6 @@ class KClusterModel(nn.Module):
 
     # NOTE: might not need to have fixed batch size in this case
     self.c = nn.Parameter(torch.Tensor(batch_size, n))
-    self.reset_parameters()
     return
 
   def reset_parameters(self):
@@ -39,8 +38,6 @@ class KClusterModel(nn.Module):
     sigma=0.01."""
     self.c.data.normal_(1., 0.01).abs_()
     self.c.data.div_(self.c.data.sum(dim=1, keepdim=True))
-    for module in self.modules():
-      module.reset_parameters()
     return
 
   def forward(self, *args, **kwargs):
@@ -81,6 +78,9 @@ class KManifoldClusterModel(KClusterModel):
     if group_models is None:
       group_models = [SubspaceModel(d, D) for _ in range(n)]
 
+    super(KManifoldClusterModel, self).__init__(n, d, D, N, batch_size,
+        group_models)
+
     # assignment and coefficient matrices, used with sparse embedding.
     # NOTE: don't want these potentially huge variables ever sent to gpu
     self.C = torch.Tensor(N, n)
@@ -91,9 +91,7 @@ class KManifoldClusterModel(KClusterModel):
       self.V = self.V.pin_memory()
     self.use_cuda = use_cuda
     self.v = nn.Parameter(torch.Tensor(batch_size, d, n))
-
-    super(KManifoldClusterModel, self).__init__(n, d, D, N, batch_size,
-        group_models)
+    self.reset_parameters()
     return
 
   def reset_parameters(self):
@@ -141,7 +139,7 @@ class KManifoldClusterModel(KClusterModel):
     if wrt in ['all', 'U']:
       Ureg = sum((gm.reg() for gm in self.group_models))
       # NOTE: disabled division by N
-      # Ureg = Ureg / self.N
+      Ureg = Ureg / self.N
     else:
       Ureg = 0.0
 
@@ -197,6 +195,7 @@ class KManifoldAEClusterModel(KClusterModel):
       group_models = [SubspaceAEModel(d, D) for _ in range(n)]
     super(KManifoldAEClusterModel, self).__init__(n, d, D, N, batch_size,
         group_models)
+    self.reset_parameters()
     return
 
   def forward(self, x):
@@ -238,16 +237,12 @@ class GroupModel(nn.Module):
 
   def __init__(self, d, D):
     super(GroupModel, self).__init__()
-
     self.d = d  # subspace dimension
     self.D = D  # ambient dimension
-    self.reset_parameters()
     return
 
   def reset_parameters(self):
-    for module in self.modules():
-      module.reset_paramters()
-    return
+    raise NotImplementedError("reset_parameters not implemented")
 
   def forward(self, *args, **kwargs):
     raise NotImplementedError("forward not implemented")
@@ -261,6 +256,8 @@ class SubspaceModel(GroupModel):
 
   def __init__(self, d, D, affine=False):
     self.affine = affine  # whether affine or linear subspaces.
+    super(SubspaceModel, self).__init__(d, D)
+
     # construct subspace parameters and initialize
     # logic taken from pytorch Linear layer code
     self.U = nn.Parameter(torch.Tensor(D, d))
@@ -268,7 +265,7 @@ class SubspaceModel(GroupModel):
       self.b = nn.Parameter(torch.Tensor(D))
     else:
       self.register_parameter('b', None)
-    super(SubspaceModel, self).__init__(d, D)
+    self.reset_parameters()
     return
 
   def reset_parameters(self):
@@ -297,8 +294,7 @@ class ResidualManifoldModel(GroupModel):
   a single hidden layer network with ReLU activation and dropout."""
 
   def __init__(self, d, D, H=None, drop_p=0.5, res_lamb=1.0):
-    self.d = d
-    self.D = D
+    super(ResidualManifoldModel, self).__init__(d, D)
 
     self.H = H if H else D  # size of hidden layer
     self.drop_p = drop_p
@@ -307,7 +303,7 @@ class ResidualManifoldModel(GroupModel):
     self.subspace_embedding = SubspaceModel(d, D, affine=True)
     self.res_fc1 = nn.Linear(d, self.H, bias=False)
     self.res_fc2 = nn.Linear(self.H, D, bias=False)
-    # NOTE: not calling reset_parameters or parent init since already done.
+    # NOTE: not calling reset_parameters since already done.
     return
 
   def forward(self, v):
@@ -336,6 +332,7 @@ class SubspaceAEModel(GroupModel):
   (i.e. pca)."""
 
   def __init__(self, d, D, affine=False):
+    super(SubspaceAEModel, self).__init__(d, D)
     self.affine = affine  # whether affine or linear subspaces.
     # NOTE: should V really be U^T, as in pca?
     self.U = nn.Parameter(torch.Tensor(D, d))
@@ -344,7 +341,7 @@ class SubspaceAEModel(GroupModel):
       self.b = nn.Parameter(torch.Tensor(D))
     else:
       self.register_parameter('b', None)
-    super(SubspaceAEModel, self).__init__(d, D)
+    self.reset_parameters()
     return
 
   def reset_parameters(self):
@@ -389,8 +386,8 @@ class ResidualManifoldAEModel(GroupModel):
   a single hidden layer network with ReLU activation and dropout."""
 
   def __init__(self, d, D, H=None, drop_p=0.5, res_lamb=1.0):
-    self.d = d  # subspace dimension
-    self.D = D  # ambient dimension
+    super(ResidualManifoldAEModel, self).__init__(d, D)
+
     self.H = H if H else D  # size of hidden layer
     self.drop_p = drop_p
     self.res_lamb = res_lamb  # residual weights regularization parameter
@@ -404,7 +401,7 @@ class ResidualManifoldAEModel(GroupModel):
     self.enc_fc2 = nn.Linear(self.H, d, bias=False)
     self.dec_fc1 = nn.Linear(d, self.H, bias=False)
     self.dec_fc2 = nn.Linear(self.H, D, bias=False)
-    # NOTE: not calling reset_parameters or parent init since already done.
+    # NOTE: not calling reset_parameters since already done.
     return
 
   def forward(self, x):
