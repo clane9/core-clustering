@@ -54,32 +54,24 @@ def eval_cluster_error(*args, **kwargs):
 
   Examples:
     cluster_error = eval_cluster_error(conf_mat)
-    cluster_error = eval_cluster_error(groups, true_groups, n=None)
+    cluster_error = eval_cluster_error(groups, true_groups)
 
   Args:
     conf_mat: (n, n) group confusion matrix
     groups: (N,) group assignment
     true_groups: (N,) true group assignment
-    n (optional): number of groups (default: infer from true_groups)
   """
-  if len(args) < 1 or len(args) > 3:
+  if len(args) not in (1, 2):
     raise ValueError("Invalid number of arguments")
   elif len(args) == 1:
     conf_mat = args[0]
-    if ((not isinstance(conf_mat, np.ndarray)) or
-        (len(conf_mat.shape) != 2) or
-            (conf_mat.shape[0] != conf_mat.shape[1])):
+    if ((not isinstance(conf_mat, np.ndarray)) or (len(conf_mat.shape) != 2)):
       raise ValueError("Invalid format for confusion matrix")
   else:
     groups = args[0]
     true_groups = args[1]
-    if len(args) == 3:
-      n = args[2]
-    elif 'n' in kwargs:
-      n = kwargs['n']
-    else:
-      n = None
-    conf_mat = eval_confusion(groups, true_groups, n)
+    # number of groups and labels will be inferred from groups and true_groups.
+    conf_mat = eval_confusion(groups, true_groups)
 
   row_ind, col_ind = linear_sum_assignment(-conf_mat)
   correct = conf_mat[row_ind, col_ind].sum()
@@ -88,7 +80,7 @@ def eval_cluster_error(*args, **kwargs):
   return cluster_error
 
 
-def eval_confusion(groups, true_groups, n=None):
+def eval_confusion(groups, true_groups, n=None, true_n=None):
   """compute confusion matrix between assigned and true groups"""
   if torch.is_tensor(groups):
     groups = groups.cpu().numpy()
@@ -98,8 +90,12 @@ def eval_confusion(groups, true_groups, n=None):
     raise ValueError("groups true_groups must have the same size")
 
   if n is not None:
+    # if n (true_n) given, assume labels are 0,...,n-1 (0,...,true_n-1)
     labels = np.arange(n).reshape((1, n))
-    labels_true = labels
+    if true_n is not None:
+      labels_true = np.arange(true_n).reshape((1, true_n))
+    else:
+      labels_true = labels
   else:
     labels = np.unique(groups)
     labels_true = np.unique(true_groups)
