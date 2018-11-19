@@ -93,6 +93,7 @@ if __name__ == '__main__':
                       help='Ambient dimension [default: 100]')
   parser.add_argument('--Ng', type=int, default=1000,
                       help='Points per group [default: 1000]')
+
   parser.add_argument('--affine', action='store_true',
                       help='Affine setting')
   parser.add_argument('--sigma', type=float, default=0.01,
@@ -111,6 +112,7 @@ if __name__ == '__main__':
   # training settings
   parser.add_argument('--alt-opt', action='store_true', default=False,
                       help='Use alternating optimization method')
+
   parser.add_argument('--batch-size', type=int, default=100,
                       help='Input batch size for training [default: 100]')
   parser.add_argument('--epochs', type=int, default=1000,
