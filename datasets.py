@@ -4,6 +4,7 @@ from __future__ import print_function
 import numpy as np
 import torch
 from torch.utils.data import Dataset
+from torchvision.datasets import MNIST
 
 import models as mod
 
@@ -80,6 +81,7 @@ class SynthUoMDataset(Dataset):
 
     if seed is not None:
       torch.manual_seed(seed)
+    rng = np.random.RandomState(seed=seed)
 
     self.group_models = [mod.ResidualManifoldModel(d, D, H,
         drop_p=0.0, res_lamb=0.0) for _ in range(n)]
@@ -112,7 +114,7 @@ class SynthUoMDataset(Dataset):
       self.X += E
 
     # permute order of data
-    self.perm = np.random.permutation(self.N)
+    self.perm = rng.permutation(self.N)
     self.X = self.X[self.perm, :]
     self.groups = self.groups[self.perm]
     return
@@ -122,3 +124,30 @@ class SynthUoMDataset(Dataset):
 
   def __getitem__(self, ii):
     return torch.tensor(ii), self.X[ii, :], self.groups[ii]
+
+
+class MNISTUoM(MNIST):
+  """`MNIST <http://yann.lecun.com/exdb/mnist/>`_ Dataset.
+    Args:
+      root (string): Root directory of dataset where ``processed/training.pt``
+        and  ``processed/test.pt`` exist.
+      train (bool, optional): If True, creates dataset from ``training.pt``,
+        otherwise from ``test.pt``.
+      download (bool, optional): If true, downloads the dataset from the
+        internet and puts it in root directory. If dataset is already
+        downloaded, it is not downloaded again.
+      transform (callable, optional): A function/transform that  takes in an
+        PIL image and returns a transformed version. E.g,
+        ``transforms.RandomCrop``
+      target_transform (callable, optional): A function/transform that takes in
+        the target and transforms it.
+    """
+  def __getitem__(self, index):
+    """
+    Args:
+      index (int): Index
+    Returns:
+      tuple: (index, image, target) where target is index of the target class.
+    """
+    img, target = super(MNISTUoM, self).__getitem__(index)
+    return torch.tensor(index), img, target
