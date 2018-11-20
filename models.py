@@ -11,20 +11,18 @@ import torch.nn.functional as F
 class KClusterModel(nn.Module):
   """Base class for k-cluster model."""
 
-  def __init__(self, n, d, D, N, batch_size, group_models):
+  def __init__(self, n, d, N, batch_size, group_models):
     super(KClusterModel, self).__init__()
 
     self.n = n  # number of groups
     self.d = d  # dimension of manifold
-    self.D = D  # ambient dimension
     self.N = N  # number of data points
     self.batch_size = batch_size
 
     # quick check to make sure group models constructed correctly
     group_model_check = (len(group_models) == n and
-        isinstance(group_models[0], GroupModel) and
-        group_models[0].d == d and
-        group_models[0].D == D)
+        isinstance(group_models[0], nn.Module) and
+        group_models[0].d == d)
     if not group_model_check:
       raise ValueError("Invalid sequence of group_models")
     self.group_models = nn.ModuleList(group_models)
@@ -59,8 +57,12 @@ class KClusterModel(nn.Module):
     c = self.c.data
     x = x.data
     x_ = x_.data
-    norm_x_ = torch.sum(c*torch.norm(x_, 2, dim=1), dim=1)
-    norm_x_ = torch.mean(norm_x_ / (torch.norm(x, 2, dim=1) + 1e-8))
+    # x_ is size (n, batch_size, ...)
+    norm_x_ = torch.sqrt(torch.sum(x_**2, dim=tuple(range(2, x_.dim())))).t()
+    norm_x_ = torch.sum(c*norm_x_, dim=1)
+    # x is size (batch_size, ...)
+    norm_x = torch.sqrt(torch.sum(x**2, dim=tuple(range(1, x.dim()))))
+    norm_x_ = torch.mean(norm_x_ / (norm_x + 1e-8))
     return norm_x_
 
   def get_groups(self):
@@ -73,12 +75,8 @@ class KManifoldClusterModel(KClusterModel):
   """Model of union of low-dimensional manifolds generalizing
   k-means/k-subspaces."""
 
-  def __init__(self, n, d, D, N, batch_size, group_models=None,
-        use_cuda=False):
-    if group_models is None:
-      group_models = [SubspaceModel(d, D) for _ in range(n)]
-
-    super(KManifoldClusterModel, self).__init__(n, d, D, N, batch_size,
+  def __init__(self, n, d, N, batch_size, group_models, use_cuda=False):
+    super(KManifoldClusterModel, self).__init__(n, d, N, batch_size,
         group_models)
 
     # assignment and coefficient matrices, used with sparse embedding.
@@ -111,8 +109,10 @@ class KManifoldClusterModel(KClusterModel):
     # compute embeddings for each group and concatenate
     # NOTE: is this efficient on gpu/cpu?
     # NOTE: could use jit trace to get some optimization.
+    # NOTE: stack along 0 dimension so that shape of x doesn't matter, and
+    # memory layout should also be better.
     x_ = torch.stack([gm(self.v[:, :, jj])
-        for jj, gm in enumerate(self.group_models)], dim=2)
+        for jj, gm in enumerate(self.group_models)], dim=0)
     return x_
 
   def objective(self, x, ii=None, lamb_U=.01, lamb_V=None, wrt='all'):
@@ -123,11 +123,7 @@ class KManifoldClusterModel(KClusterModel):
 
     # evaluate loss: least-squares weighted by assignment, as in k-means.
     x_ = self(ii)
-    # NOTE: this call introduces memory leak of size (batch_size, D, n)
-    # every iteration of AltSGD algorithm. Very strange..
-    # Fixed once made sure all objective calls not requiring gradient were
-    # wrapped in torch.no_grad(). Still strange though...
-    loss = torch.sum((x.unsqueeze(2) - x_)**2, dim=1)
+    loss = torch.sum((x.unsqueeze(0) - x_)**2, dim=tuple(range(2, x_.dim()))).t()
     if wrt in ['all', 'U']:
       loss = torch.mean(torch.sum(self.c*loss, dim=1))
     elif wrt == 'V':
@@ -190,10 +186,8 @@ class KManifoldAEClusterModel(KClusterModel):
   """Model of union of low-dimensional manifolds generalizing
   k-means/k-subspaces. Coefficients computed using auto-encoder."""
 
-  def __init__(self, n, d, D, N, batch_size, group_models=None):
-    if group_models is None:
-      group_models = [SubspaceAEModel(d, D) for _ in range(n)]
-    super(KManifoldAEClusterModel, self).__init__(n, d, D, N, batch_size,
+  def __init__(self, n, d, N, batch_size, group_models):
+    super(KManifoldAEClusterModel, self).__init__(n, d, N, batch_size,
         group_models)
     self.reset_parameters()
     return
@@ -203,7 +197,9 @@ class KManifoldAEClusterModel(KClusterModel):
     # compute embeddings for each group and concatenate
     # NOTE: is this efficient on gpu/cpu?
     # NOTE: could use jit trace to get some optimization.
-    x_ = torch.stack([gm(x) for gm in self.group_models], dim=2)
+    # NOTE: stack along 0 dimension so that shape of x doesn't matter, and
+    # memory layout should also be better.
+    x_ = torch.stack([gm(x) for gm in self.group_models], dim=0)
     return x_
 
   def objective(self, x, lamb=.01, wrt='all'):
@@ -212,11 +208,7 @@ class KManifoldAEClusterModel(KClusterModel):
 
     # evaluate loss: least-squares weighted by assignment, as in k-means.
     x_ = self(x)
-    # NOTE: this call introduces memory leak of size (batch_size, D, n)
-    # every iteration of AltSGD algorithm. Very strange..
-    # Fixed once made sure all objective calls not requiring gradient were
-    # wrapped in torch.no_grad(). Still strange though...
-    loss = torch.sum((x.unsqueeze(2) - x_)**2, dim=1)
+    loss = torch.sum((x.unsqueeze(0) - x_)**2, dim=tuple(range(2, x_.dim()))).t()
     if wrt in ['all', 'U']:
       loss = torch.mean(torch.sum(self.c*loss, dim=1))
     # for wrt C, use (batch_size, n) matrix of losses for computing closed form
@@ -232,31 +224,13 @@ class KManifoldAEClusterModel(KClusterModel):
     return obj, loss, reg, x_
 
 
-class GroupModel(nn.Module):
-  """Model of single cluster."""
-
-  def __init__(self, d, D):
-    super(GroupModel, self).__init__()
-    self.d = d  # subspace dimension
-    self.D = D  # ambient dimension
-    return
-
-  def reset_parameters(self):
-    raise NotImplementedError("reset_parameters not implemented")
-
-  def forward(self, *args, **kwargs):
-    raise NotImplementedError("forward not implemented")
-
-  def reg(self):
-    raise NotImplementedError("reg not implemented")
-
-
-class SubspaceModel(GroupModel):
+class SubspaceModel(nn.Module):
   """Model of single low-dimensional affine or linear subspace."""
 
   def __init__(self, d, D, affine=False):
+    super(SubspaceModel, self).__init__()
+    self.D = D  # ambient dimension
     self.affine = affine  # whether affine or linear subspaces.
-    super(SubspaceModel, self).__init__(d, D)
 
     # construct subspace parameters and initialize
     # logic taken from pytorch Linear layer code
@@ -287,14 +261,16 @@ class SubspaceModel(GroupModel):
     return reg
 
 
-class ResidualManifoldModel(GroupModel):
+class ResidualManifoldModel(nn.Module):
   """Model of single low-dimensional manifold.
 
   Represented as affine subspace + nonlinear residual. Residual module is just
   a single hidden layer network with ReLU activation and dropout."""
 
   def __init__(self, d, D, H=None, drop_p=0.5, res_lamb=1.0):
-    super(ResidualManifoldModel, self).__init__(d, D)
+    super(ResidualManifoldModel, self).__init__()
+    self.d = d  # manifold dimension
+    self.D = D  # ambient dimension
 
     self.H = H if H else D  # size of hidden layer
     self.drop_p = drop_p
@@ -303,7 +279,6 @@ class ResidualManifoldModel(GroupModel):
     self.subspace_embedding = SubspaceModel(d, D, affine=True)
     self.res_fc1 = nn.Linear(d, self.H, bias=False)
     self.res_fc2 = nn.Linear(self.H, D, bias=False)
-    # NOTE: not calling reset_parameters since already done.
     return
 
   def forward(self, v):
@@ -327,13 +302,53 @@ class ResidualManifoldModel(GroupModel):
     return reg
 
 
-class SubspaceAEModel(GroupModel):
+class MNISTDCManifoldModel(nn.Module):
+  def __init__(self, d, filters, drop_p=0.5):
+    super(MNISTDCManifoldModel, self).__init__()
+    self.conv_generator = nn.Sequential(
+        nn.ConvTranspose2d(d, 2*filters, 7, 1, 0, bias=False),
+        nn.BatchNorm2d(2*filters),
+        nn.ReLU(),
+        nn.Dropout2d(p=drop_p),
+        # size (2*filters, 7, 7)
+        nn.ConvTranspose2d(2*filters, filters, 4, 2, 1, bias=False),
+        nn.BatchNorm2d(filters),
+        nn.ReLU(),
+        nn.Dropout2d(p=drop_p),
+        # size (filters, 14, 14)
+        nn.ConvTranspose2d(filters, 1, 4, 2, 1, bias=False),
+        nn.Tanh()
+        # size (1, 28, 28)
+    )
+    self.d = d
+    self.filters = filters
+    return
+
+  def forward(self, v):
+    """Compute deep convolutional manifold embedding using coefficients v."""
+    x = self.conv_generator(v.view(-1, self.d, 1, 1))
+    return x
+
+  def reg(self):
+    """Compute l2 squared regularizer on last batchnorm weight and last conv
+    filter."""
+    # NOTE: confirm that network is ph degree zero wrt earlier weights?
+    # last batchnorm should reset ph for all previous layers
+    reg = (self.conv_generator[5].weight.pow(2).sum() +
+        self.conv_generator[8].weight.pow(2).sum())
+    return reg
+
+
+class SubspaceAEModel(nn.Module):
   """Model of single low-dimensional affine or linear subspace auto-encoder
   (i.e. pca)."""
 
   def __init__(self, d, D, affine=False):
-    super(SubspaceAEModel, self).__init__(d, D)
+    super(SubspaceAEModel, self).__init__()
+    self.d = d  # manifold dimension
+    self.D = D  # ambient dimension
     self.affine = affine  # whether affine or linear subspaces.
+
     # NOTE: should V really be U^T, as in pca?
     self.U = nn.Parameter(torch.Tensor(D, d))
     self.V = nn.Parameter(torch.Tensor(d, D))
@@ -379,14 +394,16 @@ class SubspaceAEModel(GroupModel):
     return reg
 
 
-class ResidualManifoldAEModel(GroupModel):
+class ResidualManifoldAEModel(nn.Module):
   """Model of single low-dimensional manifold.
 
   Represented as affine subspace + nonlinear residual. Residual module is just
   a single hidden layer network with ReLU activation and dropout."""
 
   def __init__(self, d, D, H=None, drop_p=0.5, res_lamb=1.0):
-    super(ResidualManifoldAEModel, self).__init__(d, D)
+    super(ResidualManifoldAEModel, self).__init__()
+    self.d = d  # manifold dimension
+    self.D = D  # ambient dimension
 
     self.H = H if H else D  # size of hidden layer
     self.drop_p = drop_p
