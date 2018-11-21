@@ -42,6 +42,7 @@ def train_loop(model, data_loader, device, optimizer, out_dir,
       factor=0.5, patience=10, threshold=1e-4, min_lr=min_lr)
 
   # training loop
+  err = None
   best_obj = float('inf')
   lr = float('inf')
   model.train()
@@ -57,8 +58,8 @@ def train_loop(model, data_loader, device, optimizer, out_dir,
       cluster_error, obj = metrics[:2]
       is_conv = lr <= min_lr or epoch == epochs
       scheduler.step(obj)
-    except Exception as err:
-      print('Error: {}'.format(err))
+    except Exception as e:
+      err = e
       with open('{}/error'.format(out_dir), 'w') as f:
         print(err, file=f)
       obj = float('inf')
@@ -83,6 +84,9 @@ def train_loop(model, data_loader, device, optimizer, out_dir,
 
     if is_conv:
       break
+
+  if err is not None:
+    raise err
   return
 
 
