@@ -267,18 +267,19 @@ class ResidualManifoldModel(nn.Module):
   Represented as affine subspace + nonlinear residual. Residual module is just
   a single hidden layer network with ReLU activation and dropout."""
 
-  def __init__(self, d, D, H=None, drop_p=0.5, res_lamb=1.0):
+  def __init__(self, d, xshape, H=None, drop_p=0.5, res_lamb=1.0):
     super(ResidualManifoldModel, self).__init__()
     self.d = d  # manifold dimension
-    self.D = D  # ambient dimension
+    self.D = np.prod(xshape)  # ambient dimension
+    self.xshape = xshape
 
-    self.H = H if H else D  # size of hidden layer
+    self.H = H if H else self.D  # size of hidden layer
     self.drop_p = drop_p
     self.res_lamb = res_lamb  # residual weights regularization parameter
 
-    self.subspace_embedding = SubspaceModel(d, D, affine=True)
+    self.subspace_embedding = SubspaceModel(d, self.D, affine=True)
     self.res_fc1 = nn.Linear(d, self.H, bias=False)
-    self.res_fc2 = nn.Linear(self.H, D, bias=False)
+    self.res_fc2 = nn.Linear(self.H, self.D, bias=False)
     return
 
   def forward(self, v):
@@ -288,6 +289,7 @@ class ResidualManifoldModel(nn.Module):
     z = F.dropout(z, p=self.drop_p, training=self.training)
     z = self.res_fc2(z)
     x = x + z
+    x = x.view((-1,) + self.xshape)
     return x
 
   def reg(self):

@@ -59,6 +59,7 @@ def main():
         args.drop_p, args.lamb) for _ in range(args.n)]
     model = mod.KManifoldClusterModel(args.n, args.d, args.D, N,
         batch_size, group_models, use_cuda)
+  model.to(device)
 
   # optimizer & lr schedule
   if args.auto_enc:

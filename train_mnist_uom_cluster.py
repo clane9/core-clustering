@@ -18,6 +18,8 @@ import models as mod
 import optimizers as opt
 import training as tr
 
+# import ipdb
+
 CHKP_FREQ = 50
 STOP_FREQ = 10
 N_CLASS = 10
@@ -33,7 +35,7 @@ def main():
   np.random.seed(args.seed)
 
   # construct dataset
-  mnist_dataset = dat.MNISTUoM(args.data_dir, train=True,
+  mnist_dataset = dat.MNISTUoM(args.data_dir, train=True, download=True,
       transform=transforms.Compose([
           transforms.ToTensor(),
           transforms.Normalize((0.1307,), (0.3081,))
@@ -50,10 +52,19 @@ def main():
       batch_size=batch_size, shuffle=(batch_size != N), **kwargs)
 
   # construct model
-  group_models = [mod.MNISTDCManifoldModel(args.d, args.filters, args.drop_p)
-      for _ in range(N_CLASS)]
+  arch = args.arch.lower()
+  if arch == 'dc':
+    group_models = [mod.MNISTDCManifoldModel(args.d, args.filters, args.drop_p)
+        for _ in range(N_CLASS)]
+  elif arch == 'res':
+    group_models = [mod.ResidualManifoldModel(args.d, (1, 28, 28),
+        args.filters, args.drop_p) for _ in range(N_CLASS)]
+  else:
+    raise ValueError("Invalid architecture {}".format(arch))
+
   model = mod.KManifoldClusterModel(N_CLASS, args.d, N, batch_size,
       group_models, use_cuda)
+  model.to(device)
 
   # optimizer
   if args.alt_opt:
@@ -77,6 +88,8 @@ if __name__ == '__main__':
   parser.add_argument('--data-dir', type=str, default='~/Documents/Datasets/MNIST',
                       help='Data directory [default: ~/Documents/Datasets/MNIST].')
   # model settings
+  parser.add_argument('--arch', type=str, default='dc',
+                      help='Network architecture (dc or res) [default: dc]')
   parser.add_argument('--d', type=int, default=2,
                       help='Manifold dimension [default: 2]')
   parser.add_argument('--filters', type=int, default=20,
