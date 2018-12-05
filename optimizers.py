@@ -6,9 +6,6 @@ import torch
 import torch.optim as optim
 
 from models import KClusterModel
-import utils as ut
-
-# import ipdb
 
 C_EPS = .01
 
@@ -120,23 +117,22 @@ class KManifoldSGD(KClusterOptimizer):
     self.lamb_V = lamb_V
     return
 
-  def step(self, ii, x, groups):
+  def step(self, ii, x):
     """Performs a single optimization step with alternating V, C, U updates.
 
     Args:
       ii (LongTensor): indices for current minibatch
       x (FloatTensor): current minibatch data
-      groups (numpy ndarray): minibatch true groups
     """
     self.model.set_cv(ii)
-    obj, loss, reg, Ureg, Vreg, x_ = self._step_U_V(ii, x)
     self._step_C(x)
+    obj, loss, reg, Ureg, Vreg, x_ = self._step_U_V(ii, x)
     self.model.set_CV(ii)
 
     sprs = self.model.eval_sprs()
     norm_x_ = self.model.eval_shrink(x, x_)
-    conf_mat = ut.eval_confusion(self.model.get_groups(), groups, n=self.n)
-    return obj, loss, reg, Ureg, Vreg, sprs, norm_x_, conf_mat
+
+    return obj, loss, reg, Ureg, Vreg, sprs, norm_x_
 
   def _step_U_V(self, ii, x):
     """stochastic gradient step on U, V variables (manifold models and
@@ -231,28 +227,28 @@ class KManifoldAltSGD(KManifoldSGD):
     self.maxit_V = maxit_V
     return
 
-  def step(self, ii, x, groups):
+  def step(self, ii, x):
     """Performs a single optimization step with alternating V, C, U updates.
 
     Args:
       ii (LongTensor): indices for current minibatch
       x (FloatTensor): current minibatch data
-      groups (numpy ndarray): minibatch true groups
     """
     self.model.set_cv(ii)
-    obj, loss, reg, Ureg, Vreg, x_ = self._step_U(x)
     self._step_V(ii, x)
     self._step_C(x)
+    obj, loss, reg, Ureg, Vreg, x_ = self._step_U(x)
     self.model.set_CV(ii)
 
     sprs = self.model.eval_sprs()
     norm_x_ = self.model.eval_shrink(x, x_)
-    conf_mat = ut.eval_confusion(self.model.get_groups(), groups, n=self.n)
-    return obj, loss, reg, Ureg, Vreg, sprs, norm_x_, conf_mat
+    return obj, loss, reg, Ureg, Vreg, sprs, norm_x_
 
   def _step_V(self, ii, x):
     """one or a few exact gradient steps on V variable (manifold
-    coefficients). no acceleration."""
+    coefficients). no acceleration.
+
+    NOTE: too complicated and doesn't work well. Possibly remove."""
     group = self.params_dict['V']
     lr = group['lr']
     v = group['params'][0]
@@ -424,24 +420,23 @@ class KManifoldAESGD(KClusterOptimizer):
         nesterov, soft_assign)
     return
 
-  def step(self, _, x, groups):
-    """Performs a single optimization step with alternating V, C, U updates.
+  def step(self, _, x):
+    """Performs a single optimization step with alternating C, U_V updates.
 
     Args:
-      ii (LongTensor): indices for current minibatch (not used)
+      ii (LongTensor): indices for current minibatch (not used since c updated
+        first in closed form)
       x (FloatTensor): current minibatch data
-      groups (numpy ndarray): minibatch true groups
     """
-    obj, loss, reg, x_ = self._step_U_V(x)
     self._step_C(x)
+    obj, loss, reg, x_ = self._step_U_V(x)
     # included for consistency
     Ureg = reg
     Vreg = 0.0
 
     sprs = self.model.eval_sprs()
     norm_x_ = self.model.eval_shrink(x, x_)
-    conf_mat = ut.eval_confusion(self.model.get_groups(), groups, n=self.n)
-    return obj, loss, reg, Ureg, Vreg, sprs, norm_x_, conf_mat
+    return obj, loss, reg, Ureg, Vreg, sprs, norm_x_
 
   def _step_U_V(self, x):
     """stochastic gradient step on U, V variables (manifold models and

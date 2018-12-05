@@ -44,6 +44,10 @@ class KClusterModel(nn.Module):
   def objective(self, *args, **kwargs):
     raise NotImplementedError("objective not implemented")
 
+  def gm_reg(self):
+    """Compute regularization wrt all group models."""
+    return sum((gm.reg() for gm in self.group_models))
+
   def eval_sprs(self):
     """measure robust sparsity of current assignment subset c"""
     c = self.c.data
@@ -123,7 +127,8 @@ class KManifoldClusterModel(KClusterModel):
 
     # evaluate loss: least-squares weighted by assignment, as in k-means.
     x_ = self(ii)
-    loss = torch.sum((x.unsqueeze(0) - x_)**2, dim=tuple(range(2, x_.dim()))).t()
+    loss = torch.sum((x.unsqueeze(0) - x_)**2,
+        dim=tuple(range(2, x_.dim()))).t()
     if wrt in ['all', 'U']:
       loss = torch.mean(torch.sum(self.c*loss, dim=1))
     elif wrt == 'V':
@@ -133,7 +138,7 @@ class KManifoldClusterModel(KClusterModel):
 
     # evaluate U regularizer
     if wrt in ['all', 'U']:
-      Ureg = sum((gm.reg() for gm in self.group_models))
+      Ureg = self.gm_reg()
       # NOTE: disabled division by N
       # Ureg = Ureg / self.N
     else:
@@ -208,15 +213,17 @@ class KManifoldAEClusterModel(KClusterModel):
 
     # evaluate loss: least-squares weighted by assignment, as in k-means.
     x_ = self(x)
-    loss = torch.sum((x.unsqueeze(0) - x_)**2, dim=tuple(range(2, x_.dim()))).t()
+    loss = torch.sum((x.unsqueeze(0) - x_)**2,
+        dim=tuple(range(2, x_.dim()))).t()
     if wrt in ['all', 'U']:
+      # NOTE: c assumed to be already updated with respect to current sample.
       loss = torch.mean(torch.sum(self.c*loss, dim=1))
     # for wrt C, use (batch_size, n) matrix of losses for computing closed form
     # assignment.
 
     # evaluate U regularizer
     if wrt in ['all', 'U']:
-      reg = sum((gm.reg() for gm in self.group_models))
+      reg = self.gm_reg()
     else:
       reg = 0.0
 
@@ -318,8 +325,8 @@ class MNISTDCManifoldModel(nn.Module):
         nn.ReLU(),
         nn.Dropout2d(p=drop_p),
         # size (filters, 14, 14)
-        nn.ConvTranspose2d(filters, 1, 4, 2, 1, bias=False),
-        nn.Tanh()
+        nn.ConvTranspose2d(filters, 1, 4, 2, 1, bias=True)
+        # nn.Tanh()
         # size (1, 28, 28)
     )
     self.d = d
