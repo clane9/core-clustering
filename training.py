@@ -3,6 +3,7 @@ from __future__ import division
 from __future__ import print_function
 
 import time
+import numpy as np
 import torch
 from torch import optim
 
@@ -36,6 +37,7 @@ def train_loop(model, data_loader, device, optimizer, out_dir,
   val_logf = '{}/val_log.csv'.format(out_dir)
   with open(val_logf, 'w') as f:
     print(logheader, file=f)
+  conf_mats = np.zeros((epochs, model.n, data_loader.dataset.classes.size))
 
   min_lr = 1e-6*ut.get_learning_rate(optimizer)
   scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer,
@@ -46,9 +48,10 @@ def train_loop(model, data_loader, device, optimizer, out_dir,
   best_obj = float('inf')
   lr = float('inf')
   model.train()
-  for epoch in range(1, epochs+1):
-    try:
-      metrics = train_epoch(data_loader, optimizer, device)
+  try:
+    for epoch in range(1, epochs+1):
+      metrics, conf_mats[epoch-1, :] = train_epoch(model, data_loader,
+          optimizer, device)
       lr = ut.get_learning_rate(optimizer)
 
       with open(val_logf, 'a') as f:
@@ -58,51 +61,56 @@ def train_loop(model, data_loader, device, optimizer, out_dir,
       cluster_error, obj = metrics[:2]
       is_conv = lr <= min_lr or epoch == epochs
       scheduler.step(obj)
-    except Exception as e:
-      err = e
-      with open('{}/error'.format(out_dir), 'w') as f:
-        print(err, file=f)
-      obj = float('inf')
-      cluster_error = float('inf')
-      is_conv = True
 
-    is_best = obj < best_obj
-    best_obj = min(obj, best_obj)
-    if epoch == 1 or epoch % chkp_freq == 0 or is_conv:
-      ut.save_checkpoint({
-          'epoch': epoch,
-          'model': model.state_dict(),
-          'optimizer': optimizer.state_dict(),
-          'err': cluster_error,
-          'obj': obj},
-          is_best,
-          filename='{}/checkpoint{}.pth.tar'.format(out_dir, epoch),
-          best_filename='{}/model_best.pth.tar'.format(out_dir))
+      is_best = obj < best_obj
+      best_obj = min(obj, best_obj)
+      if epoch == 1 or epoch % chkp_freq == 0 or is_conv:
+        ut.save_checkpoint({
+            'epoch': epoch,
+            'model': model.state_dict(),
+            'optimizer': optimizer.state_dict(),
+            'err': cluster_error,
+            'obj': obj},
+            is_best,
+            filename='{}/checkpoint{}.pth.tar'.format(out_dir, epoch),
+            best_filename='{}/model_best.pth.tar'.format(out_dir))
 
-    if stop_freq > 0 and epoch % stop_freq == 0:
-      ipdb.set_trace()
+      if stop_freq > 0 and epoch % stop_freq == 0:
+        ipdb.set_trace()
 
-    if is_conv:
-      break
+      if is_conv:
+        break
 
-  if err is not None:
-    raise err
+  except Exception as e:
+    err = e
+    with open('{}/error'.format(out_dir), 'w') as f:
+      print(err, file=f)
+
+  finally:
+    with open('{}/conf_mats.npz'.format(out_dir), 'wb') as f:
+      np.savez(f, conf_mats=conf_mats[:epoch, :])
+    if err is not None:
+      raise err
   return
 
 
-def train_epoch(data_loader, optimizer, device):
+def train_epoch(model, data_loader, optimizer, device):
   """train model for one epoch and record convergence measures."""
   (obj, loss, reg, Ureg, Vreg, sprs, norm_x_,
       conf_mat, sampsec) = [ut.AverageMeter() for _ in range(9)]
   epoch_tic = time.time()
   for ii, x, groups in data_loader:
-    # forward
+    # opt step
     tic = time.time()
     ii, x = ii.to(device), x.to(device)
-    (batch_obj, batch_loss, batch_reg, batch_Ureg, batch_Vreg, batch_sprs,
-        batch_norm_x_, batch_conf_mat) = optimizer.step(ii, x, groups)
-    batch_size = x.size(0)
+    (batch_obj, batch_loss, batch_reg, batch_Ureg, batch_Vreg,
+        batch_sprs, batch_norm_x_) = optimizer.step(ii, x)
 
+    # eval batch cluster confusion
+    batch_conf_mat = ut.eval_confusion(model.get_groups(), groups, n=model.n,
+        true_classes=data_loader.dataset.classes)
+
+    batch_size = x.size(0)
     obj.update(batch_obj, batch_size)
     loss.update(batch_loss, batch_size)
     reg.update(batch_reg, batch_size)
@@ -119,5 +127,5 @@ def train_epoch(data_loader, optimizer, device):
       raise RuntimeError('Divergence! NaN objective.')
   rtime = time.time() - epoch_tic
   cluster_error = ut.eval_cluster_error(conf_mat.sum)
-  return (cluster_error, obj.avg, loss.avg, reg.avg,
-      Ureg.avg, Vreg.avg, sprs.avg, norm_x_.avg, sampsec.avg, rtime)
+  return ((cluster_error, obj.avg, loss.avg, reg.avg, Ureg.avg, Vreg.avg,
+      sprs.avg, norm_x_.avg, sampsec.avg, rtime), conf_mat.sum)
