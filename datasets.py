@@ -8,6 +8,8 @@ from torchvision.datasets import MNIST
 
 import models as mod
 
+import ipdb
+
 
 class SynthUoSDataset(Dataset):
   """Synthetic union of subspaces dataset."""
@@ -21,6 +23,8 @@ class SynthUoSDataset(Dataset):
     self.N = n*Ng
     self.affine = affine
     self.sigma = sigma
+    self.classes = np.arange(n)
+
     rng = np.random.RandomState(seed=seed)
 
     self.Us = np.zeros([D, d, n])
@@ -55,13 +59,14 @@ class SynthUoSDataset(Dataset):
     self.groups = self.groups[self.perm]
 
     self.X = torch.tensor(self.X, dtype=torch.float32)
+    self.Idx = torch.arange(self.N)
     return
 
   def __len__(self):
     return self.N
 
   def __getitem__(self, ii):
-    return torch.tensor(ii), self.X[ii, :], self.groups[ii]
+    return self.Idx[ii], self.X[ii, :], self.groups[ii]
 
 
 class SynthUoMDataset(Dataset):
@@ -78,6 +83,7 @@ class SynthUoMDataset(Dataset):
     self.H = H
     self.res_weight_scale = res_weight_scale
     self.sigma = sigma
+    self.classes = np.arange(n)
 
     if seed is not None:
       torch.manual_seed(seed)
@@ -117,13 +123,15 @@ class SynthUoMDataset(Dataset):
     self.perm = rng.permutation(self.N)
     self.X = self.X[self.perm, :]
     self.groups = self.groups[self.perm]
+
+    self.Idx = torch.arange(self.N)
     return
 
   def __len__(self):
     return self.N
 
   def __getitem__(self, ii):
-    return torch.tensor(ii), self.X[ii, :], self.groups[ii]
+    return self.Idx[ii], self.X[ii, :], self.groups[ii]
 
 
 class MNISTUoM(MNIST):
@@ -141,7 +149,55 @@ class MNISTUoM(MNIST):
         ``transforms.RandomCrop``
       target_transform (callable, optional): A function/transform that takes in
         the target and transforms it.
+      classes (sequence, optional): Subset of digits to include. Note that
+        original digit labels are kept.
     """
+  def __init__(self, root, train=True, transform=None, target_transform=None,
+        download=False, classes=None, batch_size=100):
+    super(MNISTUoM, self).__init__(root, train, transform, target_transform,
+        download)
+
+    self.classes = classes
+    if self.classes is not None:
+      self.classes = np.array(self.classes)
+      if np.setdiff1d(self.classes, np.arange(10)).size > 0:
+        raise ValueError("Invalid classes.")
+
+      if self.train:
+        self.train_data, self.train_labels = self._subset_classes(
+            self.train_data, self.train_labels, self.classes)
+      else:
+        self.test_data, self.test_labels = self._subset_classes(
+            self.test_data, self.test_labels, self.classes)
+    else:
+      self.classes = np.arange(10)
+
+    # make sure batch_size divides N
+    ipdb.set_trace()
+    N = len(self)
+    if batch_size <= 0 or batch_size > N:
+      batch_size = N
+    self.batch_size = batch_size
+    N = (N // batch_size)*batch_size
+    # NOTE: separately named train_* and test_* is annoying, and fixed in more
+    # recent torchvision
+    if self.train:
+      self.train_data = self.train_data[:N, :]
+      self.train_labels = self.train_labels[:N]
+    else:
+      self.test_data = self.test_data[:N, :]
+      self.test_labels = self.test_labels[:N]
+
+    self.Idx = torch.arange(len(self))
+    return
+
+  def _subset_classes(self, data, labels, classes):
+    """Restrict data to subset of classes."""
+    mask = (labels.view(-1, 1) == torch.tensor(classes).view(1, -1)).any(dim=1)
+    data = data[mask, :]
+    labels = labels[mask]
+    return data, labels
+
   def __getitem__(self, index):
     """
     Args:
@@ -150,4 +206,4 @@ class MNISTUoM(MNIST):
       tuple: (index, image, target) where target is index of the target class.
     """
     img, target = super(MNISTUoM, self).__getitem__(index)
-    return torch.tensor(index), img, target
+    return self.Idx[index], img, target
