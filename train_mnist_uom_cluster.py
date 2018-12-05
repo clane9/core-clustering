@@ -18,11 +18,8 @@ import models as mod
 import optimizers as opt
 import training as tr
 
-# import ipdb
-
 CHKP_FREQ = 50
 STOP_FREQ = 10
-N_CLASS = 10
 
 
 def main():
@@ -35,16 +32,13 @@ def main():
   np.random.seed(args.seed)
 
   # construct dataset
-  mnist_dataset = dat.MNISTUoM(args.data_dir, train=True, download=True,
+  mnist_dataset = dat.MNISTUoM(args.data_dir, train=True,
       transform=transforms.Compose([
           transforms.ToTensor(),
-          transforms.Normalize((0.1307,), (0.3081,))
-      ]))
+          transforms.Normalize((0.1307,), (0.3081,))]),
+      download=True, classes=args.classes, batch_size=args.batch_size)
   N = len(mnist_dataset)
-  if args.batch_size <= 0 or args.batch_size >= N:
-    batch_size = N
-  else:
-    batch_size = args.batch_size
+  batch_size = mnist_dataset.batch_size
   kwargs = {'num_workers': 1}
   if use_cuda:
     kwargs['pin_memory'] = True
@@ -55,14 +49,14 @@ def main():
   arch = args.arch.lower()
   if arch == 'dc':
     group_models = [mod.MNISTDCManifoldModel(args.d, args.filters, args.drop_p)
-        for _ in range(N_CLASS)]
+        for _ in range(args.n)]
   elif arch == 'res':
     group_models = [mod.ResidualManifoldModel(args.d, (1, 28, 28),
-        args.filters, args.drop_p) for _ in range(N_CLASS)]
+        args.filters, args.drop_p) for _ in range(args.n)]
   else:
     raise ValueError("Invalid architecture {}".format(arch))
 
-  model = mod.KManifoldClusterModel(N_CLASS, args.d, N, batch_size,
+  model = mod.KManifoldClusterModel(args.n, args.d, N, batch_size,
       group_models, use_cuda)
   model.to(device)
 
@@ -85,11 +79,17 @@ if __name__ == '__main__':
   parser = argparse.ArgumentParser(description='Cluster MNIST data')
   parser.add_argument('--out-dir', type=str, required=True,
                       help='Output directory.')
-  parser.add_argument('--data-dir', type=str, default='~/Documents/Datasets/MNIST',
-                      help='Data directory [default: ~/Documents/Datasets/MNIST].')
+  parser.add_argument('--data-dir', type=str,
+                      default='~/Documents/Datasets/MNIST',
+                      help=('Data directory '
+                          '[default: ~/Documents/Datasets/MNIST].'))
+  parser.add_argument('--classes', type=int, default=None, nargs='+',
+                      help='Subset of digit classes [default: all]')
   # model settings
   parser.add_argument('--arch', type=str, default='dc',
                       help='Network architecture (dc or res) [default: dc]')
+  parser.add_argument('--n', type=int, default=None,
+                      help='Manifold dimension [default: # classes]')
   parser.add_argument('--d', type=int, default=2,
                       help='Manifold dimension [default: 2]')
   parser.add_argument('--filters', type=int, default=20,
