@@ -80,7 +80,8 @@ def eval_cluster_error(*args, **kwargs):
   return cluster_error
 
 
-def eval_confusion(groups, true_groups, n=None, true_n=None):
+def eval_confusion(groups, true_groups, n=None, true_n=None,
+      true_classes=None):
   """compute confusion matrix between assigned and true groups"""
   if torch.is_tensor(groups):
     groups = groups.cpu().numpy()
@@ -90,20 +91,21 @@ def eval_confusion(groups, true_groups, n=None, true_n=None):
     raise ValueError("groups true_groups must have the same size")
 
   if n is not None:
-    # if n (true_n) given, assume labels are 0,...,n-1 (0,...,true_n-1)
-    labels = np.arange(n).reshape((1, n))
-    if true_n is not None:
-      labels_true = np.arange(true_n).reshape((1, true_n))
+    classes = np.arange(n).reshape((1, -1))
+    if true_classes is not None:
+      true_classes = np.array(true_classes).reshape((1, -1))
+    elif true_n is not None:
+      true_classes = np.arange(true_n).reshape((1, -1))
     else:
-      labels_true = labels
+      true_classes = classes
   else:
-    labels = np.unique(groups)
-    labels_true = np.unique(true_groups)
+    classes = np.unique(groups)
+    true_classes = np.unique(true_groups)
 
   groups = groups.reshape((-1, 1))
   true_groups = true_groups.reshape((-1, 1))
 
-  groups_onehot = (groups == labels).astype(np.int64)
-  true_groups_onehot = (true_groups == labels_true).astype(np.int64)
+  groups_onehot = (groups == classes).astype(np.int64)
+  true_groups_onehot = (true_groups == true_classes).astype(np.int64)
   conf_mat = np.matmul(groups_onehot.T, true_groups_onehot)
   return conf_mat
