@@ -31,7 +31,7 @@ class KClusterOptimizer(optim.Optimizer):
     self.params_dict = {group['name']: group for group in self.param_groups}
 
     self.model = model
-    self.n = model.n
+    self.k = model.k
     self.N = model.N
     self.lamb = lamb
     self.set_soft_assign(soft_assign)
@@ -74,7 +74,7 @@ class KClusterOptimizer(optim.Optimizer):
     # NOTE: add small eps, seems to help U updates slightly. But probably
     # should prune this.
     if C_EPS > 0:
-      c.data.add_(C_EPS / self.n)
+      c.data.add_(C_EPS / self.k)
       c.data.div_(c.data.sum(dim=1, keepdim=True))
     return
 
@@ -374,7 +374,7 @@ class KSubspaceAltSGD(KManifoldAltSGD):
     # solve least squares by computing batched solution to normal equations.
     # (n x D x d)
     U = torch.stack([self.model.group_models[jj].U.data
-        for jj in range(self.n)], dim=0)
+        for jj in range(self.k)], dim=0)
     # (n x d x d)
     Ut = U.transpose(1, 2)
     UtU = torch.matmul(Ut, U)
@@ -384,10 +384,10 @@ class KSubspaceAltSGD(KManifoldAltSGD):
     A = UtU.add(lambeye.unsqueeze(0))
 
     # (n x D x batch_size)
-    B = x.data.t().unsqueeze(0).expand(self.n, -1, -1)
+    B = x.data.t().unsqueeze(0).expand(self.k, -1, -1)
     if self.model.group_models[0].affine:
       B = B.sub(torch.stack([self.model.group_models[jj].b.data
-          for jj in range(self.n)], dim=0).unsqueeze(2))
+          for jj in range(self.k)], dim=0).unsqueeze(2))
     # (n x d x batch_size)
     B = torch.matmul(Ut, B)
 

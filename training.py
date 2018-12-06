@@ -37,7 +37,7 @@ def train_loop(model, data_loader, device, optimizer, out_dir,
   val_logf = '{}/val_log.csv'.format(out_dir)
   with open(val_logf, 'w') as f:
     print(logheader, file=f)
-  conf_mats = np.zeros((epochs, model.n, data_loader.dataset.classes.size))
+  conf_mats = np.zeros((epochs, model.k, data_loader.dataset.classes.size))
 
   min_lr = 1e-6*ut.get_learning_rate(optimizer)
   scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer,
@@ -107,7 +107,7 @@ def train_epoch(model, data_loader, optimizer, device):
         batch_sprs, batch_norm_x_) = optimizer.step(ii, x)
 
     # eval batch cluster confusion
-    batch_conf_mat = ut.eval_confusion(model.get_groups(), groups, n=model.n,
+    batch_conf_mat = ut.eval_confusion(model.get_groups(), groups, n=model.k,
         true_classes=data_loader.dataset.classes)
 
     batch_size = x.size(0)

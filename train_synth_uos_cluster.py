@@ -51,13 +51,13 @@ def main():
   if args.auto_enc:
     group_models = [mod.SubspaceAEModel(args.d, args.D, args.affine)
         for _ in range(args.n)]
-    model = mod.KManifoldAEClusterModel(args.n, args.d, args.D, N,
-        batch_size, group_models)
+    model = mod.KManifoldAEClusterModel(args.n, args.d, N, batch_size,
+        group_models)
   else:
     group_models = [mod.SubspaceModel(args.d, args.D, args.affine)
         for _ in range(args.n)]
-    model = mod.KManifoldClusterModel(args.n, args.d, args.D, N,
-        batch_size, group_models, use_cuda)
+    model = mod.KManifoldClusterModel(args.n, args.d, N, batch_size,
+        group_models, use_cuda)
   model = model.to(device)
 
   # optimizer & lr schedule
