@@ -8,8 +8,6 @@ from torchvision.datasets import MNIST
 
 import models as mod
 
-import ipdb
-
 
 class SynthUoSDataset(Dataset):
   """Synthetic union of subspaces dataset."""
@@ -59,6 +57,7 @@ class SynthUoSDataset(Dataset):
     self.groups = self.groups[self.perm]
 
     self.X = torch.tensor(self.X, dtype=torch.float32)
+    self.groups = torch.tensor(self.groups, dtype=torch.int64)
     self.Idx = torch.arange(self.N)
     return
 
@@ -67,6 +66,53 @@ class SynthUoSDataset(Dataset):
 
   def __getitem__(self, ii):
     return self.Idx[ii], self.X[ii, :], self.groups[ii]
+
+
+class SynthUoSOnlineDataset(Dataset):
+  """Synthetic union of subspaces dataset with fresh samples."""
+  def __init__(self, n, d, D, N, affine=False, sigma=0., seed=None):
+    super(SynthUoSOnlineDataset).__init__()
+
+    self.n = n  # number of subspaces
+    self.d = d  # subspace dimension
+    self.D = D  # ambient dimension
+    self.N = N  # number of points
+    self.affine = affine
+    self.sigma = sigma
+
+    self.rng = torch.Generator()
+    if seed is not None:
+      self.set_seed(seed)
+
+    self.classes = np.arange(n)
+    self.Us = torch.zeros((n, D, d))
+    self.bs = torch.zeros((n, D)) if affine else None
+
+    # sample data from randomnly generated (linear or affine) subspaces
+    for grp in range(n):
+      self.Us[grp, :, :], _ = torch.qr(torch.randn(D, d, generator=self.rng))
+
+      if affine:
+        self.bs[grp, :] = (1./np.sqrt(D))*torch.randn(D, generator=self.rng)
+    return
+
+  def __len__(self):
+    return self.N
+
+  def set_seed(self, seed):
+    self.rng.manual_seed(seed)
+    return
+
+  def __getitem__(self, ii):
+    grp = torch.randint(high=self.n, size=(1,), dtype=torch.int64,
+        generator=self.rng)
+    v = (1./np.sqrt(self.d))*torch.randn(self.d, 1, generator=self.rng)
+    x = torch.matmul(self.Us[grp, :, :], v).view(-1)
+    if self.affine:
+      x += self.bs[grp, :]
+    if self.sigma > 0:
+      x += (self.sigma/np.sqrt(self.D))*torch.randn(self.D, generator=self.rng)
+    return torch.tensor(ii), x, grp
 
 
 class SynthUoMDataset(Dataset):
@@ -124,6 +170,7 @@ class SynthUoMDataset(Dataset):
     self.X = self.X[self.perm, :]
     self.groups = self.groups[self.perm]
 
+    self.groups = torch.tensor(self.groups, dtype=torch.int64)
     self.Idx = torch.arange(self.N)
     return
 
@@ -173,7 +220,6 @@ class MNISTUoM(MNIST):
       self.classes = np.arange(10)
 
     # make sure batch_size divides N
-    ipdb.set_trace()
     N = len(self)
     if batch_size <= 0 or batch_size > N:
       batch_size = N
