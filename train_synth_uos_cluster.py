@@ -12,13 +12,14 @@ import pickle
 
 import numpy as np
 import torch
+import torch.distributed as dist
+from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
 
 import datasets as dat
 import models as mod
 import optimizers as opt
 import training as tr
-
-# import ipdb
 
 CHKP_FREQ = 50
 STOP_FREQ = 10
@@ -26,12 +27,13 @@ STOP_FREQ = 10
 
 def main():
   use_cuda = args.cuda and torch.cuda.is_available()
+  if use_cuda and args.dist:
+    raise ValueError("Cannot use cuda in distributed mode")
+
   device = torch.device('cuda' if use_cuda else 'cpu')
   torch.set_num_threads(args.num_threads)
 
   # construct dataset
-  torch.manual_seed(args.data_seed)
-  np.random.seed(args.data_seed)
   synth_dataset = dat.SynthUoSDataset(args.n, args.d, args.D, args.Ng,
       args.affine, args.sigma, args.data_seed)
   N = args.n*args.Ng
@@ -41,8 +43,13 @@ def main():
   kwargs = {'num_workers': 0}
   if use_cuda:
     kwargs['pin_memory'] = True
-  synth_data_loader = torch.utils.data.DataLoader(synth_dataset,
-      batch_size=batch_size, shuffle=(batch_size != N), **kwargs)
+  if args.dist:
+    sampler = DistributedSampler(synth_dataset, dist.get_world_size(),
+        dist.get_rank())
+  else:
+    sampler = DistributedSampler(synth_dataset, 1, 0)
+  synth_data_loader = DataLoader(synth_dataset, batch_size=batch_size,
+      sampler=sampler, drop_last=True, **kwargs)
 
   torch.manual_seed(args.seed)
   np.random.seed(args.seed)
@@ -57,26 +64,29 @@ def main():
     group_models = [mod.SubspaceModel(args.d, args.D, args.affine)
         for _ in range(args.n)]
     model = mod.KManifoldClusterModel(args.n, args.d, N, batch_size,
-        group_models, use_cuda)
+        group_models, use_cuda, store_C_V=(not args.alt_opt))
   model = model.to(device)
 
   # optimizer & lr schedule
   if args.auto_enc:
     optimizer = opt.KManifoldAESGD(model, lr=args.init_lr,
         lamb=args.lamb_U, momentum=args.momentum, nesterov=args.nesterov,
-        soft_assign=args.soft_assign)
+        soft_assign=args.soft_assign, dist_mode=args.dist)
   else:
     if args.alt_opt:
       optimizer = opt.KSubspaceAltSGD(model, lr=args.init_lr,
           lamb_U=args.lamb_U, lamb_V=args.lamb_V, momentum=args.momentum,
-          nesterov=args.nesterov, soft_assign=args.soft_assign)
+          nesterov=args.nesterov, soft_assign=args.soft_assign,
+          dist_mode=args.dist)
     else:
+      if args.dist:
+        raise ValueError("Distributed mode not compatible with joint SGD opt.")
       optimizer = opt.KManifoldSGD(model, lr=args.init_lr,
           lamb_U=args.lamb_U, lamb_V=args.lamb_V, momentum=args.momentum,
           nesterov=args.nesterov, soft_assign=args.soft_assign)
 
   tr.train_loop(model, synth_data_loader, device, optimizer,
-      args.out_dir, args.epochs, CHKP_FREQ, STOP_FREQ)
+      args.out_dir, args.epochs, CHKP_FREQ, STOP_FREQ, args.dist)
   return
 
 
@@ -112,7 +122,6 @@ if __name__ == '__main__':
   # training settings
   parser.add_argument('--alt-opt', action='store_true', default=False,
                       help='Use alternating optimization method')
-
   parser.add_argument('--batch-size', type=int, default=100,
                       help='Input batch size for training [default: 100]')
   parser.add_argument('--epochs', type=int, default=1000,
@@ -123,8 +132,8 @@ if __name__ == '__main__':
                       help='Initial learning rate [default: 0.9]')
   parser.add_argument('--nesterov', action='store_true', default=False,
                       help='Use nesterov form of acceleration')
-  parser.add_argument('--maxit-V', type=int, default=20,
-                      help='Number of iterations for V update [default: 20]')
+  parser.add_argument('--dist', action='store_true', default=False,
+                      help='Enables distributed training')
   parser.add_argument('--cuda', action='store_true', default=False,
                       help='Enables CUDA training')
   parser.add_argument('--num-threads', type=int, default=1,
@@ -133,11 +142,16 @@ if __name__ == '__main__':
                       help='Training random seed [default: 2018]')
   args = parser.parse_args()
 
+  if args.dist:
+    dist.init_process_group(backend="mpi")
+
+  is_logging = (not args.dist) or (dist.get_rank() == 0)
   # create output directory, deleting any existing results.
-  if os.path.exists(args.out_dir):
-    shutil.rmtree(args.out_dir)
-  os.mkdir(args.out_dir)
-  # save args
-  with open('{}/args.pkl'.format(args.out_dir), 'wb') as f:
-    pickle.dump(args, f)
+  if is_logging:
+    if os.path.exists(args.out_dir):
+      shutil.rmtree(args.out_dir)
+    os.mkdir(args.out_dir)
+    # save args
+    with open('{}/args.pkl'.format(args.out_dir), 'wb') as f:
+      pickle.dump(args, f)
   main()
