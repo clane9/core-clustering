@@ -75,7 +75,7 @@ class KClusterModel(nn.Module):
 
   def get_groups(self):
     """compute group assignment."""
-    groups = torch.argmax(self.c.data, dim=1).cpu().numpy()
+    groups = torch.argmax(self.c.data, dim=1).cpu()
     return groups
 
 
@@ -83,19 +83,25 @@ class KManifoldClusterModel(KClusterModel):
   """Model of union of low-dimensional manifolds generalizing
   k-means/k-subspaces."""
 
-  def __init__(self, k, d, N, batch_size, group_models, use_cuda=False):
+  def __init__(self, k, d, N, batch_size, group_models, use_cuda=False,
+        store_C_V=True):
     super(KManifoldClusterModel, self).__init__(k, d, N, batch_size,
         group_models)
 
     # Assignment and coefficient matrices, used with sparse embedding.
     # Don't want these potentially huge variables ever sent to gpu.
     # At some point might not even want them in memory.
-    self.C = torch.Tensor(N, k)
-    self.V = torch.Tensor(N, d, k)
-    if use_cuda:
-      # should speed up copy to cuda memory
-      self.C = self.C.pin_memory()
-      self.V = self.V.pin_memory()
+    self.store_C_V = store_C_V
+    if store_C_V:
+      self.C = torch.Tensor(N, k)
+      self.V = torch.Tensor(N, d, k)
+      if use_cuda:
+        # should speed up copy to cuda memory
+        self.C = self.C.pin_memory()
+        self.V = self.V.pin_memory()
+    else:
+      self.C = None
+      self.V = None
     self.use_cuda = use_cuda
     self.v = nn.Parameter(torch.Tensor(batch_size, d, k))
     self.reset_parameters()
@@ -104,10 +110,12 @@ class KManifoldClusterModel(KClusterModel):
   def reset_parameters(self):
     """Initialize V with entries drawn from normal with std 0.1/sqrt(d), and C
     with entries from normal distribution, mean=1, sigma=0.01."""
-    V_std = .1 / np.sqrt(self.d)
-    self.V.data.normal_(0., V_std)
-    self.C.data.normal_(1., 0.01).abs_()
-    self.C.data.div_(self.C.data.sum(dim=1, keepdim=True))
+    v_std = .1 / np.sqrt(self.d)
+    self.v.data.normal_(0., v_std)
+    if self.store_C_V:
+      self.V.data.normal_(0., v_std)
+      self.C.data.normal_(1., 0.01).abs_()
+      self.C.data.div_(self.C.data.sum(dim=1, keepdim=True))
     super(KManifoldClusterModel, self).reset_parameters()
     return
 
@@ -172,6 +180,8 @@ class KManifoldClusterModel(KClusterModel):
     """set c, v to reflect subset of C, V given by ii."""
     # NOTE: in the case this is transferring cpu to gpu, does pinning memory
     # make it faster?
+    if not self.store_C_V:
+      raise RuntimeError("C, V not stored!")
     self.c.data.copy_(self.C[ii, :])
     self.v.data.copy_(self.V[ii, :, :])
     return
@@ -179,6 +189,8 @@ class KManifoldClusterModel(KClusterModel):
   def set_CV(self, ii):
     """update full segmentation coefficients with values from current
     mini-batch."""
+    if not self.store_C_V:
+      raise RuntimeError("C, V not stored!")
     # NOTE: is this asynchronous?
     self.C[ii, :] = self.c.data.cpu()
     self.V[ii, :, :] = self.v.data.cpu()
@@ -187,9 +199,11 @@ class KManifoldClusterModel(KClusterModel):
   def get_groups(self, full=False):
     """compute group assignment."""
     if full:
-      groups = torch.argmax(self.C.data, dim=1).cpu().numpy()
+      if not self.store_C_V:
+        raise RuntimeError("C, V not stored!")
+      groups = torch.argmax(self.C.data, dim=1).cpu()
     else:
-      groups = torch.argmax(self.c.data, dim=1).cpu().numpy()
+      groups = torch.argmax(self.c.data, dim=1).cpu()
     return groups
 
 
