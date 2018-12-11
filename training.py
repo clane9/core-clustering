@@ -8,7 +8,7 @@ import numpy as np
 import torch
 from torch import optim
 import torch.distributed as dist
-from torch.utils.data.distributed import DistributedSampler
+from datasets import DistributedSampler
 from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
 
 import utils as ut

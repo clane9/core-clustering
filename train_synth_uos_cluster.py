@@ -14,7 +14,7 @@ import numpy as np
 import torch
 import torch.distributed as dist
 from torch.utils.data import DataLoader
-from torch.utils.data.distributed import DistributedSampler
+from datasets import DistributedSampler
 
 import datasets as dat
 import models as mod
