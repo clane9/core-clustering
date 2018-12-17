@@ -76,6 +76,7 @@ def eval_cluster_error(*args, **kwargs):
     conf_mat = conf_mat.numpy()
   if conf_mat.ndim != 2:
     raise ValueError("Invalid format for confusion matrix")
+  conf_mat = np.round(conf_mat).astype(np.int64)
 
   row_ind, col_ind = linear_sum_assignment(-conf_mat)
   correct = conf_mat[row_ind, col_ind].sum()

@@ -45,14 +45,14 @@ def train_loop(model, data_loader, device, optimizer, out_dir,
   if is_logging:
     with open(val_logf, 'w') as f:
       print(logheader, file=f)
-  conf_mats = np.zeros((epochs, model.k, data_loader.dataset.classes.size))
+  conf_mats = np.zeros((epochs, model.k, data_loader.dataset.classes.size),
+      dtype=np.int64)
 
   min_lr = 1e-6*ut.get_learning_rate(optimizer)
   scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer,
       factor=0.5, patience=10, threshold=1e-4, min_lr=min_lr)
 
   # training loop
-  err = None
   lr = float('inf')
   model.train()
   try:
@@ -97,11 +97,11 @@ def train_loop(model, data_loader, device, optimizer, out_dir,
         if err_count > 0:
           raise RuntimeError("dist error")
 
-  except Exception as e:
-    err = e
-    if str(e) != "dist error":
+  except Exception as err:
+    if str(err) != "dist error":
+      print('{}: {}'.format(type(err), err))
       with open("{}/error".format(out_dir), "a") as f:
-        print(err, file=f)
+        print('{}: {}'.format(type(err), err), file=f)
       if dist_mode:
         err_count = torch.tensor(1.)
         dist.all_reduce(err_count, op=dist.reduce_op.SUM)
@@ -110,8 +110,6 @@ def train_loop(model, data_loader, device, optimizer, out_dir,
     if is_logging:
       with open('{}/conf_mats.npz'.format(out_dir), 'wb') as f:
         np.savez(f, conf_mats=conf_mats[:epoch, :])
-    if err is not None:
-      raise err
   return
 
 
@@ -136,6 +134,8 @@ def train_epoch(model, data_loader, optimizer, device, dist_mode=False):
       dist.all_reduce(coalesced, op=dist.reduce_op.SUM)
       coalesced /= dist.get_world_size()
       batch_metrics = _unflatten_dense_tensors(coalesced, batch_metrics)
+      # only conf_mat should not be averaged.
+      batch_metrics[-1] *= dist.get_world_size()
 
     batch_size = x.size(0)
     if dist_mode:
