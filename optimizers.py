@@ -4,6 +4,8 @@ from __future__ import division
 import numpy as np
 import torch
 import torch.optim as optim
+import torch.distributed as dist
+from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
 
 from models import KClusterModel
 
@@ -31,7 +33,7 @@ class KClusterOptimizer(optim.Optimizer):
     self.params_dict = {group['name']: group for group in self.param_groups}
 
     self.model = model
-    self.n = model.n
+    self.k = model.k
     self.N = model.N
     self.lamb = lamb
     self.set_soft_assign(soft_assign)
@@ -74,7 +76,7 @@ class KClusterOptimizer(optim.Optimizer):
     # NOTE: add small eps, seems to help U updates slightly. But probably
     # should prune this.
     if C_EPS > 0:
-      c.data.add_(C_EPS / self.n)
+      c.data.add_(C_EPS / self.k)
       c.data.div_(c.data.sum(dim=1, keepdim=True))
     return
 
@@ -199,11 +201,11 @@ class KManifoldSGD(KClusterOptimizer):
         lamb_V=self.lamb_V, wrt=wrt)
 
 
-class KManifoldAltSGD(KManifoldSGD):
-  """Implements variant of SGD for special k-manifold case. Alternates between
-  (1) one or a few exact gradient updates on V (coefficients), (2) closed form
-  update to (soft) assignment C, (3) stochastic gradient update on U (manifold
-  model variables).
+class KSubspaceAltSGD(KClusterOptimizer):
+  """Implements variant of SGD for special k-subspace case. Alternates between
+  (1) closed form v solution by solving least-squares, (2) closed form update
+  to (soft) assignment C, (3) stochastic gradient update on U (manifold model
+  variables).
 
   Args:
     model (KManifoldClusterModel instance): model to optimize.
@@ -212,106 +214,89 @@ class KManifoldAltSGD(KManifoldSGD):
     lamb_V (float): V regularization parameter.
     momentum (float, optional): momentum factor (default: 0)
     nesterov (bool, optional): enables Nesterov momentum (default: False)
-    maxit_V (int, optional): number of gradient iterations for V update
-      (default: 20).
     soft_assign (float, optional): update segmentation using soft assignment.
       0=exact, 1=uniform assignment (default: 0)
+    dist_mode (bool, optional): whether in mpi distributed mode
+      (default: False).
   """
   def __init__(self, model, lr, lamb_U, lamb_V=None, momentum=0.0,
-        nesterov=False, maxit_V=20, soft_assign=0.0):
-    if maxit_V <= 0:
-      raise ValueError("Invalid max V iters: {}".format(maxit_V))
+        nesterov=False, soft_assign=0.0, dist_mode=False):
 
-    super(KManifoldAltSGD, self).__init__(model, lr, lamb_U, lamb_V,
-        momentum, nesterov, soft_assign)
-    self.maxit_V = maxit_V
+    lamb_V = lamb_U if lamb_V is None else lamb_V
+    min_lamb = np.min([lamb_U, lamb_V])
+    if min_lamb < 0.0:
+      raise ValueError("Invalid regularization lambda: {}".format(min_lamb))
+
+    if dist_mode and not (dist.is_initialized()):
+      raise RuntimeError("Distributed package not initialized")
+
+    params = [{'name': 'C', 'params': [model.c]},
+        {'name': 'V', 'params': [model.v]},
+        {'name': 'U', 'params': model.group_models.parameters()}]
+
+    super(KSubspaceAltSGD, self).__init__(model, params, lr, lamb_U, momentum,
+        nesterov, soft_assign)
+
+    # disable grads for V
+    for p in self.params_dict['V']['params']:
+      p.requires_grad = False
+
+    self.lamb_U = lamb_U
+    self.lamb_V = lamb_V
+    self.lamb = None
+    self.dist_mode = dist_mode
+
+    if dist_mode:
+      if dist.get_rank() == 0:
+        print("Distributed mode with world={}, syncing parameters.".format(
+            dist.get_world_size()))
+      _sync_params(self.params_dict['U'])
     return
 
-  def step(self, ii, x):
+  def step(self, _, x):
     """Performs a single optimization step with alternating V, C, U updates.
 
     Args:
-      ii (LongTensor): indices for current minibatch
+      ii (LongTensor): indices for current minibatch (not used, included for
+        consistency)
       x (FloatTensor): current minibatch data
     """
-    self.model.set_cv(ii)
-    self._step_V(ii, x)
+    self._step_V(x)
     self._step_C(x)
     obj, loss, reg, Ureg, Vreg, x_ = self._step_U(x)
-    self.model.set_CV(ii)
 
     sprs = self.model.eval_sprs()
     norm_x_ = self.model.eval_shrink(x, x_)
     return obj, loss, reg, Ureg, Vreg, sprs, norm_x_
 
-  def _step_V(self, ii, x):
-    """one or a few exact gradient steps on V variable (manifold
-    coefficients). no acceleration.
+  def _step_V(self, x):
+    """closed form least-squares update to V variable (coefficients)."""
+    v = self.model.v
+    d = v.data.shape[1]
 
-    NOTE: too complicated and doesn't work well. Possibly remove."""
-    group = self.params_dict['V']
-    lr = group['lr']
-    v = group['params'][0]
+    # solve least squares by computing batched solution to normal equations.
+    # (k x D x d)
+    U = torch.stack([self.model.group_models[jj].U.data
+        for jj in range(self.k)], dim=0)
+    Ut = U.transpose(1, 2)
+    # (k x d x d)
+    UtU = torch.matmul(Ut, U)
+    # (d x d)
+    lambeye = torch.eye(d, dtype=UtU.dtype, device=UtU.device).mul(self.lamb_V)
+    # (k x d x d)
+    A = UtU.add(lambeye.unsqueeze(0))
 
-    # adaptive step size constants following trust region framework
-    lr_decr, lr_min, lr_max = 0.5, 1e-4, 1e4
-    success_thr, fail_thr = 0.9, .01
-    # NOTE: should these scalars be transferred off the gpu if using cuda?
-    tol = torch.norm(v.data).mul(1e-5)
+    # (k x D x batch_size)
+    B = x.data.t().unsqueeze(0).expand(self.k, -1, -1)
+    if self.model.group_models[0].affine:
+      B = B.sub(torch.stack([self.model.group_models[jj].b.data
+          for jj in range(self.k)], dim=0).unsqueeze(2))
+    # (k x d x batch_size)
+    B = torch.matmul(Ut, B)
 
-    # freeze C, U
-    v.requires_grad = True
-    for name in ['C', 'U']:
-      for p in self.params_dict[name]['params']:
-        p.requires_grad = False
-
-    # gradient descent iteration with steps chosen by trust region success
-    # condition
-    # NOTE: will this strategy work well if manifold embedding is not smooth?
-    obj = self.objective(x, wrt='V')[0]
-    prev_obj = obj.data
-    g_norm = torch.ones_like(tol).mul(np.inf)
-    backtracking = False
-    itr = 0
-    while itr < self.maxit_V and g_norm >= tol:
-      # bw pass
-      if not backtracking:
-        self.zero_grad()
-        obj.backward()
-        g_v = v.grad.data
-        g_normsqr = g_v.pow(2).sum()
-        g_norm = g_normsqr.sqrt()
-
-      # grad step
-      v.data.add_(-lr, g_v)
-      obj = self.objective(x, wrt='V')[0]
-
-      # adaptive step size using trust region success condition
-      pred_decr = g_normsqr.mul(lr)
-      obs_decr = prev_obj - obj.data
-      model_fit = obs_decr/pred_decr
-
-      if model_fit < fail_thr:
-        # failure case
-        # reset variable and decrease step
-        v.data.add_(lr, g_v)
-        if lr <= lr_min:
-          # increment iteration counter if already hit lr_min
-          itr += 1
-        else:
-          lr = np.clip(lr_decr*lr, lr_min, lr_max)
-        backtracking = True
-      else:
-        if model_fit > success_thr:
-          # very successful case, increase step
-          lr = np.clip(lr/lr_decr, lr_min, lr_max)
-        prev_obj = obj.data
-        itr += 1
-        backtracking = False
-
-      # print(('k={:d}, obj={:.5e}, |g|={:.3e}, pd={:.3e}, od={:.3e}, '
-      #     'fit={:.3f}, lr={:.3e}').format(itr, obj.data, g_norm, pred_decr,
-      #         obs_decr, model_fit, lr))
+    # (k x d x batch_size)
+    vt, _ = torch.gesv(B, A)
+    v.data.copy_(vt.permute(2, 1, 0))
     return
 
   def _step_U(self, x):
@@ -321,16 +306,11 @@ class KManifoldAltSGD(KManifoldSGD):
     nesterov = group['nesterov']
     lr = group['lr']
 
-    # freeze V, C
-    for p in group['params']:
-      p.requires_grad = True
-    for name in ['C', 'V']:
-      for p in self.params_dict[name]['params']:
-        p.requires_grad = False
-
     obj, loss, reg, Ureg, Vreg, x_ = self.objective(x, wrt='all')
     self.zero_grad()
     obj.backward()
+    if self.dist_mode:
+      _average_grads(group)
 
     for p in group['params']:
       if p.grad is None:
@@ -349,52 +329,10 @@ class KManifoldAltSGD(KManifoldSGD):
       p.data.add_(-lr, d_p)
     return obj.data, loss.data, reg.data, Ureg.data, Vreg.data, x_.data
 
-
-class KSubspaceAltSGD(KManifoldAltSGD):
-  """Implements variant of SGD for special k-subspace case. Alternates between
-  (1) closed form v solution by solving least-squares, (2) closed form update
-  to (soft) assignment C, (3) stochastic gradient update on U (manifold model
-  variables).
-
-  Args:
-    model (KManifoldClusterModel instance): model to optimize.
-    lr (float): learning rate
-    lamb_U (float): U regularization parameter
-    lamb_V (float): V regularization parameter.
-    momentum (float, optional): momentum factor (default: 0)
-    nesterov (bool, optional): enables Nesterov momentum (default: False)
-    soft_assign (float, optional): update segmentation using soft assignment.
-      0=exact, 1=uniform assignment (default: 0)
-  """
-  def _step_V(self, _, x):
-    """closed form least-squares update to V variable (coefficients)."""
-    v = self.model.v
-    d = v.data.shape[1]
-
-    # solve least squares by computing batched solution to normal equations.
-    # (n x D x d)
-    U = torch.stack([self.model.group_models[jj].U.data
-        for jj in range(self.n)], dim=0)
-    # (n x d x d)
-    Ut = U.transpose(1, 2)
-    UtU = torch.matmul(Ut, U)
-    # (d x d)
-    lambeye = torch.eye(d, dtype=UtU.dtype, device=UtU.device).mul(self.lamb_V)
-    # (n x d x d)
-    A = UtU.add(lambeye.unsqueeze(0))
-
-    # (n x D x batch_size)
-    B = x.data.t().unsqueeze(0).expand(self.n, -1, -1)
-    if self.model.group_models[0].affine:
-      B = B.sub(torch.stack([self.model.group_models[jj].b.data
-          for jj in range(self.n)], dim=0).unsqueeze(2))
-    # (n x d x batch_size)
-    B = torch.matmul(Ut, B)
-
-    # (n x d x batch_size)
-    vt, _ = torch.gesv(B, A)
-    v.data.copy_(vt.permute(2, 1, 0))
-    return
+  def objective(self, x, wrt='all'):
+    """encapsulate model objective function. A little inelegant..."""
+    return self.model.objective(x, lamb_U=self.lamb_U,
+        lamb_V=self.lamb_V, wrt=wrt)
 
 
 class KManifoldAESGD(KClusterOptimizer):
@@ -410,14 +348,26 @@ class KManifoldAESGD(KClusterOptimizer):
     nesterov (bool, optional): enables Nesterov momentum (default: False)
     soft_assign (float, optional): update segmentation using soft assignment.
       0=exact, 1=uniform assignment (default: 0)
+    dist_mode (bool, optional): whether in mpi distributed mode
+      (default: False).
   """
   def __init__(self, model, lr, lamb, momentum=0.0, nesterov=False,
-        soft_assign=0.0):
+        soft_assign=0.0, dist_mode=False):
+
+    if dist_mode and not dist.is_initialized():
+      raise RuntimeError("Distributed package not initialized")
 
     params = [{'name': 'C', 'params': [model.c]},
         {'name': 'U_V', 'params': model.group_models.parameters()}]
     super(KManifoldAESGD, self).__init__(model, params, lr, lamb, momentum,
         nesterov, soft_assign)
+
+    self.dist_mode = dist_mode
+    if dist_mode:
+      if dist.get_rank() == 0:
+        print("Distributed mode with world={}, syncing parameters.".format(
+            dist.get_world_size()))
+      _sync_params(self.params_dict['U_V'])
     return
 
   def step(self, _, x):
@@ -441,14 +391,16 @@ class KManifoldAESGD(KClusterOptimizer):
   def _step_U_V(self, x):
     """stochastic gradient step on U, V variables (manifold models and
     coeffcients)"""
-    obj, loss, reg, x_ = self.objective(x, wrt='all')
-    self.zero_grad()
-    obj.backward()
-
     group = self.params_dict['U_V']
     momentum = group['momentum']
     nesterov = group['nesterov']
     lr = group['lr']
+
+    obj, loss, reg, x_ = self.objective(x, wrt='all')
+    self.zero_grad()
+    obj.backward()
+    if self.dist_mode:
+      _average_grads(group)
 
     for p in group['params']:
       if p.grad is None:
@@ -500,3 +452,31 @@ def find_soft_assign(losses, T=1.):
   c = torch.clamp(T + 1. - losses, min=0.)
   c = c.div(c.sum(dim=1, keepdim=True))
   return c
+
+
+def _average_grads(group):
+  """All reduce U gradients across processes.
+
+  Follows: pytorch DistributedDataParallelCPU.
+  """
+  params = [p for p in group['params'] if p.requires_grad and
+      p.grad is not None]
+  grads = [p.grad.data for p in params]
+  coalesced = _flatten_dense_tensors(grads)
+  dist.all_reduce(coalesced, op=dist.reduce_op.SUM)
+  coalesced /= dist.get_world_size()
+  sync_grads = _unflatten_dense_tensors(coalesced, grads)
+  for buf, synced in zip(grads, sync_grads):
+    buf.copy_(synced)
+  return
+
+
+def _sync_params(group):
+  """Broadcast current parameters from process 0.
+
+  Follows: pytorch DistributedDataParallelCPU.
+  """
+  # only one time broadcast so multiple calls should be fine.
+  for p in group['params']:
+    dist.broadcast(p.data, 0)
+  return

@@ -1,14 +1,14 @@
 from __future__ import division
 from __future__ import print_function
 
+import math
 import numpy as np
 import torch
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, Sampler
 from torchvision.datasets import MNIST
+import torch.distributed as dist
 
 import models as mod
-
-import ipdb
 
 
 class SynthUoSDataset(Dataset):
@@ -59,6 +59,7 @@ class SynthUoSDataset(Dataset):
     self.groups = self.groups[self.perm]
 
     self.X = torch.tensor(self.X, dtype=torch.float32)
+    self.groups = torch.tensor(self.groups, dtype=torch.int64)
     self.Idx = torch.arange(self.N)
     return
 
@@ -67,6 +68,53 @@ class SynthUoSDataset(Dataset):
 
   def __getitem__(self, ii):
     return self.Idx[ii], self.X[ii, :], self.groups[ii]
+
+
+class SynthUoSOnlineDataset(Dataset):
+  """Synthetic union of subspaces dataset with fresh samples."""
+  def __init__(self, n, d, D, N, affine=False, sigma=0., seed=None):
+    super(SynthUoSOnlineDataset).__init__()
+
+    self.n = n  # number of subspaces
+    self.d = d  # subspace dimension
+    self.D = D  # ambient dimension
+    self.N = N  # number of points
+    self.affine = affine
+    self.sigma = sigma
+
+    self.rng = torch.Generator()
+    if seed is not None:
+      self.rng.manual_seed(seed)
+    self.seed = seed
+
+    self.classes = np.arange(n)
+    self.Us = torch.zeros((n, D, d))
+    self.bs = torch.zeros((n, D)) if affine else None
+
+    # sample data from randomnly generated (linear or affine) subspaces
+    for grp in range(n):
+      self.Us[grp, :, :], _ = torch.qr(torch.randn(D, d, generator=self.rng))
+
+      if affine:
+        self.bs[grp, :] = (1./np.sqrt(D))*torch.randn(D, generator=self.rng)
+    return
+
+  def __len__(self):
+    return self.N
+
+  def __getitem__(self, ii):
+    # NOTE: need to use global torch generator when using worker processes to
+    # generate data. Otherwise rng is duplicated and end up getting repeated
+    # data. Also note that it doesn't matter if seed is changed after
+    # DataLoader constructor is called.
+    grp = torch.randint(high=self.n, size=(1,), dtype=torch.int64)
+    v = (1./np.sqrt(self.d))*torch.randn(self.d, 1)
+    x = torch.matmul(self.Us[grp, :, :], v).view(-1)
+    if self.affine:
+      x += self.bs[grp, :]
+    if self.sigma > 0:
+      x += (self.sigma/np.sqrt(self.D))*torch.randn(self.D)
+    return torch.tensor(ii), x, grp
 
 
 class SynthUoMDataset(Dataset):
@@ -124,6 +172,7 @@ class SynthUoMDataset(Dataset):
     self.X = self.X[self.perm, :]
     self.groups = self.groups[self.perm]
 
+    self.groups = torch.tensor(self.groups, dtype=torch.int64)
     self.Idx = torch.arange(self.N)
     return
 
@@ -173,7 +222,6 @@ class MNISTUoM(MNIST):
       self.classes = np.arange(10)
 
     # make sure batch_size divides N
-    ipdb.set_trace()
     N = len(self)
     if batch_size <= 0 or batch_size > N:
       batch_size = N
@@ -207,3 +255,63 @@ class MNISTUoM(MNIST):
     """
     img, target = super(MNISTUoM, self).__getitem__(index)
     return self.Idx[index], img, target
+
+
+# taken from pytorch 1.0.0 so that data sampling order consistent regardless
+# world size.
+class DistributedSampler(Sampler):
+  """Sampler that restricts data loading to a subset of the dataset.
+
+  It is especially useful in conjunction with
+  :class:`torch.nn.parallel.DistributedDataParallel`. In such case, each
+  process can pass a DistributedSampler instance as a DataLoader sampler,
+  and load a subset of the original dataset that is exclusive to it.
+
+  .. note::
+    Dataset is assumed to be of constant size.
+
+  Arguments:
+    dataset: Dataset used for sampling.
+    num_replicas (optional): Number of processes participating in
+      distributed training.
+    rank (optional): Rank of the current process within num_replicas.
+  """
+
+  def __init__(self, dataset, num_replicas=None, rank=None):
+    if num_replicas is None:
+      if not dist.is_available():
+        raise RuntimeError("Requires distributed package to be available")
+      num_replicas = dist.get_world_size()
+    if rank is None:
+      if not dist.is_available():
+        raise RuntimeError("Requires distributed package to be available")
+      rank = dist.get_rank()
+    self.dataset = dataset
+    self.num_replicas = num_replicas
+    self.rank = rank
+    self.epoch = 0
+    self.num_samples = int(math.ceil(len(self.dataset) *
+        (1.0 / self.num_replicas)))
+    self.total_size = self.num_samples * self.num_replicas
+
+  def __iter__(self):
+    # deterministically shuffle based on epoch
+    g = torch.Generator()
+    g.manual_seed(self.epoch)
+    indices = torch.randperm(len(self.dataset), generator=g).tolist()
+
+    # add extra samples to make it evenly divisible
+    indices += indices[:(self.total_size - len(indices))]
+    assert len(indices) == self.total_size
+
+    # subsample
+    indices = indices[self.rank:self.total_size:self.num_replicas]
+    assert len(indices) == self.num_samples
+
+    return iter(indices)
+
+  def __len__(self):
+    return self.num_samples
+
+  def set_epoch(self, epoch):
+    self.epoch = epoch

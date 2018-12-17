@@ -14,7 +14,6 @@ import numpy as np
 import torch
 import torch.distributed as dist
 from torch.utils.data import DataLoader
-from datasets import DistributedSampler
 
 import datasets as dat
 import models as mod
@@ -34,22 +33,20 @@ def main():
   torch.set_num_threads(args.num_threads)
 
   # construct dataset
-  synth_dataset = dat.SynthUoSDataset(args.n, args.d, args.D, args.Ng,
+  torch.manual_seed(args.data_seed)
+  np.random.seed(args.data_seed)
+  synth_dataset = dat.SynthUoSOnlineDataset(args.n, args.d, args.D, args.N,
       args.affine, args.sigma, args.data_seed)
-  N = args.n*args.Ng
-  batch_size = args.batch_size
-  if args.batch_size <= 0 or args.batch_size > N:
-    batch_size = N
-  kwargs = {'num_workers': 0}
+  if args.dist:
+    # separate online sampling seeds per process
+    synth_dataset.set_seed(1991 + dist.get_rank())
+  kwargs = {'num_workers': 4}
   if use_cuda:
     kwargs['pin_memory'] = True
-  if args.dist:
-    sampler = DistributedSampler(synth_dataset, dist.get_world_size(),
-        dist.get_rank())
-  else:
-    sampler = DistributedSampler(synth_dataset, 1, 0)
-  synth_data_loader = DataLoader(synth_dataset, batch_size=batch_size,
-      sampler=sampler, drop_last=True, **kwargs)
+  if args.batch_size <= 0 or args.batch_size > args.N:
+    raise ValueError("Invalid batch size")
+  synth_data_loader = DataLoader(synth_dataset, batch_size=args.batch_size,
+      shuffle=False, drop_last=True, **kwargs)
 
   torch.manual_seed(args.seed)
   np.random.seed(args.seed)
@@ -58,13 +55,13 @@ def main():
   if args.auto_enc:
     group_models = [mod.SubspaceAEModel(args.d, args.D, args.affine)
         for _ in range(args.n)]
-    model = mod.KManifoldAEClusterModel(args.n, args.d, N, batch_size,
-        group_models)
+    model = mod.KManifoldAEClusterModel(args.n, args.d, args.N,
+        args.batch_size, group_models)
   else:
     group_models = [mod.SubspaceModel(args.d, args.D, args.affine)
         for _ in range(args.n)]
-    model = mod.KManifoldClusterModel(args.n, args.d, N, batch_size,
-        group_models, use_cuda, store_C_V=(not args.alt_opt))
+    model = mod.KManifoldClusterModel(args.n, args.d, args.N, args.batch_size,
+        group_models, use_cuda, store_C_V=False)
   model = model.to(device)
 
   # optimizer & lr schedule
@@ -73,17 +70,10 @@ def main():
         lamb=args.lamb_U, momentum=args.momentum, nesterov=args.nesterov,
         soft_assign=args.soft_assign, dist_mode=args.dist)
   else:
-    if args.alt_opt:
-      optimizer = opt.KSubspaceAltSGD(model, lr=args.init_lr,
-          lamb_U=args.lamb_U, lamb_V=args.lamb_V, momentum=args.momentum,
-          nesterov=args.nesterov, soft_assign=args.soft_assign,
-          dist_mode=args.dist)
-    else:
-      if args.dist:
-        raise ValueError("Distributed mode not compatible with joint SGD opt.")
-      optimizer = opt.KManifoldSGD(model, lr=args.init_lr,
-          lamb_U=args.lamb_U, lamb_V=args.lamb_V, momentum=args.momentum,
-          nesterov=args.nesterov, soft_assign=args.soft_assign)
+    optimizer = opt.KSubspaceAltSGD(model, lr=args.init_lr,
+        lamb_U=args.lamb_U, lamb_V=args.lamb_V, momentum=args.momentum,
+        nesterov=args.nesterov, soft_assign=args.soft_assign,
+        dist_mode=args.dist)
 
   tr.train_loop(model, synth_data_loader, device, optimizer,
       args.out_dir, args.epochs, CHKP_FREQ, STOP_FREQ, args.dist)
@@ -101,8 +91,8 @@ if __name__ == '__main__':
                       help='Subspace dimension [default: 10]')
   parser.add_argument('--D', type=int, default=100,
                       help='Ambient dimension [default: 100]')
-  parser.add_argument('--Ng', type=int, default=1000,
-                      help='Points per group [default: 1000]')
+  parser.add_argument('--N', type=int, default=100000,
+                      help='Total data points [default: 10^5]')
 
   parser.add_argument('--affine', action='store_true',
                       help='Affine setting')
@@ -120,12 +110,10 @@ if __name__ == '__main__':
   parser.add_argument('--soft-assign', type=float, default=0.1,
                       help='soft assignment parameter [default: 0.1]')
   # training settings
-  parser.add_argument('--alt-opt', action='store_true', default=False,
-                      help='Use alternating optimization method')
   parser.add_argument('--batch-size', type=int, default=100,
                       help='Input batch size for training [default: 100]')
-  parser.add_argument('--epochs', type=int, default=1000,
-                      help='Number of epochs to train [default: 1000]')
+  parser.add_argument('--epochs', type=int, default=100,
+                      help='Number of epochs to train [default: 100]')
   parser.add_argument('--init-lr', type=float, default=0.5,
                       help='Initial learning rate [default: 0.5]')
   parser.add_argument('--momentum', type=float, default=0.9,

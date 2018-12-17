@@ -11,29 +11,33 @@ import torch.nn.functional as F
 class KClusterModel(nn.Module):
   """Base class for k-cluster model."""
 
-  def __init__(self, n, d, N, batch_size, group_models):
+  def __init__(self, k, d, N, batch_size, group_models):
     super(KClusterModel, self).__init__()
 
-    self.n = n  # number of groups
+    self.k = k  # number of groups
     self.d = d  # dimension of manifold
     self.N = N  # number of data points
     self.batch_size = batch_size
 
     # quick check to make sure group models constructed correctly
-    group_model_check = (len(group_models) == n and
+    group_model_check = (len(group_models) == k and
         isinstance(group_models[0], nn.Module) and
+        hasattr(group_models[0], 'd') and
         group_models[0].d == d)
     if not group_model_check:
       raise ValueError("Invalid sequence of group_models")
     self.group_models = nn.ModuleList(group_models)
 
     # NOTE: might not need to have fixed batch size in this case
-    self.c = nn.Parameter(torch.Tensor(batch_size, n))
+    self.c = nn.Parameter(torch.Tensor(batch_size, k))
     return
 
   def reset_parameters(self):
     """Initialize C with entries from normal distribution centered on 1,
-    sigma=0.01."""
+    sigma=0.01.
+
+    NOTE: Very uniform initialization. But initialization of c doesn't matter
+    since c updated first in closed form anyway."""
     self.c.data.normal_(1., 0.01).abs_()
     self.c.data.div_(self.c.data.sum(dim=1, keepdim=True))
     return
@@ -71,7 +75,7 @@ class KClusterModel(nn.Module):
 
   def get_groups(self):
     """compute group assignment."""
-    groups = torch.argmax(self.c.data, dim=1).cpu().numpy()
+    groups = torch.argmax(self.c.data, dim=1).cpu()
     return groups
 
 
@@ -79,30 +83,39 @@ class KManifoldClusterModel(KClusterModel):
   """Model of union of low-dimensional manifolds generalizing
   k-means/k-subspaces."""
 
-  def __init__(self, n, d, N, batch_size, group_models, use_cuda=False):
-    super(KManifoldClusterModel, self).__init__(n, d, N, batch_size,
+  def __init__(self, k, d, N, batch_size, group_models, use_cuda=False,
+        store_C_V=True):
+    super(KManifoldClusterModel, self).__init__(k, d, N, batch_size,
         group_models)
 
-    # assignment and coefficient matrices, used with sparse embedding.
-    # NOTE: don't want these potentially huge variables ever sent to gpu
-    self.C = torch.Tensor(N, n)
-    self.V = torch.Tensor(N, d, n)
-    if use_cuda:
-      # should speed up copy to cuda memory
-      self.C = self.C.pin_memory()
-      self.V = self.V.pin_memory()
+    # Assignment and coefficient matrices, used with sparse embedding.
+    # Don't want these potentially huge variables ever sent to gpu.
+    # At some point might not even want them in memory.
+    self.store_C_V = store_C_V
+    if store_C_V:
+      self.C = torch.Tensor(N, k)
+      self.V = torch.Tensor(N, d, k)
+      if use_cuda:
+        # should speed up copy to cuda memory
+        self.C = self.C.pin_memory()
+        self.V = self.V.pin_memory()
+    else:
+      self.C = None
+      self.V = None
     self.use_cuda = use_cuda
-    self.v = nn.Parameter(torch.Tensor(batch_size, d, n))
+    self.v = nn.Parameter(torch.Tensor(batch_size, d, k))
     self.reset_parameters()
     return
 
   def reset_parameters(self):
     """Initialize V with entries drawn from normal with std 0.1/sqrt(d), and C
     with entries from normal distribution, mean=1, sigma=0.01."""
-    V_std = .1 / np.sqrt(self.d)
-    self.V.data.normal_(0., V_std)
-    self.C.data.normal_(1., 0.01).abs_()
-    self.C.data.div_(self.C.data.sum(dim=1, keepdim=True))
+    v_std = .1 / np.sqrt(self.d)
+    self.v.data.normal_(0., v_std)
+    if self.store_C_V:
+      self.V.data.normal_(0., v_std)
+      self.C.data.normal_(1., 0.01).abs_()
+      self.C.data.div_(self.C.data.sum(dim=1, keepdim=True))
     super(KManifoldClusterModel, self).reset_parameters()
     return
 
@@ -112,7 +125,8 @@ class KManifoldClusterModel(KClusterModel):
       self.set_cv(ii)
     # compute embeddings for each group and concatenate
     # NOTE: is this efficient on gpu/cpu?
-    # NOTE: could use jit trace to get some optimization.
+    # NOTE: could use jit trace to get some optimization (although doesn't seem
+    # to make a big difference in simple test).
     # NOTE: stack along 0 dimension so that shape of x doesn't matter, and
     # memory layout should also be better.
     x_ = torch.stack([gm(self.v[:, :, jj])
@@ -133,7 +147,7 @@ class KManifoldClusterModel(KClusterModel):
       loss = torch.mean(torch.sum(self.c*loss, dim=1))
     elif wrt == 'V':
       loss = torch.mean(torch.sum(loss, dim=1))
-    # for wrt C, use Nb x n matrix of losses for computing closed form
+    # for wrt C, use Nb x k matrix of losses for computing closed form
     # assignment.
 
     # evaluate U regularizer
@@ -166,6 +180,8 @@ class KManifoldClusterModel(KClusterModel):
     """set c, v to reflect subset of C, V given by ii."""
     # NOTE: in the case this is transferring cpu to gpu, does pinning memory
     # make it faster?
+    if not self.store_C_V:
+      raise RuntimeError("C, V not stored!")
     self.c.data.copy_(self.C[ii, :])
     self.v.data.copy_(self.V[ii, :, :])
     return
@@ -173,6 +189,8 @@ class KManifoldClusterModel(KClusterModel):
   def set_CV(self, ii):
     """update full segmentation coefficients with values from current
     mini-batch."""
+    if not self.store_C_V:
+      raise RuntimeError("C, V not stored!")
     # NOTE: is this asynchronous?
     self.C[ii, :] = self.c.data.cpu()
     self.V[ii, :, :] = self.v.data.cpu()
@@ -181,9 +199,11 @@ class KManifoldClusterModel(KClusterModel):
   def get_groups(self, full=False):
     """compute group assignment."""
     if full:
-      groups = torch.argmax(self.C.data, dim=1).cpu().numpy()
+      if not self.store_C_V:
+        raise RuntimeError("C, V not stored!")
+      groups = torch.argmax(self.C.data, dim=1).cpu()
     else:
-      groups = torch.argmax(self.c.data, dim=1).cpu().numpy()
+      groups = torch.argmax(self.c.data, dim=1).cpu()
     return groups
 
 
@@ -191,8 +211,8 @@ class KManifoldAEClusterModel(KClusterModel):
   """Model of union of low-dimensional manifolds generalizing
   k-means/k-subspaces. Coefficients computed using auto-encoder."""
 
-  def __init__(self, n, d, N, batch_size, group_models):
-    super(KManifoldAEClusterModel, self).__init__(n, d, N, batch_size,
+  def __init__(self, k, d, N, batch_size, group_models):
+    super(KManifoldAEClusterModel, self).__init__(k, d, N, batch_size,
         group_models)
     self.reset_parameters()
     return
@@ -236,6 +256,7 @@ class SubspaceModel(nn.Module):
 
   def __init__(self, d, D, affine=False):
     super(SubspaceModel, self).__init__()
+    self.d = d  # manifold dimension
     self.D = D  # ambient dimension
     self.affine = affine  # whether affine or linear subspaces.
 
