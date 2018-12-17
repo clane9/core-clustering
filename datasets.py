@@ -84,7 +84,8 @@ class SynthUoSOnlineDataset(Dataset):
 
     self.rng = torch.Generator()
     if seed is not None:
-      self.set_seed(seed)
+      self.rng.manual_seed(seed)
+    self.seed = seed
 
     self.classes = np.arange(n)
     self.Us = torch.zeros((n, D, d))
@@ -101,19 +102,18 @@ class SynthUoSOnlineDataset(Dataset):
   def __len__(self):
     return self.N
 
-  def set_seed(self, seed):
-    self.rng.manual_seed(seed)
-    return
-
   def __getitem__(self, ii):
-    grp = torch.randint(high=self.n, size=(1,), dtype=torch.int64,
-        generator=self.rng)
-    v = (1./np.sqrt(self.d))*torch.randn(self.d, 1, generator=self.rng)
+    # NOTE: need to use global torch generator when using worker processes to
+    # generate data. Otherwise rng is duplicated and end up getting repeated
+    # data. Also note that it doesn't matter if seed is changed after
+    # DataLoader constructor is called.
+    grp = torch.randint(high=self.n, size=(1,), dtype=torch.int64)
+    v = (1./np.sqrt(self.d))*torch.randn(self.d, 1)
     x = torch.matmul(self.Us[grp, :, :], v).view(-1)
     if self.affine:
       x += self.bs[grp, :]
     if self.sigma > 0:
-      x += (self.sigma/np.sqrt(self.D))*torch.randn(self.D, generator=self.rng)
+      x += (self.sigma/np.sqrt(self.D))*torch.randn(self.D)
     return torch.tensor(ii), x, grp
 
 
