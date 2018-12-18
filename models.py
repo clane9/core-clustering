@@ -50,7 +50,7 @@ class KClusterModel(nn.Module):
 
   def gm_reg(self):
     """Compute regularization wrt all group models."""
-    return sum((gm.reg() for gm in self.group_models))
+    return torch.stack([gm.reg() for gm in self.group_models], dim=0)
 
   def eval_sprs(self):
     """measure robust sparsity of current assignment subset c"""
@@ -133,34 +133,47 @@ class KManifoldClusterModel(KClusterModel):
         for jj, gm in enumerate(self.group_models)], dim=0)
     return x_
 
-  def objective(self, x, ii=None, lamb_U=.01, lamb_V=None, wrt='all'):
+  def objective(self, x, ii=None, lamb_U=.01, lamb_V=None, wrt='all',
+        c_mean=None):
     if wrt not in ['all', 'V', 'C', 'U']:
       raise ValueError(("Objective must be computed wrt 'all', "
           "'V', 'C', or 'U'"))
     lamb_V = lamb_U if lamb_V is None else lamb_V
 
+    # jth column of assignment c scaled by N/N_j
+    # used to balance objective wrt U across j=1,...,k
+    if c_mean is not None:
+      c_scale = self.c / c_mean.view(1, -1)
+    else:
+      c_scale = self.c
+
     # evaluate loss: least-squares weighted by assignment, as in k-means.
     x_ = self(ii)
     loss = torch.sum((x.unsqueeze(0) - x_)**2,
         dim=tuple(range(2, x_.dim()))).t()
-    if wrt in ['all', 'U']:
+    if wrt == 'all':
       loss = torch.mean(torch.sum(self.c*loss, dim=1))
+    elif wrt == 'U':
+      loss = torch.mean(torch.sum(c_scale*loss, dim=1))
     elif wrt == 'V':
       loss = torch.mean(torch.sum(loss, dim=1))
     # for wrt C, use Nb x k matrix of losses for computing closed form
     # assignment.
 
     # evaluate U regularizer
-    if wrt in ['all', 'U']:
-      Ureg = self.gm_reg()
-      # NOTE: disabled division by N
-      # Ureg = Ureg / self.N
+    if wrt in ['all', 'U', 'C']:
+      Ureg = self.gm_reg().view(1, -1)
+      if wrt == 'all':
+        Ureg = torch.mean(torch.sum(self.c*Ureg, dim=1))
+      elif wrt == 'U':
+        Ureg = torch.mean(torch.sum(c_scale*Ureg, dim=1))
+        # equivalently
+        # Ureg = torch.sum(Ureg)
+      # for wrt C, use 1 x k vector of U reg values for closed form assignment.
     else:
       Ureg = 0.0
 
     # evaluate V l2 squared regularizer
-    # NOTE: is there a strong need to have a U only case where Vreg is not
-    # computed?
     if wrt in ['all', 'V', 'C']:
       Vreg = torch.sum(self.v**2, dim=1)
       if wrt == 'all':
@@ -227,25 +240,38 @@ class KManifoldAEClusterModel(KClusterModel):
     x_ = torch.stack([gm(x) for gm in self.group_models], dim=0)
     return x_
 
-  def objective(self, x, lamb=.01, wrt='all'):
-    if wrt not in ['all', 'C', 'U']:
-      raise ValueError("Objective must be computed wrt 'all', 'C', or 'U'")
+  def objective(self, x, lamb=.01, wrt='all', c_mean=None):
+    if wrt not in ['all', 'C', 'U_V']:
+      raise ValueError("Objective must be computed wrt 'all', 'C', or 'U_V'")
+
+    # jth column of assignment c scaled by N/N_j
+    # used to balance objective wrt U_V across j=1,...,k
+    if c_mean is not None:
+      c_scale = self.c / c_mean.view(1, -1)
+    else:
+      c_scale = self.c
 
     # evaluate loss: least-squares weighted by assignment, as in k-means.
     x_ = self(x)
     loss = torch.sum((x.unsqueeze(0) - x_)**2,
         dim=tuple(range(2, x_.dim()))).t()
-    if wrt in ['all', 'U']:
+    if wrt == 'all':
       # NOTE: c assumed to be already updated with respect to current sample.
       loss = torch.mean(torch.sum(self.c*loss, dim=1))
+    elif wrt == 'U_V':
+      loss = torch.mean(torch.sum(c_scale*loss, dim=1))
     # for wrt C, use (batch_size, n) matrix of losses for computing closed form
     # assignment.
 
     # evaluate U regularizer
-    if wrt in ['all', 'U']:
-      reg = self.gm_reg()
-    else:
-      reg = 0.0
+    reg = self.gm_reg().view(1, -1)
+    if wrt == 'all':
+      reg = torch.mean(torch.sum(self.c*reg, dim=1))
+    elif wrt == 'U_V':
+      reg = torch.mean(torch.sum(c_scale*reg, dim=1))
+      # equivalently
+      # reg = torch.sum(reg)
+    # for wrt C, use 1 x k vector of U reg values for closed form assignment.
 
     obj = loss + lamb*reg
     return obj, loss, reg, x_

@@ -10,6 +10,7 @@ from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
 from models import KClusterModel
 
 C_EPS = .01
+EMA_DECAY = 0.9
 
 
 class KClusterOptimizer(optim.Optimizer):
@@ -76,13 +77,16 @@ class KClusterOptimizer(optim.Optimizer):
     # NOTE: add small eps, seems to help U updates slightly. But probably
     # should prune this.
     if C_EPS > 0:
-      c.data.add_(C_EPS / self.k)
+      # c.data.add_(C_EPS / self.k)
+      c_z = torch.zeros_like(c.data)
+      c_z.normal_(mean=0, std=(C_EPS/self.k)).abs_()
+      c.data.add_(c_z)
       c.data.div_(c.data.sum(dim=1, keepdim=True))
     return
 
-  def objective(self, x, wrt='all'):
+  def objective(self, x, wrt='all', c_mean=None):
     """encapsulate model objective function. A little inelegant..."""
-    return self.model.objective(x, lamb=self.lamb, wrt=wrt)
+    return self.model.objective(x, lamb=self.lamb, wrt=wrt, c_mean=c_mean)
 
 
 class KManifoldSGD(KClusterOptimizer):
@@ -218,9 +222,11 @@ class KSubspaceAltSGD(KClusterOptimizer):
       0=exact, 1=uniform assignment (default: 0)
     dist_mode (bool, optional): whether in mpi distributed mode
       (default: False).
+    size_scale (bool, optional): whether to scale wrt U obj to compensate for
+      group size imbalance (default: False).
   """
   def __init__(self, model, lr, lamb_U, lamb_V=None, momentum=0.0,
-        nesterov=False, soft_assign=0.0, dist_mode=False):
+        nesterov=False, soft_assign=0.0, dist_mode=False, size_scale=False):
 
     lamb_V = lamb_U if lamb_V is None else lamb_V
     min_lamb = np.min([lamb_U, lamb_V])
@@ -246,6 +252,9 @@ class KSubspaceAltSGD(KClusterOptimizer):
     self.lamb = None
     self.dist_mode = dist_mode
 
+    self.size_scale = size_scale
+    self.c_mean = torch.mean(model.c.data, dim=0) if size_scale else None
+
     if dist_mode:
       if dist.get_rank() == 0:
         print("Distributed mode with world={}, syncing parameters.".format(
@@ -263,7 +272,9 @@ class KSubspaceAltSGD(KClusterOptimizer):
     """
     self._step_V(x)
     self._step_C(x)
-    obj, loss, reg, Ureg, Vreg, x_ = self._step_U(x)
+    self._step_U(x)
+    with torch.no_grad():
+      obj, loss, reg, Ureg, Vreg, x_ = self.objective(x, wrt='all')
 
     sprs = self.model.eval_sprs()
     norm_x_ = self.model.eval_shrink(x, x_)
@@ -306,7 +317,11 @@ class KSubspaceAltSGD(KClusterOptimizer):
     nesterov = group['nesterov']
     lr = group['lr']
 
-    obj, loss, reg, Ureg, Vreg, x_ = self.objective(x, wrt='all')
+    if self.size_scale:
+      self.c_mean.mul_(EMA_DECAY)
+      self.c_mean.add_(1-EMA_DECAY, torch.mean(self.model.c.data, dim=0))
+
+    obj = self.objective(x, wrt='U', c_mean=self.c_mean)[0]
     self.zero_grad()
     obj.backward()
     if self.dist_mode:
@@ -327,12 +342,12 @@ class KSubspaceAltSGD(KClusterOptimizer):
         else:
           d_p = buf
       p.data.add_(-lr, d_p)
-    return obj.data, loss.data, reg.data, Ureg.data, Vreg.data, x_.data
+    return
 
-  def objective(self, x, wrt='all'):
+  def objective(self, x, wrt='all', c_mean=None):
     """encapsulate model objective function. A little inelegant..."""
     return self.model.objective(x, lamb_U=self.lamb_U,
-        lamb_V=self.lamb_V, wrt=wrt)
+        lamb_V=self.lamb_V, wrt=wrt, c_mean=c_mean)
 
 
 class KManifoldAESGD(KClusterOptimizer):
@@ -350,9 +365,11 @@ class KManifoldAESGD(KClusterOptimizer):
       0=exact, 1=uniform assignment (default: 0)
     dist_mode (bool, optional): whether in mpi distributed mode
       (default: False).
+    size_scale (bool, optional): whether to scale wrt U_V obj to compensate for
+      group size imbalance (default: False).
   """
   def __init__(self, model, lr, lamb, momentum=0.0, nesterov=False,
-        soft_assign=0.0, dist_mode=False):
+        soft_assign=0.0, dist_mode=False, size_scale=False):
 
     if dist_mode and not dist.is_initialized():
       raise RuntimeError("Distributed package not initialized")
@@ -361,6 +378,9 @@ class KManifoldAESGD(KClusterOptimizer):
         {'name': 'U_V', 'params': model.group_models.parameters()}]
     super(KManifoldAESGD, self).__init__(model, params, lr, lamb, momentum,
         nesterov, soft_assign)
+
+    self.size_scale = size_scale
+    self.c_mean = torch.mean(model.c.data, dim=0) if size_scale else None
 
     self.dist_mode = dist_mode
     if dist_mode:
@@ -379,7 +399,9 @@ class KManifoldAESGD(KClusterOptimizer):
       x (FloatTensor): current minibatch data
     """
     self._step_C(x)
-    obj, loss, reg, x_ = self._step_U_V(x)
+    self._step_U_V(x)
+    with torch.no_grad():
+      obj, loss, reg, x_ = self.objective(x, wrt='all')
     # included for consistency
     Ureg = reg
     Vreg = 0.0
@@ -396,7 +418,11 @@ class KManifoldAESGD(KClusterOptimizer):
     nesterov = group['nesterov']
     lr = group['lr']
 
-    obj, loss, reg, x_ = self.objective(x, wrt='all')
+    if self.size_scale:
+      self.c_mean.mul_(EMA_DECAY)
+      self.c_mean.add_(1-EMA_DECAY, torch.mean(self.model.c.data, dim=0))
+
+    obj = self.objective(x, wrt='U_V', c_mean=self.c_mean)[0]
     self.zero_grad()
     obj.backward()
     if self.dist_mode:
@@ -421,7 +447,7 @@ class KManifoldAESGD(KClusterOptimizer):
           d_p = buf
 
       p.data.add_(-lr, d_p)
-    return obj.data, loss.data, reg.data, x_.data
+    return
 
 
 def find_soft_assign(losses, T=1.):
