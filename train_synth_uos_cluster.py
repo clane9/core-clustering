@@ -37,10 +37,7 @@ def main():
   synth_dataset = dat.SynthUoSDataset(args.n, args.d, args.D, args.Ng,
       args.affine, args.sigma, args.data_seed)
   N = args.n*args.Ng
-  batch_size = args.batch_size
-  if args.batch_size <= 0 or args.batch_size > N:
-    batch_size = N
-  kwargs = {'num_workers': 0}
+  kwargs = {'num_workers': args.num_workers}
   if use_cuda:
     kwargs['pin_memory'] = True
   if args.dist:
@@ -48,7 +45,9 @@ def main():
         dist.get_rank())
   else:
     sampler = DistributedSampler(synth_dataset, 1, 0)
-  synth_data_loader = DataLoader(synth_dataset, batch_size=batch_size,
+  if args.batch_size <= 0 or args.batch_size > N:
+    raise ValueError("Invalid batch size")
+  synth_data_loader = DataLoader(synth_dataset, batch_size=args.batch_size,
       sampler=sampler, drop_last=True, **kwargs)
 
   torch.manual_seed(args.seed)
@@ -58,12 +57,12 @@ def main():
   if args.auto_enc:
     group_models = [mod.SubspaceAEModel(args.d, args.D, args.affine)
         for _ in range(args.n)]
-    model = mod.KManifoldAEClusterModel(args.n, args.d, N, batch_size,
+    model = mod.KManifoldAEClusterModel(args.n, args.d, N, args.batch_size,
         group_models)
   else:
     group_models = [mod.SubspaceModel(args.d, args.D, args.affine)
         for _ in range(args.n)]
-    model = mod.KManifoldClusterModel(args.n, args.d, N, batch_size,
+    model = mod.KManifoldClusterModel(args.n, args.d, N, args.batch_size,
         group_models, use_cuda, store_C_V=(not args.alt_opt))
   model = model.to(device)
 
@@ -71,13 +70,14 @@ def main():
   if args.auto_enc:
     optimizer = opt.KManifoldAESGD(model, lr=args.init_lr,
         lamb=args.lamb_U, momentum=args.momentum, nesterov=args.nesterov,
-        soft_assign=args.soft_assign, dist_mode=args.dist)
+        soft_assign=args.soft_assign, dist_mode=args.dist,
+        size_scale=args.size_scale)
   else:
     if args.alt_opt:
       optimizer = opt.KSubspaceAltSGD(model, lr=args.init_lr,
           lamb_U=args.lamb_U, lamb_V=args.lamb_V, momentum=args.momentum,
           nesterov=args.nesterov, soft_assign=args.soft_assign,
-          dist_mode=args.dist)
+          dist_mode=args.dist, size_scale=args.size_scale)
     else:
       if args.dist:
         raise ValueError("Distributed mode not compatible with joint SGD opt.")
@@ -124,20 +124,25 @@ if __name__ == '__main__':
                       help='Use alternating optimization method')
   parser.add_argument('--batch-size', type=int, default=100,
                       help='Input batch size for training [default: 100]')
-  parser.add_argument('--epochs', type=int, default=1000,
-                      help='Number of epochs to train [default: 1000]')
+  parser.add_argument('--epochs', type=int, default=50,
+                      help='Number of epochs to train [default: 50]')
   parser.add_argument('--init-lr', type=float, default=0.5,
                       help='Initial learning rate [default: 0.5]')
   parser.add_argument('--momentum', type=float, default=0.9,
-                      help='Initial learning rate [default: 0.9]')
+                      help='Momentum acceleration parameter [default: 0.9]')
   parser.add_argument('--nesterov', action='store_true', default=False,
                       help='Use nesterov form of acceleration')
   parser.add_argument('--dist', action='store_true', default=False,
                       help='Enables distributed training')
+  parser.add_argument('--size-scale', action='store_true', default=False,
+                      help=('Scale objective wrt U to compensate for '
+                      'size imbalance'))
   parser.add_argument('--cuda', action='store_true', default=False,
                       help='Enables CUDA training')
   parser.add_argument('--num-threads', type=int, default=1,
                       help='Number of parallel threads to use [default: 1]')
+  parser.add_argument('--num-workers', type=int, default=1,
+                      help='Number of workers for data loading [default: 1]')
   parser.add_argument('--seed', type=int, default=2018,
                       help='Training random seed [default: 2018]')
   args = parser.parse_args()

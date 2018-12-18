@@ -33,14 +33,14 @@ def main():
   torch.set_num_threads(args.num_threads)
 
   # construct dataset
-  torch.manual_seed(args.data_seed)
-  np.random.seed(args.data_seed)
   synth_dataset = dat.SynthUoSOnlineDataset(args.n, args.d, args.D, args.N,
       args.affine, args.sigma, args.data_seed)
   if args.dist:
     # separate online sampling seeds per process
-    synth_dataset.set_seed(1991 + dist.get_rank())
-  kwargs = {'num_workers': 4}
+    torch.manual_seed(args.data_seed + 1957*dist.get_rank())
+  else:
+    torch.manual_seed(args.data_seed)
+  kwargs = {'num_workers': args.num_workers}
   if use_cuda:
     kwargs['pin_memory'] = True
   if args.batch_size <= 0 or args.batch_size > args.N:
@@ -68,12 +68,13 @@ def main():
   if args.auto_enc:
     optimizer = opt.KManifoldAESGD(model, lr=args.init_lr,
         lamb=args.lamb_U, momentum=args.momentum, nesterov=args.nesterov,
-        soft_assign=args.soft_assign, dist_mode=args.dist)
+        soft_assign=args.soft_assign, dist_mode=args.dist,
+        size_scale=args.size_scale)
   else:
     optimizer = opt.KSubspaceAltSGD(model, lr=args.init_lr,
         lamb_U=args.lamb_U, lamb_V=args.lamb_V, momentum=args.momentum,
         nesterov=args.nesterov, soft_assign=args.soft_assign,
-        dist_mode=args.dist)
+        dist_mode=args.dist, size_scale=args.size_scale)
 
   tr.train_loop(model, synth_data_loader, device, optimizer,
       args.out_dir, args.epochs, CHKP_FREQ, STOP_FREQ, args.dist)
@@ -112,8 +113,8 @@ if __name__ == '__main__':
   # training settings
   parser.add_argument('--batch-size', type=int, default=100,
                       help='Input batch size for training [default: 100]')
-  parser.add_argument('--epochs', type=int, default=100,
-                      help='Number of epochs to train [default: 100]')
+  parser.add_argument('--epochs', type=int, default=50,
+                      help='Number of epochs to train [default: 50]')
   parser.add_argument('--init-lr', type=float, default=0.5,
                       help='Initial learning rate [default: 0.5]')
   parser.add_argument('--momentum', type=float, default=0.9,
@@ -122,10 +123,15 @@ if __name__ == '__main__':
                       help='Use nesterov form of acceleration')
   parser.add_argument('--dist', action='store_true', default=False,
                       help='Enables distributed training')
+  parser.add_argument('--size-scale', action='store_true', default=False,
+                      help=('Scale objective wrt U to compensate for '
+                      'size imbalance'))
   parser.add_argument('--cuda', action='store_true', default=False,
                       help='Enables CUDA training')
   parser.add_argument('--num-threads', type=int, default=1,
                       help='Number of parallel threads to use [default: 1]')
+  parser.add_argument('--num-workers', type=int, default=1,
+                      help='Number of workers for data loading [default: 1]')
   parser.add_argument('--seed', type=int, default=2018,
                       help='Training random seed [default: 2018]')
   args = parser.parse_args()
