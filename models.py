@@ -134,7 +134,7 @@ class KManifoldClusterModel(KClusterModel):
     return x_
 
   def objective(self, x, ii=None, lamb_U=.01, lamb_V=None, wrt='all',
-        c_mean=None):
+        c_mean=None, prox_reg_U=False):
     if wrt not in ['all', 'V', 'C', 'U']:
       raise ValueError(("Objective must be computed wrt 'all', "
           "'V', 'C', or 'U'"))
@@ -161,14 +161,12 @@ class KManifoldClusterModel(KClusterModel):
     # assignment.
 
     # evaluate U regularizer
-    if wrt in ['all', 'U', 'C']:
+    if (wrt in ['all', 'C']) or (wrt == 'U' and not prox_reg_U):
       Ureg = self.gm_reg().view(1, -1)
       if wrt == 'all':
         Ureg = torch.mean(torch.sum(self.c*Ureg, dim=1))
       elif wrt == 'U':
         Ureg = torch.mean(torch.sum(c_scale*Ureg, dim=1))
-        # equivalently
-        # Ureg = torch.sum(Ureg)
       # for wrt C, use 1 x k vector of U reg values for closed form assignment.
     else:
       Ureg = 0.0
@@ -269,8 +267,6 @@ class KManifoldAEClusterModel(KClusterModel):
       reg = torch.mean(torch.sum(self.c*reg, dim=1))
     elif wrt == 'U_V':
       reg = torch.mean(torch.sum(c_scale*reg, dim=1))
-      # equivalently
-      # reg = torch.sum(reg)
     # for wrt C, use 1 x k vector of U reg values for closed form assignment.
 
     obj = loss + lamb*reg
@@ -280,11 +276,16 @@ class KManifoldAEClusterModel(KClusterModel):
 class SubspaceModel(nn.Module):
   """Model of single low-dimensional affine or linear subspace."""
 
-  def __init__(self, d, D, affine=False):
+  def __init__(self, d, D, affine=False, reg='fro_sqr'):
     super(SubspaceModel, self).__init__()
     self.d = d  # manifold dimension
     self.D = D  # ambient dimension
     self.affine = affine  # whether affine or linear subspaces.
+
+    if reg not in ('fro_sqr', 'grp_sprs'):
+      raise ValueError(("Invalid regularization choice "
+          "(must be one of 'fro_sqr', 'grp_sprs')."))
+    self.reg_mode = reg
 
     # construct subspace parameters and initialize
     # logic taken from pytorch Linear layer code
@@ -310,8 +311,11 @@ class SubspaceModel(nn.Module):
     return x
 
   def reg(self):
-    """Compute L2 regularization on subspace basis."""
-    reg = torch.sum(self.U**2)
+    """Compute regularization on subspace basis."""
+    if self.reg_mode == 'grp_sprs':
+      reg = torch.sum(torch.norm(self.U, p=2, dim=0))
+    else:
+      reg = torch.sum(self.U**2)
     return reg
 
 
@@ -399,11 +403,16 @@ class SubspaceAEModel(nn.Module):
   """Model of single low-dimensional affine or linear subspace auto-encoder
   (i.e. pca)."""
 
-  def __init__(self, d, D, affine=False):
+  def __init__(self, d, D, affine=False, reg='fro_sqr'):
     super(SubspaceAEModel, self).__init__()
     self.d = d  # manifold dimension
     self.D = D  # ambient dimension
     self.affine = affine  # whether affine or linear subspaces.
+
+    if reg not in ('fro_sqr', 'grp_sprs'):
+      raise ValueError(("Invalid regularization choice "
+          "(must be one of 'fro_sqr', 'grp_sprs')."))
+    self.reg_mode = reg
 
     # NOTE: should V really be U^T, as in pca?
     self.U = nn.Parameter(torch.Tensor(D, d))
@@ -446,7 +455,12 @@ class SubspaceAEModel(nn.Module):
 
   def reg(self):
     """Compute L2 regularization on subspace basis."""
-    reg = 0.5*(self.U.pow(2).sum() + self.V.pow(2).sum())
+    if self.reg_mode == 'grp_sprs':
+      Ureg = torch.sum(torch.norm(self.U, p=2, dim=0))
+    else:
+      Ureg = torch.sum(self.U**2)
+    Vreg = torch.sum(self.V**2)
+    reg = Ureg + Vreg
     return reg
 
 

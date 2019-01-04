@@ -52,15 +52,16 @@ def main():
   np.random.seed(args.seed)
 
   # construct model
+  model_d = args.model_d if args.model_d > 0 else args.d
   if args.auto_enc:
-    group_models = [mod.SubspaceAEModel(args.d, args.D, args.affine)
-        for _ in range(args.n)]
-    model = mod.KManifoldAEClusterModel(args.n, args.d, args.N,
+    group_models = [mod.SubspaceAEModel(model_d, args.D, args.affine,
+        reg=args.reg_U) for _ in range(args.n)]
+    model = mod.KManifoldAEClusterModel(args.n, model_d, args.N,
         args.batch_size, group_models)
   else:
-    group_models = [mod.SubspaceModel(args.d, args.D, args.affine)
-        for _ in range(args.n)]
-    model = mod.KManifoldClusterModel(args.n, args.d, args.N, args.batch_size,
+    group_models = [mod.SubspaceModel(model_d, args.D, args.affine,
+        reg=args.reg_U) for _ in range(args.n)]
+    model = mod.KManifoldClusterModel(args.n, model_d, args.N, args.batch_size,
         group_models, use_cuda, store_C_V=False)
   model = model.to(device)
 
@@ -71,10 +72,18 @@ def main():
         soft_assign=args.soft_assign, dist_mode=args.dist,
         size_scale=args.size_scale)
   else:
-    optimizer = opt.KSubspaceAltSGD(model, lr=args.init_lr,
-        lamb_U=args.lamb_U, lamb_V=args.lamb_V, momentum=args.momentum,
-        nesterov=args.nesterov, soft_assign=args.soft_assign,
-        dist_mode=args.dist, size_scale=args.size_scale)
+    if args.prox_reg_U:
+      prox_U = (opt.prox_grp_sprs if args.reg_U == 'grp_sprs'
+          else opt.prox_fro_sqr)
+      optimizer = opt.KSubspaceAltProxSGD(model, lr=args.init_lr,
+          lamb_U=args.lamb_U, lamb_V=args.lamb_V, momentum=args.momentum,
+          prox_U=prox_U, soft_assign=args.soft_assign,
+          dist_mode=args.dist, size_scale=args.size_scale)
+    else:
+      optimizer = opt.KSubspaceAltSGD(model, lr=args.init_lr,
+          lamb_U=args.lamb_U, lamb_V=args.lamb_V, momentum=args.momentum,
+          nesterov=args.nesterov, soft_assign=args.soft_assign,
+          dist_mode=args.dist, size_scale=args.size_scale)
 
   tr.train_loop(model, synth_data_loader, device, optimizer,
       args.out_dir, args.epochs, CHKP_FREQ, STOP_FREQ, args.dist)
@@ -102,8 +111,15 @@ if __name__ == '__main__':
   parser.add_argument('--data-seed', type=int, default=1904,
                       help='Data random seed [default: 1904]')
   # model settings
+  parser.add_argument('--model-d', type=int, default=-1,
+                      help='Model subspace dimension [default: d]')
   parser.add_argument('--auto-enc', action='store_true', default=False,
                       help='use auto-encoder formulation')
+  parser.add_argument('--reg-U', type=str, default='fro_sqr',
+                      help=("U reg function (one of 'fro_sqr', 'grp_sprs') "
+                          "[default: fro_sqr]"))
+  parser.add_argument('--prox-reg-U', action='store_true', default=False,
+                      help='update U by proximal gradient')
   parser.add_argument('--lamb-U', type=float, default=1e-4,
                       help='U reg parameter [default: 1e-4]')
   parser.add_argument('--lamb-V', type=float, default=0.1,

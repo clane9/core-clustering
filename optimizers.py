@@ -5,6 +5,7 @@ import numpy as np
 import torch
 import torch.optim as optim
 import torch.distributed as dist
+import torch.nn.functional as F
 from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
 
 from models import KClusterModel
@@ -350,6 +351,95 @@ class KSubspaceAltSGD(KClusterOptimizer):
         lamb_V=self.lamb_V, wrt=wrt, c_mean=c_mean)
 
 
+class KSubspaceAltProxSGD(KSubspaceAltSGD):
+  """Implements variant of SGD for special k-subspace case. Alternates between
+  (1) closed form v solution by solving least-squares, (2) closed form update
+  to (soft) assignment C, (3) stochastic accelerated proximal gradient update
+  on U (subspace variables).
+
+  Args:
+    model (KManifoldClusterModel instance): model to optimize.
+    lr (float): learning rate
+    lamb_U (float): U regularization parameter
+    lamb_V (float): V regularization parameter.
+    momentum (float, optional): momentum factor (default: 0)
+    prox_U (callable, optional): proximal operator of regularizer wrt U
+      variables (default: None).
+    soft_assign (float, optional): update segmentation using soft assignment.
+      0=exact, 1=uniform assignment (default: 0)
+    dist_mode (bool, optional): whether in mpi distributed mode
+      (default: False).
+    size_scale (bool, optional): whether to scale wrt U obj to compensate for
+      group size imbalance (default: False).
+  """
+  def __init__(self, model, lr, lamb_U, lamb_V=None, momentum=0.0,
+        prox_U=None, soft_assign=0.0, dist_mode=False, size_scale=False):
+
+    super(KSubspaceAltProxSGD, self).__init__(model, lr, lamb_U, lamb_V,
+        momentum=momentum, nesterov=True, soft_assign=soft_assign,
+        dist_mode=dist_mode, size_scale=size_scale)
+
+    self.params_dict['U']['par_names'] = [p[0] for p in
+        self.model.group_models.named_parameters()]
+
+    self.prox_U = prox_U
+    self.prox_reg_U = prox_U is not None
+    return
+
+  def _step_U(self, x):
+    """stochastic gradient step on U variables (manifold models)"""
+    group = self.params_dict['U']
+    momentum = group['momentum']
+    lr = group['lr']
+
+    if self.size_scale:
+      self.c_mean.mul_(EMA_DECAY)
+      self.c_mean.add_(1-EMA_DECAY, torch.mean(self.model.c.data, dim=0))
+      # only needed for computing prox reg U. computed separately in objective.
+      # NOTE: a little disorganized...
+      c_scale = self.model.c.data / self.c_mean.view(1, -1)
+    else:
+      c_scale = self.model.c.data
+
+    obj = self.objective(x, wrt='U', c_mean=self.c_mean)[0]
+    self.zero_grad()
+    obj.backward()
+    if self.dist_mode:
+      _average_grads(group)
+
+    for p_name, p in zip(group['par_names'], group['params']):
+      if p.grad is None:
+        continue
+      d_p = p.grad.data
+
+      # proximal updates (only on subspace basis variables)
+      x = p.data.add(-lr, d_p)
+      # assume params are named e.g. 0.U, 0.b
+      if self.prox_reg_U and 'U' in p_name:
+        group_idx = int(p_name.split('.')[0])
+        prox_lamb = lr*self.lamb_U*torch.mean(c_scale[:, group_idx])
+        x = self.prox_U(x, prox_lamb)
+
+      # acceleration
+      if momentum > 0:
+        param_state = self.state[p]
+        if 'momentum_buffer' not in param_state:
+          param_state['momentum_buffer'] = torch.zeros_like(p.data)
+          param_state['momentum_buffer'].copy_(p.data)
+        buf = param_state['momentum_buffer']
+        # NOTE: does this make sense on first iteration? Regardless, shouldn't
+        # matter much. This way we also recover the updates in KSubspaceAltSGD
+        # exactly.
+        p.data.set_(x.add(momentum, x.sub(buf)))
+        buf.set_(x)
+    return
+
+  def objective(self, x, wrt='all', c_mean=None):
+    """encapsulate model objective function. A little inelegant..."""
+    return self.model.objective(x, lamb_U=self.lamb_U, lamb_V=self.lamb_V,
+        wrt=wrt, c_mean=c_mean, prox_reg_U=self.prox_reg_U)
+
+
 class KManifoldAESGD(KClusterOptimizer):
   """Implements variant of SGD for special k-manifold case. Alternates between
   (1) closed form update to (soft) assignment C, (2) stochastic gradient update
@@ -506,3 +596,16 @@ def _sync_params(group):
   for p in group['params']:
     dist.broadcast(p.data, 0)
   return
+
+
+def prox_fro_sqr(X, lamb):
+  """Evaluate proximal operator of g(X) = lambda ||X||_F^2."""
+  return (1./(1.+2.*lamb))*X
+
+
+def prox_grp_sprs(X, lamb):
+  """Evaluate proximal operator of g(X) = lambda ||X||_{2 1}."""
+  Xnorm = torch.norm(X, p=2, dim=0)
+  m, n = X.shape
+  coeff = F.relu(torch.ones(1, n) - lamb/(Xnorm + 1e-8))
+  return coeff*X
