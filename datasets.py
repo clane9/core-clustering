@@ -107,7 +107,7 @@ class SynthUoSOnlineDataset(Dataset):
     # generate data. Otherwise rng is duplicated and end up getting repeated
     # data. Also note that it doesn't matter if seed is changed after
     # DataLoader constructor is called.
-    grp = torch.randint(high=self.n, size=(1,), dtype=torch.int64)
+    grp = torch.randint(high=self.n, size=(1,), dtype=torch.int64)[0]
     v = (1./np.sqrt(self.d))*torch.randn(self.d, 1)
     x = torch.matmul(self.Us[grp, :, :], v).view(-1)
     if self.affine:
