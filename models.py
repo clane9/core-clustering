@@ -7,6 +7,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+import utils as ut
+
+RANK_TOL = .001
+
 
 class KClusterModel(nn.Module):
   """Base class for k-cluster model."""
@@ -48,9 +52,10 @@ class KClusterModel(nn.Module):
   def objective(self, *args, **kwargs):
     raise NotImplementedError("objective not implemented")
 
-  def gm_reg(self):
+  def gm_reg(self, prox_nonsmooth=False):
     """Compute regularization wrt all group models."""
-    return torch.stack([gm.reg() for gm in self.group_models], dim=0)
+    return torch.stack([gm.reg(prox_nonsmooth)
+        for gm in self.group_models], dim=0)
 
   def eval_sprs(self):
     """measure robust sparsity of current assignment subset c"""
@@ -134,39 +139,28 @@ class KManifoldClusterModel(KClusterModel):
     return x_
 
   def objective(self, x, ii=None, lamb_U=.01, lamb_V=None, wrt='all',
-        c_mean=None, prox_reg_U=False):
+        prox_nonsmooth=False):
     if wrt not in ['all', 'V', 'C', 'U']:
       raise ValueError(("Objective must be computed wrt 'all', "
           "'V', 'C', or 'U'"))
     lamb_V = lamb_U if lamb_V is None else lamb_V
 
-    # jth column of assignment c scaled by N/N_j
-    # used to balance objective wrt U across j=1,...,k
-    if c_mean is not None:
-      c_scale = self.c / c_mean.view(1, -1)
-    else:
-      c_scale = self.c
-
     # evaluate loss: least-squares weighted by assignment, as in k-means.
     x_ = self(ii)
     loss = torch.sum((x.unsqueeze(0) - x_)**2,
         dim=tuple(range(2, x_.dim()))).t()
-    if wrt == 'all':
+    if wrt in ['all', 'U']:
       loss = torch.mean(torch.sum(self.c*loss, dim=1))
-    elif wrt == 'U':
-      loss = torch.mean(torch.sum(c_scale*loss, dim=1))
     elif wrt == 'V':
       loss = torch.mean(torch.sum(loss, dim=1))
-    # for wrt C, use Nb x k matrix of losses for computing closed form
+    # for wrt C, use batch_size x k matrix of losses for computing closed form
     # assignment.
 
     # evaluate U regularizer
-    if (wrt in ['all', 'C']) or (wrt == 'U' and not prox_reg_U):
-      Ureg = self.gm_reg().view(1, -1)
-      if wrt == 'all':
+    if wrt in ['all', 'C', 'U']:
+      Ureg = self.gm_reg(prox_nonsmooth).view(1, -1)
+      if wrt in ['all', 'U']:
         Ureg = torch.mean(torch.sum(self.c*Ureg, dim=1))
-      elif wrt == 'U':
-        Ureg = torch.mean(torch.sum(c_scale*Ureg, dim=1))
       # for wrt C, use 1 x k vector of U reg values for closed form assignment.
     else:
       Ureg = 0.0
@@ -178,7 +172,7 @@ class KManifoldClusterModel(KClusterModel):
         Vreg = torch.mean(torch.sum(self.c*Vreg, dim=1))
       elif wrt == 'V':
         Vreg = torch.mean(torch.sum(Vreg, dim=1))
-      # for wrt C, use Nb x n matrix of V reg values for closed form
+      # for wrt C, use batch_size x n matrix of V reg values for closed form
       # assignment.
     else:
       Vreg = 0.0
@@ -238,35 +232,24 @@ class KManifoldAEClusterModel(KClusterModel):
     x_ = torch.stack([gm(x) for gm in self.group_models], dim=0)
     return x_
 
-  def objective(self, x, lamb=.01, wrt='all', c_mean=None):
+  def objective(self, x, lamb=.01, wrt='all', prox_nonsmooth=False):
     if wrt not in ['all', 'C', 'U_V']:
       raise ValueError("Objective must be computed wrt 'all', 'C', or 'U_V'")
-
-    # jth column of assignment c scaled by N/N_j
-    # used to balance objective wrt U_V across j=1,...,k
-    if c_mean is not None:
-      c_scale = self.c / c_mean.view(1, -1)
-    else:
-      c_scale = self.c
 
     # evaluate loss: least-squares weighted by assignment, as in k-means.
     x_ = self(x)
     loss = torch.sum((x.unsqueeze(0) - x_)**2,
         dim=tuple(range(2, x_.dim()))).t()
-    if wrt == 'all':
+    if wrt in ['all', 'U_V']:
       # NOTE: c assumed to be already updated with respect to current sample.
       loss = torch.mean(torch.sum(self.c*loss, dim=1))
-    elif wrt == 'U_V':
-      loss = torch.mean(torch.sum(c_scale*loss, dim=1))
-    # for wrt C, use (batch_size, n) matrix of losses for computing closed form
+    # for wrt C, use batch_size x k matrix of losses for computing closed form
     # assignment.
 
     # evaluate U regularizer
-    reg = self.gm_reg().view(1, -1)
-    if wrt == 'all':
+    reg = self.gm_reg(prox_nonsmooth).view(1, -1)
+    if wrt in ['all', 'U_V']:
       reg = torch.mean(torch.sum(self.c*reg, dim=1))
-    elif wrt == 'U_V':
-      reg = torch.mean(torch.sum(c_scale*reg, dim=1))
     # for wrt C, use 1 x k vector of U reg values for closed form assignment.
 
     obj = loss + lamb*reg
@@ -310,13 +293,20 @@ class SubspaceModel(nn.Module):
     x = F.linear(v, self.U, self.b)
     return x
 
-  def reg(self):
+  def reg(self, prox_nonsmooth=False):
     """Compute regularization on subspace basis."""
     if self.reg_mode == 'grp_sprs':
-      reg = torch.sum(torch.norm(self.U, p=2, dim=0))
+      if prox_nonsmooth:
+        reg = torch.tensor(0.0)
+      else:
+        reg = torch.sum(torch.norm(self.U, p=2, dim=0))
     else:
       reg = torch.sum(self.U**2)
     return reg
+
+  def rank(self, tol=RANK_TOL):
+    """Compute rank of subspace basis."""
+    return ut.rank(self.U.data, tol)
 
 
 class ResidualManifoldModel(nn.Module):
@@ -350,7 +340,7 @@ class ResidualManifoldModel(nn.Module):
     x = x.view((-1,) + self.xshape)
     return x
 
-  def reg(self):
+  def reg(self, prox_nonsmooth=False):
     """Compute L2 squared regularization on subspace basis and residual
     module."""
     reg = torch.sum(self.subspace_embedding.U**2)
@@ -360,6 +350,9 @@ class ResidualManifoldModel(nn.Module):
     reg += self.res_lamb*(torch.sum(self.res_fc1.weight**2) +
         torch.sum(self.res_fc2.weight**2))
     return reg
+
+  def rank(self, tol=RANK_TOL):
+    raise NotImplementedError("rank not implemented for residual manifold")
 
 
 class MNISTDCManifoldModel(nn.Module):
@@ -389,7 +382,7 @@ class MNISTDCManifoldModel(nn.Module):
     x = self.conv_generator(v.view(-1, self.d, 1, 1))
     return x
 
-  def reg(self):
+  def reg(self, prox_nonsmooth=False):
     """Compute l2 squared regularizer on last batchnorm weight and last conv
     filter."""
     # NOTE: confirm that network is ph degree zero wrt earlier weights?
@@ -397,6 +390,9 @@ class MNISTDCManifoldModel(nn.Module):
     reg = (self.conv_generator[5].weight.pow(2).sum() +
         self.conv_generator[8].weight.pow(2).sum())
     return reg
+
+  def rank(self, tol=RANK_TOL):
+    raise NotImplementedError("rank not implemented for mnist deep conv model")
 
 
 class SubspaceAEModel(nn.Module):
@@ -453,15 +449,21 @@ class SubspaceAEModel(nn.Module):
     x_ = F.linear(v, self.U, self.b)
     return x_
 
-  def reg(self):
+  def reg(self, prox_nonsmooth=False):
     """Compute L2 regularization on subspace basis."""
     if self.reg_mode == 'grp_sprs':
-      Ureg = torch.sum(torch.norm(self.U, p=2, dim=0))
+      if prox_nonsmooth:
+        Ureg = torch.tensor(0.0)
+      else:
+        Ureg = torch.sum(torch.norm(self.U, p=2, dim=0))
     else:
       Ureg = torch.sum(self.U**2)
     Vreg = torch.sum(self.V**2)
     reg = Ureg + Vreg
     return reg
+
+  def rank(self, tol=RANK_TOL):
+    return ut.rank(self.U.data, tol)
 
 
 class ResidualManifoldAEModel(nn.Module):
@@ -516,13 +518,16 @@ class ResidualManifoldAEModel(nn.Module):
     x_ = x_ + z
     return x_
 
-  def reg(self):
+  def reg(self, prox_nonsmooth=False):
     """Compute L2 squared regularization on subspace basis and residual
     module."""
-    reg = self.subspace_ae.reg()
+    reg = self.subspace_ae.reg(prox_nonsmooth)
     # Intuition is for weights of residual module to be strongly regularized so
     # that residual is Lipschitz with a small constant, controlling the
     # curvature of the manifold.
     reg += 0.5*self.res_lamb*sum([layer.weight.pow(2).sum() for layer in
         [self.enc_fc1, self.enc_fc2, self.dec_fc1, self.dec_fc2]])
     return reg
+
+  def rank(self, tol=RANK_TOL):
+    raise NotImplementedError("rank not implemented for residual AE model")

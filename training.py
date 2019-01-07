@@ -15,7 +15,8 @@ import utils as ut
 
 
 def train_loop(model, data_loader, device, optimizer, out_dir,
-      epochs=200, chkp_freq=50, stop_freq=-1, dist_mode=False):
+      epochs=200, chkp_freq=50, stop_freq=-1, dist_mode=False,
+      eval_rank=False):
   """Train k-manifold model for series of epochs.
 
   Args:
@@ -28,14 +29,22 @@ def train_loop(model, data_loader, device, optimizer, out_dir,
     chkp_freq: how often to save checkpoint (default: 50)
     stop_freq: how often to stop for debugging (default: -1)
     dist_mode: whether in mpi distributed mode (default: False)
+    eval_rank: evaluate ranks of group models, only implemented for subspace
+      models (default: False)
   """
   printformstr = ('(epoch {:d}/{:d}) lr={:.3e} err={:.4f} obj={:.3e} '
-      'loss={:.3e} reg(U)(V)={:.3e},{:.3e},{:.3e} sprs={:.2f} '
-      '|x_|={:.3e} samp/s={:.0f} rtime={:.3f}')
-  logheader = ('Epoch,LR,Err,Obj,Loss,Reg,U.reg,V.reg,'
-      'Sprs,Norm.x_,Samp.s,RT')
-  logformstr = ('{:d},{:.9e},{:.9f},{:.9e},{:.9e},{:.9e},{:.9e},{:.9e},'
-      '{:.9e},{:.9e},{:.0f},{:.9f}')
+      'loss={:.3e} reg(U)(V)={:.3e},{:.3e},{:.3e} ')
+  if eval_rank:
+    printformstr += 'rank(min)(max)={:.0f},{:.0f},{:.0f} '
+  printformstr += 'sprs={:.2f} |x_|={:.3e} samp/s={:.0f} rtime={:.3f}'
+  logheader = 'Epoch,LR,Err,Obj,Loss,Reg,U.reg,V.reg,'
+  if eval_rank:
+    logheader += 'Rank.med,Rank.min,Rank.max,'
+  logheader += 'Sprs,Norm.x_,Samp.s,RT'
+  logformstr = '{:d},{:.9e},{:.9f},{:.9e},{:.9e},{:.9e},{:.9e},{:.9e},'
+  if eval_rank:
+    logformstr += '{:.9f},{:.0f},{:.0f},'
+  logformstr += '{:.9e},{:.9e},{:.0f},{:.9f}'
   val_logf = '{}/val_log.csv'.format(out_dir)
 
   if dist_mode and not (dist.is_initialized()):
@@ -47,6 +56,8 @@ def train_loop(model, data_loader, device, optimizer, out_dir,
       print(logheader, file=f)
   conf_mats = np.zeros((epochs, model.k, data_loader.dataset.classes.size),
       dtype=np.int64)
+  if eval_rank:
+    svs = np.zeros((epochs, model.k, model.d), dtype=np.float32)
 
   min_lr = 1e-6*ut.get_learning_rate(optimizer)
   scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer,
@@ -64,6 +75,14 @@ def train_loop(model, data_loader, device, optimizer, out_dir,
       metrics, conf_mats[epoch-1, :] = train_epoch(model, data_loader,
           optimizer, device, dist_mode)
       lr = ut.get_learning_rate(optimizer)
+
+      if eval_rank:
+        ranks, epoch_svs = zip(*[gm.rank() for gm in model.group_models])
+        svs[epoch-1, :] = torch.stack(epoch_svs).numpy()
+
+        ranks = torch.stack(ranks).numpy()
+        rank_stats = np.median(ranks), ranks.min(), ranks.max()
+        metrics = metrics[:6] + rank_stats + metrics[6:]
 
       if is_logging:
         with open(val_logf, 'a') as f:
@@ -110,6 +129,8 @@ def train_loop(model, data_loader, device, optimizer, out_dir,
     if is_logging:
       with open('{}/conf_mats.npz'.format(out_dir), 'wb') as f:
         np.savez(f, conf_mats=conf_mats[:epoch, :])
+      with open('{}/svs.npz'.format(out_dir), 'wb') as f:
+        np.savez(f, svs=svs[:epoch, :])
   return
 
 

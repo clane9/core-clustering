@@ -4,6 +4,7 @@ from __future__ import division
 import numpy as np
 import shutil
 import torch
+import torch.nn.functional as F
 from scipy.optimize import linear_sum_assignment
 
 
@@ -118,3 +119,22 @@ def eval_confusion(groups, true_groups, k=None, true_k=None,
     conf_mat = torch.matmul(groups_onehot.t(),
         true_groups_onehot).type(torch.float32)
   return conf_mat
+
+
+def prox_fro_sqr(X, lamb):
+  """Evaluate proximal operator of g(X) = lambda ||X||_F^2."""
+  return (1./(1.+2.*lamb))*X
+
+
+def prox_grp_sprs(X, lamb):
+  """Evaluate proximal operator of g(X) = lambda ||X||_{2 1}."""
+  Xnorm = torch.norm(X, p=2, dim=0)
+  m, n = X.shape
+  coeff = F.relu(torch.ones(1, n) - lamb/(Xnorm + 1e-8))
+  return coeff*X
+
+
+def rank(X, tol=.01):
+  """Evaluate approximate rank of X."""
+  _, svs, _ = torch.svd(X)
+  return (svs > tol*svs.max()).sum(), svs

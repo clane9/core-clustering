@@ -5,19 +5,18 @@ import numpy as np
 import torch
 import torch.optim as optim
 import torch.distributed as dist
-import torch.nn.functional as F
 from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
 
 from models import KClusterModel
 
-C_EPS = .01
 EMA_DECAY = 0.9
+EPS = 1e-8
 
 
 class KClusterOptimizer(optim.Optimizer):
   """Base class for special purpose k-cluster optimizers."""
   def __init__(self, model, params, lr, lamb, momentum=0.0, nesterov=False,
-        soft_assign=0.0):
+        soft_assign=0.0, c_sigma=.01):
 
     if not isinstance(model, KClusterModel):
       raise ValueError("Must provide k-cluster model instance.")
@@ -39,6 +38,7 @@ class KClusterOptimizer(optim.Optimizer):
     self.N = model.N
     self.lamb = lamb
     self.set_soft_assign(soft_assign)
+    self.c_sigma = c_sigma
 
     # disable gradients wrt C
     model.c.requires_grad = False
@@ -76,18 +76,18 @@ class KClusterOptimizer(optim.Optimizer):
     else:
       c.data.copy_(find_soft_assign(obj, self.soft_assign))
     # NOTE: add small eps, seems to help U updates slightly. But probably
-    # should prune this.
-    if C_EPS > 0:
-      # c.data.add_(C_EPS / self.k)
+    # could prune this. It is necessary in V grad update in KManifoldSGD
+    # to avoid div by zero however.
+    if self.c_sigma > 0:
       c_z = torch.zeros_like(c.data)
-      c_z.normal_(mean=0, std=(C_EPS/self.k)).abs_()
+      c_z.normal_(mean=0, std=(self.c_sigma/self.k)).abs_()
       c.data.add_(c_z)
       c.data.div_(c.data.sum(dim=1, keepdim=True))
     return
 
-  def objective(self, x, wrt='all', c_mean=None):
+  def objective(self, x, wrt='all'):
     """encapsulate model objective function. A little inelegant..."""
-    return self.model.objective(x, lamb=self.lamb, wrt=wrt, c_mean=c_mean)
+    return self.model.objective(x, lamb=self.lamb, wrt=wrt)
 
 
 class KManifoldSGD(KClusterOptimizer):
@@ -104,21 +104,24 @@ class KManifoldSGD(KClusterOptimizer):
     nesterov (bool, optional): enables Nesterov momentum (default: False)
     soft_assign (float, optional): update segmentation using soft assignment.
       0=exact, 1=uniform assignment (default: 0)
+    c_sigma (float, optional): assignment noise level (default: .01)
   """
   def __init__(self, model, lr, lamb_U, lamb_V=None, momentum=0.0,
-        nesterov=False, soft_assign=0.0):
+        nesterov=False, soft_assign=0.0, c_sigma=.01):
 
     lamb_V = lamb_U if lamb_V is None else lamb_V
     min_lamb = np.min([lamb_U, lamb_V])
     if min_lamb < 0.0:
       raise ValueError("Invalid regularization lambda: {}".format(min_lamb))
+    if c_sigma <= 0.0:
+      raise ValueError("Invalid assignment noise level: {}".format(c_sigma))
 
     params = [{'name': 'C', 'params': [model.c]},
         {'name': 'V', 'params': [model.v]},
         {'name': 'U', 'params': model.group_models.parameters()}]
 
     super(KManifoldSGD, self).__init__(model, params, lr, lamb_U, momentum,
-        nesterov, soft_assign)
+        nesterov, soft_assign, c_sigma)
 
     self.lamb_U = lamb_U
     self.lamb_V = lamb_V
@@ -174,6 +177,7 @@ class KManifoldSGD(KClusterOptimizer):
 
         if V_step:
           # rescale gradients to compensate for c scaling on objective wrt V.
+          # NOTE: must have c_ij  > 0 all i, j for this to work.
           d_p.div_(self.model.c.data.unsqueeze(1))
 
         if momentum > 0:
@@ -223,11 +227,13 @@ class KSubspaceAltSGD(KClusterOptimizer):
       0=exact, 1=uniform assignment (default: 0)
     dist_mode (bool, optional): whether in mpi distributed mode
       (default: False).
-    size_scale (bool, optional): whether to scale wrt U obj to compensate for
-      group size imbalance (default: False).
+    size_scale (bool, optional): whether to scale gradients wrt U to compensate
+      for group size imbalance (default: False).
+    c_sigma (float, optional): assignment noise level (default: .01)
   """
   def __init__(self, model, lr, lamb_U, lamb_V=None, momentum=0.0,
-        nesterov=False, soft_assign=0.0, dist_mode=False, size_scale=False):
+        nesterov=False, soft_assign=0.0, dist_mode=False, size_scale=False,
+        c_sigma=.01):
 
     lamb_V = lamb_U if lamb_V is None else lamb_V
     min_lamb = np.min([lamb_U, lamb_V])
@@ -242,11 +248,15 @@ class KSubspaceAltSGD(KClusterOptimizer):
         {'name': 'U', 'params': model.group_models.parameters()}]
 
     super(KSubspaceAltSGD, self).__init__(model, params, lr, lamb_U, momentum,
-        nesterov, soft_assign)
+        nesterov, soft_assign, c_sigma)
 
     # disable grads for V
     for p in self.params_dict['V']['params']:
       p.requires_grad = False
+
+    # needed for scaling gradients.
+    self.params_dict['U']['par_names'] = [p[0] for p in
+        self.model.group_models.named_parameters()]
 
     self.lamb_U = lamb_U
     self.lamb_V = lamb_V
@@ -319,19 +329,30 @@ class KSubspaceAltSGD(KClusterOptimizer):
     lr = group['lr']
 
     if self.size_scale:
-      self.c_mean.mul_(EMA_DECAY)
-      self.c_mean.add_(1-EMA_DECAY, torch.mean(self.model.c.data, dim=0))
+      batch_c_mean = torch.mean(self.model.c.data, dim=0)
 
-    obj = self.objective(x, wrt='U', c_mean=self.c_mean)[0]
+    obj = self.objective(x, wrt='U')[0]
     self.zero_grad()
     obj.backward()
     if self.dist_mode:
-      _average_grads(group)
+      tensors = [p.grad.data for p in group['params']
+          if p.requires_grad and p.grad is not None]
+      if self.size_scale:
+        tensors.append(batch_c_mean)
+      _average_tensors(tensors)
 
-    for p in group['params']:
+    if self.size_scale:
+      self.c_mean.mul_(EMA_DECAY).add_(1-EMA_DECAY, batch_c_mean)
+
+    for p_name, p in zip(group['par_names'], group['params']):
       if p.grad is None:
         continue
       d_p = p.grad.data
+
+      if self.size_scale:
+        group_idx = int(p_name.split('.')[0])
+        d_p.div_(self.c_mean[group_idx]+EPS)
+
       if momentum > 0:
         param_state = self.state[p]
         if 'momentum_buffer' not in param_state:
@@ -345,10 +366,10 @@ class KSubspaceAltSGD(KClusterOptimizer):
       p.data.add_(-lr, d_p)
     return
 
-  def objective(self, x, wrt='all', c_mean=None):
+  def objective(self, x, wrt='all'):
     """encapsulate model objective function. A little inelegant..."""
     return self.model.objective(x, lamb_U=self.lamb_U,
-        lamb_V=self.lamb_V, wrt=wrt, c_mean=c_mean)
+        lamb_V=self.lamb_V, wrt=wrt)
 
 
 class KSubspaceAltProxSGD(KSubspaceAltSGD):
@@ -369,18 +390,17 @@ class KSubspaceAltProxSGD(KSubspaceAltSGD):
       0=exact, 1=uniform assignment (default: 0)
     dist_mode (bool, optional): whether in mpi distributed mode
       (default: False).
-    size_scale (bool, optional): whether to scale wrt U obj to compensate for
-      group size imbalance (default: False).
+    size_scale (bool, optional): whether to scale gradients wrt U to compensate
+      for group size imbalance (default: False).
+    c_sigma (float, optional): assignment noise level (default: .01)
   """
   def __init__(self, model, lr, lamb_U, lamb_V=None, momentum=0.0,
-        prox_U=None, soft_assign=0.0, dist_mode=False, size_scale=False):
+        prox_U=None, soft_assign=0.0, dist_mode=False, size_scale=False,
+        c_sigma=.01):
 
     super(KSubspaceAltProxSGD, self).__init__(model, lr, lamb_U, lamb_V,
         momentum=momentum, nesterov=True, soft_assign=soft_assign,
-        dist_mode=dist_mode, size_scale=size_scale)
-
-    self.params_dict['U']['par_names'] = [p[0] for p in
-        self.model.group_models.named_parameters()]
+        dist_mode=dist_mode, size_scale=size_scale, c_sigma=c_sigma)
 
     self.prox_U = prox_U
     self.prox_reg_U = prox_U is not None
@@ -392,32 +412,38 @@ class KSubspaceAltProxSGD(KSubspaceAltSGD):
     momentum = group['momentum']
     lr = group['lr']
 
-    if self.size_scale:
-      self.c_mean.mul_(EMA_DECAY)
-      self.c_mean.add_(1-EMA_DECAY, torch.mean(self.model.c.data, dim=0))
-      # only needed for computing prox reg U. computed separately in objective.
-      # NOTE: a little disorganized...
-      c_scale = self.model.c.data / self.c_mean.view(1, -1)
-    else:
-      c_scale = self.model.c.data
+    if self.size_scale or self.prox_reg_U:
+      batch_c_mean = torch.mean(self.model.c.data, dim=0)
 
-    obj = self.objective(x, wrt='U', c_mean=self.c_mean)[0]
+    obj = self.objective(x, wrt='U', prox_nonsmooth=self.prox_reg_U)[0]
     self.zero_grad()
     obj.backward()
     if self.dist_mode:
-      _average_grads(group)
+      tensors = [p.grad.data for p in group['params']
+          if p.requires_grad and p.grad is not None]
+      if self.size_scale:
+        tensors.append(batch_c_mean)
+      _average_tensors(tensors)
+
+    if self.size_scale:
+      self.c_mean.mul_(EMA_DECAY).add_(1-EMA_DECAY, batch_c_mean)
 
     for p_name, p in zip(group['par_names'], group['params']):
+      group_idx = int(p_name.split('.')[0])
+
       if p.grad is None:
         continue
       d_p = p.grad.data
+      if self.size_scale:
+        d_p.div_(self.c_mean[group_idx]+EPS)
+
+      x = p.data.add(-lr, d_p)
 
       # proximal updates (only on subspace basis variables)
-      x = p.data.add(-lr, d_p)
       # assume params are named e.g. 0.U, 0.b
       if self.prox_reg_U and 'U' in p_name:
-        group_idx = int(p_name.split('.')[0])
-        prox_lamb = lr*self.lamb_U*torch.mean(c_scale[:, group_idx])
+        prox_lamb = (lr * self.lamb_U *
+            batch_c_mean[group_idx] / (self.c_mean[group_idx]+EPS))
         x = self.prox_U(x, prox_lamb)
 
       # acceleration
@@ -434,10 +460,10 @@ class KSubspaceAltProxSGD(KSubspaceAltSGD):
         buf.set_(x)
     return
 
-  def objective(self, x, wrt='all', c_mean=None):
+  def objective(self, x, wrt='all', prox_nonsmooth=False):
     """encapsulate model objective function. A little inelegant..."""
     return self.model.objective(x, lamb_U=self.lamb_U, lamb_V=self.lamb_V,
-        wrt=wrt, c_mean=c_mean, prox_reg_U=self.prox_reg_U)
+        wrt=wrt, prox_nonsmooth=prox_nonsmooth)
 
 
 class KManifoldAESGD(KClusterOptimizer):
@@ -455,11 +481,12 @@ class KManifoldAESGD(KClusterOptimizer):
       0=exact, 1=uniform assignment (default: 0)
     dist_mode (bool, optional): whether in mpi distributed mode
       (default: False).
-    size_scale (bool, optional): whether to scale wrt U_V obj to compensate for
-      group size imbalance (default: False).
+    size_scale (bool, optional): whether to scale gradients wrt U_V to
+      compensate for group size imbalance (default: False).
+    c_sigma (float, optional): assignment noise level (default: .01)
   """
   def __init__(self, model, lr, lamb, momentum=0.0, nesterov=False,
-        soft_assign=0.0, dist_mode=False, size_scale=False):
+        soft_assign=0.0, dist_mode=False, size_scale=False, c_sigma=.01):
 
     if dist_mode and not dist.is_initialized():
       raise RuntimeError("Distributed package not initialized")
@@ -467,7 +494,11 @@ class KManifoldAESGD(KClusterOptimizer):
     params = [{'name': 'C', 'params': [model.c]},
         {'name': 'U_V', 'params': model.group_models.parameters()}]
     super(KManifoldAESGD, self).__init__(model, params, lr, lamb, momentum,
-        nesterov, soft_assign)
+        nesterov, soft_assign, c_sigma)
+
+    # needed for scaling gradients.
+    self.params_dict['U_V']['par_names'] = [p[0] for p in
+        self.model.group_models.named_parameters()]
 
     self.size_scale = size_scale
     self.c_mean = torch.mean(model.c.data, dim=0) if size_scale else None
@@ -509,19 +540,29 @@ class KManifoldAESGD(KClusterOptimizer):
     lr = group['lr']
 
     if self.size_scale:
-      self.c_mean.mul_(EMA_DECAY)
-      self.c_mean.add_(1-EMA_DECAY, torch.mean(self.model.c.data, dim=0))
+      batch_c_mean = torch.mean(self.model.c.data, dim=0)
 
-    obj = self.objective(x, wrt='U_V', c_mean=self.c_mean)[0]
+    obj = self.objective(x, wrt='U_V')[0]
     self.zero_grad()
     obj.backward()
     if self.dist_mode:
-      _average_grads(group)
+      tensors = [p.grad.data for p in group['params']
+          if p.requires_grad and p.grad is not None]
+      if self.size_scale:
+        tensors.append(batch_c_mean)
+      _average_tensors(tensors)
 
-    for p in group['params']:
+    if self.size_scale:
+      self.c_mean.mul_(EMA_DECAY).add_(1-EMA_DECAY, batch_c_mean)
+
+    for p_name, p in zip(group['par_names'], group['params']):
       if p.grad is None:
         continue
       d_p = p.grad.data
+
+      if self.size_scale:
+        group_idx = int(p_name.split('.')[0])
+        d_p.div_(self.c_mean[group_idx]+EPS)
 
       if momentum > 0:
         param_state = self.state[p]
@@ -570,19 +611,16 @@ def find_soft_assign(losses, T=1.):
   return c
 
 
-def _average_grads(group):
-  """All reduce U gradients across processes.
+def _average_tensors(tensors):
+  """All reduce list of tensors across processes.
 
   Follows: pytorch DistributedDataParallelCPU.
   """
-  params = [p for p in group['params'] if p.requires_grad and
-      p.grad is not None]
-  grads = [p.grad.data for p in params]
-  coalesced = _flatten_dense_tensors(grads)
+  coalesced = _flatten_dense_tensors(tensors)
   dist.all_reduce(coalesced, op=dist.reduce_op.SUM)
   coalesced /= dist.get_world_size()
-  sync_grads = _unflatten_dense_tensors(coalesced, grads)
-  for buf, synced in zip(grads, sync_grads):
+  sync_tensors = _unflatten_dense_tensors(coalesced, tensors)
+  for buf, synced in zip(tensors, sync_tensors):
     buf.copy_(synced)
   return
 
@@ -596,16 +634,3 @@ def _sync_params(group):
   for p in group['params']:
     dist.broadcast(p.data, 0)
   return
-
-
-def prox_fro_sqr(X, lamb):
-  """Evaluate proximal operator of g(X) = lambda ||X||_F^2."""
-  return (1./(1.+2.*lamb))*X
-
-
-def prox_grp_sprs(X, lamb):
-  """Evaluate proximal operator of g(X) = lambda ||X||_{2 1}."""
-  Xnorm = torch.norm(X, p=2, dim=0)
-  m, n = X.shape
-  coeff = F.relu(torch.ones(1, n) - lamb/(Xnorm + 1e-8))
-  return coeff*X

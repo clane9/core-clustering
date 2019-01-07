@@ -19,6 +19,7 @@ import datasets as dat
 import models as mod
 import optimizers as opt
 import training as tr
+import utils as ut
 
 CHKP_FREQ = 50
 STOP_FREQ = 10
@@ -73,8 +74,8 @@ def main():
         size_scale=args.size_scale)
   else:
     if args.prox_reg_U:
-      prox_U = (opt.prox_grp_sprs if args.reg_U == 'grp_sprs'
-          else opt.prox_fro_sqr)
+      prox_U = (ut.prox_grp_sprs if args.reg_U == 'grp_sprs'
+          else ut.prox_fro_sqr)
       optimizer = opt.KSubspaceAltProxSGD(model, lr=args.init_lr,
           lamb_U=args.lamb_U, lamb_V=args.lamb_V, momentum=args.momentum,
           prox_U=prox_U, soft_assign=args.soft_assign,
@@ -86,7 +87,8 @@ def main():
           dist_mode=args.dist, size_scale=args.size_scale)
 
   tr.train_loop(model, synth_data_loader, device, optimizer,
-      args.out_dir, args.epochs, CHKP_FREQ, STOP_FREQ, args.dist)
+      args.out_dir, args.epochs, CHKP_FREQ, STOP_FREQ, args.dist,
+      eval_rank=True)
   return
 
 
