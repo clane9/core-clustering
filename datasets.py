@@ -3,6 +3,7 @@ from __future__ import print_function
 
 import math
 import numpy as np
+from scipy.io import loadmat
 import torch
 from torch.utils.data import Dataset, Sampler
 from torchvision.datasets import MNIST
@@ -255,6 +256,31 @@ class MNISTUoM(MNIST):
     """
     img, target = super(MNISTUoM, self).__getitem__(index)
     return self.Idx[index], img, target
+
+
+class MNISTScatPCAUoS(Dataset):
+  """MNIST after scattering transform feature extraction and PCA to D=500.
+
+  Following (You et al., CVPR 2016)."""
+  def __init__(self, matfile='MNIST_SC_pca.mat'):
+    mnist_sc_pca = loadmat(matfile)
+
+    self.X = torch.tensor(mnist_sc_pca['X'].T, dtype=torch.float32)
+    self.groups = torch.tensor(mnist_sc_pca['MNIST_LABEL'], dtype=torch.int64).view(-1)
+    self.classes = np.arange(10)
+    self.n = 10
+
+    # normalize data points (rows) of X
+    self.X.div_(torch.norm(self.X, p=2, dim=1).view(-1, 1).add(1e-8))
+    self.N, self.D = self.X.shape
+    self.Idx = torch.arange(self.N, dtype=torch.int64)
+    return
+
+  def __len__(self):
+    return self.N
+
+  def __getitem__(self, ii):
+    return self.Idx[ii], self.X[ii, :], self.groups[ii]
 
 
 # taken from pytorch 1.0.0 so that data sampling order consistent regardless

@@ -61,7 +61,7 @@ def train_loop(model, data_loader, device, optimizer, out_dir,
 
   min_lr = 1e-6*ut.get_learning_rate(optimizer)
   scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer,
-      factor=0.5, patience=10, threshold=1e-4, min_lr=min_lr)
+      factor=0.5, patience=10, threshold=1e-3, min_lr=min_lr)
 
   # training loop
   lr = float('inf')
