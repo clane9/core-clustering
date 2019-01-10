@@ -23,7 +23,7 @@ import training as tr
 import utils as ut
 
 CHKP_FREQ = 50
-STOP_FREQ = -1
+STOP_FREQ = 5
 
 
 def main():
@@ -39,10 +39,7 @@ def main():
   np.random.seed(args.seed)
 
   # load dataset
-  if args.dataset == 'mnist_sc_pca':
-    dataset = dat.MNISTScatPCAUoS(matfile='datasets/MNIST_SC_pca.mat')
-  else:
-    raise ValueError("Invalid dataset {}".format(args.dataset))
+  dataset = dat.YouCVPR16ImageUoS(args.dataset)
   kwargs = {'num_workers': args.num_workers}
   if use_cuda:
     kwargs['pin_memory'] = True
@@ -100,7 +97,7 @@ if __name__ == '__main__':
                       help='Output directory.')
   parser.add_argument('--dataset', type=str, default='mnist_sc_pca',
                       help='Real dataset [default: mnist_sc_pca].',
-                      choices=['mnist_sc_pca'])
+                      choices=['mnist_sc_pca', 'coil100'])
   # model settings
   parser.add_argument('--affine', action='store_true',
                       help='Affine setting')

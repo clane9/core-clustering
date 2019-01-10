@@ -581,6 +581,78 @@ class KManifoldAESGD(KClusterOptimizer):
     return
 
 
+class KManifoldAEMetaOptimizer(KClusterOptimizer):
+  """Meta optimizer for k-manifold AE formulations. Step alternates between
+  (1) closed form update to (soft) assignment C, (2) SGD type step on manifold
+  auto-encoders.
+
+  Args:
+    model (KManifoldAEClusterModel instance): model to optimize.
+    Optimizer (Optimizer class): optimizer to use for manifold SGD updates.
+    lr (float): learning rate
+    lamb (float): regularization parameter
+    soft_assign (float, optional): update segmentation using soft assignment.
+      0=exact, inf=uniform assignment (default: 0)
+    c_sigma (float, optional): assignment noise level (default: .01)
+    dist_mode (bool, optional): whether in mpi distributed mode
+      (default: False).
+    opt_kwargs (dict, optional): kwargs for Optimizer
+  """
+  def __init__(self, model, Optimizer, lr, lamb, soft_assign=0.0, c_sigma=.01,
+        dist_mode=False, opt_kwargs={}):
+
+    if not issubclass(Optimizer, optim.Optimizer):
+      raise ValueError("Optimizer must be sub-class of torch.optim.Optimizer.")
+
+    params = [{'name': 'C', 'params': [model.c]},
+        {'name': 'U_V', 'params': model.group_models.parameters()}]
+    super(KManifoldAEMetaOptimizer, self).__init__(model, params, lr, lamb,
+        momentum=0.0, nesterov=False, soft_assign=soft_assign, c_sigma=c_sigma)
+
+    self.U_V_optimizer = Optimizer([self.params_dict['U_V']], **opt_kwargs)
+
+    self.dist_mode = dist_mode
+    if dist_mode:
+      if dist.get_rank() == 0:
+        print("Distributed mode with world={}, syncing parameters.".format(
+            dist.get_world_size()))
+      _sync_params(self.params_dict['U_V'])
+    return
+
+  def __setstate__(self, state):
+    # shouldn't need to do anything specific for U_V_optimizer since it just
+    # refers to the 'U_V' param_group.
+    super(KManifoldAEMetaOptimizer, self).__setstate__(state)
+    return
+
+  def step(self, _, x):
+    """Performs a single optimization step with alternating C, U_V updates.
+
+    Args:
+      ii (LongTensor): indices for current minibatch (not used since c updated
+        first in closed form)
+      x (FloatTensor): current minibatch data
+    """
+    # C and U_V steps
+    self._step_C(x)
+    obj, loss, reg, x_ = self.objective(x, wrt='all')
+    self.zero_grad()
+    obj.backward()
+    if self.dist_mode:
+      tensors = [p.grad.data for p in self.params_dict['U_V']['params']
+          if p.requires_grad and p.grad is not None]
+      _average_tensors(tensors)
+    self.U_V_optimizer.step()
+
+    # included for consistency
+    Ureg = reg
+    Vreg = 0.0
+
+    sprs = self.model.eval_sprs()
+    norm_x_ = self.model.eval_shrink(x, x_)
+    return obj, loss, reg, Ureg, Vreg, sprs, norm_x_
+
+
 def find_soft_assign(losses, T=1.):
   """soft assignment found by shifting up negative losses by T, thresholding
   and normalizing.

@@ -1,6 +1,7 @@
 from __future__ import division
 from __future__ import print_function
 
+import os
 import math
 import numpy as np
 from scipy.io import loadmat
@@ -10,6 +11,8 @@ from torchvision.datasets import MNIST
 import torch.distributed as dist
 
 import models as mod
+
+CODE_DIR = os.path.dirname(os.path.realpath(__file__))
 
 
 class SynthUoSDataset(Dataset):
@@ -258,17 +261,25 @@ class MNISTUoM(MNIST):
     return self.Idx[index], img, target
 
 
-class MNISTScatPCAUoS(Dataset):
-  """MNIST after scattering transform feature extraction and PCA to D=500.
+class YouCVPR16ImageUoS(Dataset):
+  """Image datasets from (You et al., CVPR 2016)."""
+  def __init__(self, dataset='mnist_sc_pca'):
+    if dataset == 'mnist_sc_pca':
+      matfile = '{}/datasets/MNIST_SC_pca.mat'.format(CODE_DIR)
+      data = loadmat(matfile)
+      self.X = torch.tensor(data['MNIST_SC_DATA'].T, dtype=torch.float32)
+      self.groups = torch.tensor(data['MNIST_LABEL'].reshape(-1),
+          dtype=torch.int64)
+    elif dataset == 'coil100':
+      matfile = '{}/datasets/COIL100.mat'.format(CODE_DIR)
+      data = loadmat(matfile)
+      self.X = torch.tensor(data['fea'], dtype=torch.float32)
+      self.groups = torch.tensor(data['gnd'].reshape(-1), dtype=torch.int64)
+    else:
+      raise ValueError("Invalid dataset {}".format(dataset))
 
-  Following (You et al., CVPR 2016)."""
-  def __init__(self, matfile='MNIST_SC_pca.mat'):
-    mnist_sc_pca = loadmat(matfile)
-
-    self.X = torch.tensor(mnist_sc_pca['X'].T, dtype=torch.float32)
-    self.groups = torch.tensor(mnist_sc_pca['MNIST_LABEL'], dtype=torch.int64).view(-1)
-    self.classes = np.arange(10)
-    self.n = 10
+    self.classes = torch.unique(self.groups, sorted=True).numpy()
+    self.n = self.classes.shape[0]
 
     # normalize data points (rows) of X
     self.X.div_(torch.norm(self.X, p=2, dim=1).view(-1, 1).add(1e-8))
