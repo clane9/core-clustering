@@ -78,9 +78,9 @@ def train_loop(model, data_loader, device, optimizer, out_dir,
 
       if eval_rank:
         ranks, epoch_svs = zip(*[gm.rank() for gm in model.group_models])
-        svs[epoch-1, :] = torch.stack(epoch_svs).numpy()
+        svs[epoch-1, :] = torch.stack(epoch_svs).cpu().numpy()
 
-        ranks = torch.stack(ranks).numpy()
+        ranks = torch.stack(ranks).cpu().numpy()
         rank_stats = np.median(ranks), ranks.min(), ranks.max()
         metrics = metrics[:6] + rank_stats + metrics[6:]
 
