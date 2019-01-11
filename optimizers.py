@@ -104,10 +104,12 @@ class KManifoldSGD(KClusterOptimizer):
     nesterov (bool, optional): enables Nesterov momentum (default: False)
     soft_assign (float, optional): update segmentation using soft assignment.
       0=exact, 1=uniform assignment (default: 0)
+    size_scale (bool, optional): whether to scale gradients wrt U to compensate
+      for group size imbalance (default: False).
     c_sigma (float, optional): assignment noise level (default: .01)
   """
   def __init__(self, model, lr, lamb_U, lamb_V=None, momentum=0.0,
-        nesterov=False, soft_assign=0.0, c_sigma=.01):
+        nesterov=False, soft_assign=0.0, size_scale=False, c_sigma=.01):
 
     lamb_V = lamb_U if lamb_V is None else lamb_V
     min_lamb = np.min([lamb_U, lamb_V])
@@ -122,6 +124,13 @@ class KManifoldSGD(KClusterOptimizer):
 
     super(KManifoldSGD, self).__init__(model, params, lr, lamb_U, momentum,
         nesterov, soft_assign, c_sigma)
+
+    # needed for scaling gradients.
+    self.params_dict['U']['par_names'] = [p[0] for p in
+        self.model.group_models.named_parameters()]
+
+    self.size_scale = size_scale
+    self.c_mean = torch.mean(model.c.data, dim=0) if size_scale else None
 
     self.lamb_U = lamb_U
     self.lamb_V = lamb_V
@@ -163,6 +172,10 @@ class KManifoldSGD(KClusterOptimizer):
       v_buf = v_state['momentum_buffer'][ii, :, :].to(v.data.device,
           non_blocking=True)
 
+    if self.size_scale:
+      batch_c_mean = torch.mean(self.model.c.data, dim=0)
+      self.c_mean.mul_(EMA_DECAY).add_(1-EMA_DECAY, batch_c_mean)
+
     for group_name in ['U', 'V']:
       group = self.params_dict[group_name]
       momentum = group['momentum']
@@ -170,15 +183,20 @@ class KManifoldSGD(KClusterOptimizer):
       lr = group['lr']
       V_step = group_name == 'V'
 
-      for p in group['params']:
+      for pidx, p in enumerate(group['params']):
         if p.grad is None:
           continue
         d_p = p.grad.data
 
-        if V_step:
-          # rescale gradients to compensate for c scaling on objective wrt V.
-          # NOTE: must have c_ij  > 0 all i, j for this to work.
-          d_p.div_(self.model.c.data.unsqueeze(1))
+        if self.size_scale:
+          if V_step:
+            # rescale gradients to compensate for c scaling on objective wrt V.
+            # NOTE: must have c_ij  > 0 all i, j for this to work.
+            d_p.div_(self.model.c.data.unsqueeze(1))
+          else:
+            p_name = self.params_dict['U']['par_names'][pidx]
+            group_idx = int(p_name.split('.')[0])
+            d_p.div_(self.c_mean[group_idx]+EPS)
 
         if momentum > 0:
           param_state = self.state[p]

@@ -129,8 +129,9 @@ def train_loop(model, data_loader, device, optimizer, out_dir,
     if is_logging:
       with open('{}/conf_mats.npz'.format(out_dir), 'wb') as f:
         np.savez(f, conf_mats=conf_mats[:epoch, :])
-      with open('{}/svs.npz'.format(out_dir), 'wb') as f:
-        np.savez(f, svs=svs[:epoch, :])
+      if eval_rank:
+        with open('{}/svs.npz'.format(out_dir), 'wb') as f:
+          np.savez(f, svs=svs[:epoch, :])
   return
 
 

@@ -206,7 +206,7 @@ class MNISTUoM(MNIST):
         original digit labels are kept.
     """
   def __init__(self, root, train=True, transform=None, target_transform=None,
-        download=False, classes=None, batch_size=100):
+        download=False, classes=None):
     super(MNISTUoM, self).__init__(root, train, transform, target_transform,
         download)
 
@@ -224,21 +224,7 @@ class MNISTUoM(MNIST):
             self.test_data, self.test_labels, self.classes)
     else:
       self.classes = np.arange(10)
-
-    # make sure batch_size divides N
-    N = len(self)
-    if batch_size <= 0 or batch_size > N:
-      batch_size = N
-    self.batch_size = batch_size
-    N = (N // batch_size)*batch_size
-    # NOTE: separately named train_* and test_* is annoying, and fixed in more
-    # recent torchvision
-    if self.train:
-      self.train_data = self.train_data[:N, :]
-      self.train_labels = self.train_labels[:N]
-    else:
-      self.test_data = self.test_data[:N, :]
-      self.test_labels = self.test_labels[:N]
+    self.n = self.classes.size
 
     self.Idx = torch.arange(len(self))
     return

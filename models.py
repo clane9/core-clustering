@@ -1,8 +1,9 @@
 from __future__ import print_function
 from __future__ import division
 
-import numpy as np
+from collections import OrderedDict
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -252,7 +253,8 @@ class KManifoldAEClusterModel(KClusterModel):
       reg = torch.mean(torch.sum(self.c*reg, dim=1))
     # for wrt C, use 1 x k vector of U reg values for closed form assignment.
 
-    obj = loss + lamb*reg
+    reg = lamb*reg
+    obj = loss + reg
     return obj, loss, reg, x_
 
 
@@ -531,3 +533,46 @@ class ResidualManifoldAEModel(nn.Module):
 
   def rank(self, tol=RANK_TOL):
     raise NotImplementedError("rank not implemented for residual AE model")
+
+
+class MNISTMlpAEModel(nn.Module):
+  D = 784
+
+  def __init__(self, d, filters, drop_p=0.0):
+    super(MNISTMlpAEModel, self).__init__()
+    self.d = d
+    self.filters = filters
+    self.drop_p = drop_p
+
+    self.encoder = nn.Sequential(OrderedDict([
+        ('fc1', nn.Linear(self.D, filters, bias=True)),
+        ('drop1', nn.Dropout(drop_p)),
+        ('relu1', nn.ReLU()),
+        ('fc2', nn.Linear(filters, filters, bias=True)),
+        ('drop2', nn.Dropout(drop_p)),
+        ('relu2', nn.ReLU()),
+        ('fc3', nn.Linear(filters, d, bias=False))]))
+
+    self.decoder = nn.Sequential(OrderedDict([
+        ('fc1', nn.Linear(d, filters, bias=True)),
+        ('drop1', nn.Dropout(drop_p)),
+        ('relu1', nn.ReLU()),
+        ('fc2', nn.Linear(filters, filters, bias=True)),
+        ('drop2', nn.Dropout(drop_p)),
+        ('relu2', nn.ReLU()),
+        ('fc3', nn.Linear(filters, self.D, bias=True))]))
+    return
+
+  def forward(self, x):
+    """Compute subspace embedding from data x."""
+    v = self.encoder(x.view(-1, self.D))
+    x_ = self.decoder(v).view(*x.shape)
+    return x_
+
+  def reg(self, prox_nonsmooth=False):
+    reg = sum((layer.weight.pow(2).sum()
+        for name, layer in self.named_modules() if 'fc' in name))
+    return reg
+
+  def rank(self, tol=RANK_TOL):
+    return ut.rank(self.encoder.fc3.data, tol)
