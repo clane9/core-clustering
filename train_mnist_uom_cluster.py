@@ -11,6 +11,7 @@ import pickle
 
 import numpy as np
 import torch
+from torch import optim
 from torchvision import transforms
 
 import datasets as dat
@@ -19,7 +20,7 @@ import optimizers as opt
 import training as tr
 
 CHKP_FREQ = 50
-STOP_FREQ = 10
+STOP_FREQ = -1 
 
 
 def main():
@@ -73,10 +74,10 @@ def main():
         nesterov=args.nesterov, soft_assign=args.soft_assign,
         size_scale=args.size_scale)
   else:
-    optimizer = opt.KManifoldAESGD(model, lr=args.init_lr,
-        lamb=args.lamb_U, momentum=args.momentum, nesterov=args.nesterov,
+    optimizer = opt.KManifoldAEMetaOptimizer(model, optim.Adam,
+        lr=args.init_lr, lamb=args.lamb_U,
         soft_assign=args.soft_assign, dist_mode=False,
-        size_scale=args.size_scale)
+        opt_kwargs={'betas': (0.9, 0.9)}) 
 
   tr.train_loop(model, mnist_data_loader, device, optimizer,
       args.out_dir, args.epochs, CHKP_FREQ, STOP_FREQ, eval_rank=False)
