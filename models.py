@@ -538,11 +538,16 @@ class ResidualManifoldAEModel(nn.Module):
 class MNISTMlpAEModel(nn.Module):
   D = 784
 
-  def __init__(self, d, filters, drop_p=0.0):
+  def __init__(self, d, filters, drop_p=0.0, sigma=0.1, reg='fro_sqr'):
+    if reg not in ['fro_sqr', 'fro_prod']:
+      raise ValueError("Invalid reg {}".format(reg))
+
     super(MNISTMlpAEModel, self).__init__()
     self.d = d
     self.filters = filters
     self.drop_p = drop_p
+    self.sigma = sigma
+    self.reg = reg
 
     self.encoder = nn.Sequential(OrderedDict([
         ('fc1', nn.Linear(self.D, filters, bias=True)),
@@ -554,6 +559,7 @@ class MNISTMlpAEModel(nn.Module):
         ('fc3', nn.Linear(filters, d, bias=False))]))
 
     self.decoder = nn.Sequential(OrderedDict([
+        ('noise1', NoiseInject(sigma=self.sigma)),
         ('fc1', nn.Linear(d, filters, bias=True)),
         ('drop1', nn.Dropout(drop_p)),
         ('relu1', nn.ReLU()),
@@ -570,9 +576,40 @@ class MNISTMlpAEModel(nn.Module):
     return x_
 
   def reg(self, prox_nonsmooth=False):
-    reg = sum((layer.weight.pow(2).sum()
-        for name, layer in self.named_modules() if 'fc' in name))
+    if self.reg == 'fro_sqr':
+      reg = sum((layer.weight.pow(2).sum()
+          for name, layer in self.named_modules() if 'fc' in name))
+    else:
+      reg = torch.prod(torch.stack([torch.norm(layer.weight)
+          for name, layer in self.named_modules() if 'fc' in name]))
     return reg
 
   def rank(self, tol=RANK_TOL):
     return ut.rank(self.encoder.fc3.data, tol)
+
+
+class NoiseInject(nn.Module):
+  def __init__(self, sigma=0.05):
+    super(NoiseInject, self).__init__()
+    if sigma < 0:
+      raise ValueError("Invalid noise sigma {}".format(sigma))
+    self.sigma = sigma
+    self.z = None
+    self.sqrtD = None
+    self.ndim = None
+    return
+
+  def forward(self, x):
+    if not self.training or self.sigma == 0:
+      return x
+    if self.z is None or self.z.shape != x.data.shape:
+      self.z = torch.zeros_like(x.data)
+      self.sqrtD = np.sqrt(np.prod(x.data.shape[1:]))
+      self.ndim = x.data.dim()
+    self.z.normal_()
+    xnorm = x.data.pow(2).sum(dim=tuple(range(1,self.ndim)),
+        keepdim=True).sqrt()
+    sigma = xnorm.mul(self.sigma/self.sqrtD)
+    self.z.mul_(sigma)
+    x = x.add(self.z)
+    return x
