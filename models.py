@@ -547,7 +547,7 @@ class MNISTMlpAEModel(nn.Module):
     self.filters = filters
     self.drop_p = drop_p
     self.sigma = sigma
-    self.reg = reg
+    self.reg_mode = reg
 
     self.encoder = nn.Sequential(OrderedDict([
         ('fc1', nn.Linear(self.D, filters, bias=True)),
@@ -576,7 +576,7 @@ class MNISTMlpAEModel(nn.Module):
     return x_
 
   def reg(self, prox_nonsmooth=False):
-    if self.reg == 'fro_sqr':
+    if self.reg_mode == 'fro_sqr':
       reg = sum((layer.weight.pow(2).sum()
           for name, layer in self.named_modules() if 'fc' in name))
     else:

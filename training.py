@@ -58,12 +58,15 @@ def train_loop(model, data_loader, device, optimizer, out_dir,
       dtype=np.int64)
   if eval_rank:
     svs = np.zeros((epochs, model.k, model.d), dtype=np.float32)
+  else:
+    svs = None
 
   min_lr = 1e-6*ut.get_learning_rate(optimizer)
   scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer,
       factor=0.5, patience=10, threshold=1e-3, min_lr=min_lr)
 
   # training loop
+  err = None
   lr = float('inf')
   model.train()
   try:
@@ -116,7 +119,8 @@ def train_loop(model, data_loader, device, optimizer, out_dir,
         if err_count > 0:
           raise RuntimeError("dist error")
 
-  except Exception as err:
+  except Exception as e:
+    err = e
     if str(err) != "dist error":
       print('{}: {}'.format(type(err), err))
       with open("{}/error".format(out_dir), "a") as f:
@@ -132,7 +136,10 @@ def train_loop(model, data_loader, device, optimizer, out_dir,
       if eval_rank:
         with open('{}/svs.npz'.format(out_dir), 'wb') as f:
           np.savez(f, svs=svs[:epoch, :])
-  return
+    if err is not None:
+      raise err
+
+  return conf_mats, svs
 
 
 def train_epoch(model, data_loader, optimizer, device, dist_mode=False):
