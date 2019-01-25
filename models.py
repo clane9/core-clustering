@@ -6,57 +6,235 @@ from collections import OrderedDict
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 import utils as ut
 
-RANK_TOL = .001
 
+class KManifoldAEClusterModel(nn.Module):
+  """Model of union of low-dimensional manifolds generalizing
+  k-means/k-subspaces. Coefficients computed using auto-encoder."""
 
-class KClusterModel(nn.Module):
-  """Base class for k-cluster model."""
+  def __init__(self, k, d, D, affine=False, symmetric=False, loss='l2_sqr',
+        trunks=None, soft_assign=0.1, c_sigma=.01, ema_decay=0.9):
+    if loss not in ('l2_sqr', 'l1'):
+      raise ValueError("Invalid loss mode {}.".format(loss))
+    if len(trunks) != 2 or not (isinstance(trunks[0], nn.Module) and
+          isinstance(trunks[1], nn.Module)):
+      raise ValueError("Invalid trunk encoder/decoder pair.")
+    if soft_assign < 0:
+      raise ValueError("Invalid soft-assign parameter {}".format(soft_assign))
+    if c_sigma < 0:
+      raise ValueError("Invalid assign noise parameter {}".format(c_sigma))
 
-  def __init__(self, k, d, N, batch_size, group_models):
-    super(KClusterModel, self).__init__()
-
+    super(KManifoldAEClusterModel, self).__init__()
     self.k = k  # number of groups
     self.d = d  # dimension of manifold
-    self.N = N  # number of data points
-    self.batch_size = batch_size
+    self.D = D  # number of data points
+    self.affine = affine
+    self.symmetric = symmetric
+    self.loss_mode = loss
+    self.soft_assign = soft_assign
+    self.c_sigma = c_sigma
+    self.ema_decay = ema_decay
 
-    # quick check to make sure group models constructed correctly
-    group_model_check = (len(group_models) == k and
-        isinstance(group_models[0], nn.Module) and
-        hasattr(group_models[0], 'd') and
-        group_models[0].d == d)
-    if not group_model_check:
-      raise ValueError("Invalid sequence of group_models")
-    self.group_models = nn.ModuleList(group_models)
+    # group assignment, ultimate shape (batch_size, k)
+    self.c = None
+    self.groups = None
+    # low-dimensional coefficients, ultimate shape (batch_size, k, d)
+    self.z = None
+    # mean and cov for latent low-dim coeffs.
+    self.register_buffer('running_z_mean', torch.zeros(k, d))
+    self.register_buffer('running_z_cov', torch.eye(d, d).repeat(k, 1, 1))
+    # chol factorization of covariance matrices
+    self.register_buffer('z_cov_sqrt', torch.eye(d, d).repeat(k, 1, 1))
 
-    # NOTE: might not need to have fixed batch size in this case
-    self.c = nn.Parameter(torch.Tensor(batch_size, k))
+    # (trunk_encoder, trunk_decoder)
+    self.trunks = nn.ModuleList(trunks) if trunks is not None else None
+    self.Us = nn.Parameter(torch.Tensor(k, D, d))
+    if self.symmetric:
+      self.register_parameter('Vs', None)
+    else:
+      self.Vs = nn.Parameter(torch.Tensor(k, d, D))
+    if affine:
+      self.bs = nn.Parameter(torch.Tensor(k, D))
+    else:
+      self.register_parameter('bs', None)
+    self.reset_parameters()
     return
 
   def reset_parameters(self):
-    """Initialize C with entries from normal distribution centered on 1,
-    sigma=0.01.
-
-    NOTE: Very uniform initialization. But initialization of c doesn't matter
-    since c updated first in closed form anyway."""
-    self.c.data.normal_(1., 0.01).abs_()
-    self.c.data.div_(self.c.data.sum(dim=1, keepdim=True))
+    """Initialize Us, Vs, bs with entries drawn from normal with std
+    0.1/sqrt(D)."""
+    std = .1 / np.sqrt(self.D)
+    self.Us.data.normal_(0., std)
+    if not self.symmetric:
+      self.Vs.data.normal_(0., std)
+    if self.affine:
+      self.bs.data.normal_(0., std)
     return
 
-  def forward(self, *args, **kwargs):
-    raise NotImplementedError("forward not implemented")
+  def forward(self, x):
+    """Compute AE embedding.
 
-  def objective(self, *args, **kwargs):
-    raise NotImplementedError("objective not implemented")
+    Input:
+      x: shape (batch_size, D) if trunks is None, or (batch_size, ...)
 
-  def gm_reg(self, prox_nonsmooth=False):
-    """Compute regularization wrt all group models."""
-    return torch.stack([gm.reg(prox_nonsmooth)
-        for gm in self.group_models], dim=0)
+    Returns:
+      x_: shape (k, batch_size, D) if trunks is None, or (k, batch_size, ...)
+    """
+    z = self.encode(x)
+    self.z = z.data
+    x_ = self.decode(z)
+    return x_
+
+  def encode(self, x):
+    """Project x into each of k low-dimensional spaces.
+
+    Input:
+      x: shape (batch_size, D) if trunks is None, or (batch_size, ...)
+
+    Returns:
+      z: latent low-dimensional codes (k, batch_size, d, 1)
+    """
+    if self.trunks is not None:
+      x = self.trunks[0](x)
+    assert(x.dim() == 2 and x.size(1) == self.D)
+
+    # z = U^T (x - b) or z = V (x - b)
+    if self.affine:
+      # shape (k, batch_size, D)
+      x = x.sub(self.bs.unsqueeze(1))
+    else:
+      # shape (1, batch_size, D)
+      x = x.unsqueeze(0)
+    if self.symmetric:
+      # shape (k, batch_size, d, 1)
+      z = torch.matmul(self.Us.transpose(1, 2).unsqueeze(1), x.unsqueeze(3))
+    else:
+      z = torch.matmul(self.Vs.unsqueeze(1), x.unsqueeze(3))
+    # shape (k, batch_size, d)
+    z = z.squeeze()
+    return z
+
+  def decode(self, z):
+    """Embed low-dim code z into ambient space.
+
+    Input:
+      z: shape (k, batch_size, d)
+
+    Returns:
+      x_: shape (k, batch_size, D) if trunks is None, or (k, batch_size, ...)
+    """
+    assert(z.dim() == 3 and z.size(0) == self.k and z.size(2) == self.d)
+    # x_ = U z + b
+    # shape (k, batch_size, D)
+    x_ = torch.matmul(self.Us.unsqueeze(1), z.unsqueeze(3)).squeeze()
+    if self.affine:
+      x_ = x_.add(self.bs.unsqueeze(1))
+    if self.trunks is not None:
+      x_ = self.trunks[1](x_.view(-1, self.D))
+      # shape (k, batch_size, ...)
+      x_ = x_.view((self.k, -1) + x_.shape[1:])
+    return x_
+
+  def objective(self, x, lamb=.01):
+    """Evaluate objective function."""
+    x_ = self(x)
+    loss = self.loss(x, x_)
+    reg = self.reg() if lamb > 0 else 0.0
+    assign_obj = loss + lamb*reg
+    self.set_assign(assign_obj)
+
+    loss = torch.mean(torch.sum(self.c*loss, dim=1))
+    if lamb > 0:
+      reg = torch.mean(torch.sum(self.c*reg, dim=1))
+    else:
+      reg = torch.zeros_like(loss)
+
+    reg = lamb*reg
+    obj = loss + reg
+    return obj, loss, reg, x_
+
+  def loss(self, x, x_):
+    """Evaluate reconstruction loss
+
+    Inputs:
+      x: data, shape (batch_size, ...)
+      x_, reconstruction, shape (k, batch_size, ...)
+
+    Returns:
+      loss: shape (batch_size, k)
+    """
+    reduce_dim = tuple(range(2, x_.dim()))
+    if self.loss_mode == 'l1':
+      loss = torch.sum((x.unsqueeze(0) - x_).abs(), dim=reduce_dim).t()
+    else:
+      loss = torch.sum((x.unsqueeze(0) - x_)**2, dim=reduce_dim).t()
+    return loss
+
+  def reg(self):
+    """Evaluate subspace and trunk regularization."""
+    if self.symmetric:
+      reg = torch.sum(self.Us**2, dim=(1, 2))
+    else:
+      reg = 0.5*(torch.sum(self.Us**2, dim=(1, 2)) +
+          torch.sum(self.Vs**2, dim=(1, 2)))
+
+    if self.trunks is not None:
+      for ii in (0, 1):
+        if hasattr(self.trunks[ii], 'reg'):
+          reg += self.trunks[ii].reg()
+    return reg
+
+  def set_assign(self, assign_obj):
+    """Compute soft-assignment.
+
+    Inputs:
+      assign_obj: shape (batch_size, k)
+    """
+    if self.soft_assign <= 0:
+      self.c = torch.zeros_like(assign_obj.data)
+      minidx = assign_obj.data.argmin(dim=1, keepdim=True)
+      self.c.scatter_(1, minidx, 1)
+    else:
+      self.c = ut.find_soft_assign(assign_obj.data, self.soft_assign)
+    self.groups = torch.argmax(self.c, dim=1)
+
+    if self.c_sigma > 0:
+      c_z = torch.zeros_like(self.c)
+      c_z.normal_(mean=0, std=(self.c_sigma/self.k)).abs_()
+      self.c.add_(c_z)
+      self.c.div_(self.c.sum(dim=1, keepdim=True))
+    return
+
+  def update_z_mean_cov(self):
+    """Update running estimates of latent space mean and covariance.
+
+    Used when sampling from latent space.
+    """
+    for ii in range(self.k):
+      group_mask = self.groups == ii
+      if group_mask.sum() < 2:
+        continue
+      group_z = self.z[ii, group_mask, :]
+
+      group_z_mean = group_z.mean(dim=0)
+      self.running_z_mean[ii, :].mul_(self.ema_decay)
+      self.running_z_mean[ii, :].add_(1-self.ema_decay, group_z_mean)
+
+      group_z_center = group_z.sub(self.running_z_mean[ii, :])
+      group_z_cov = torch.matmul(group_z_center.t(), group_z_center)
+      # use unbiased cov estimate
+      group_z_cov.div_(group_z.size(0)-1)
+      self.running_z_cov[ii, :, :].mul_(self.ema_decay)
+      self.running_z_cov[ii, :, :].add_(1-self.ema_decay, group_z_cov)
+
+      # compute covariance sqrt by eigendecomp
+      # NOTE: this might be too costly, for moderate d.
+      z_cov_e, z_cov_V = torch.symeig(self.running_z_cov[ii, :, :],
+          eigenvectors=True)
+      self.z_cov_sqrt[ii, :, :] = z_cov_V.mul(z_cov_e.sqrt())
+    return
 
   def eval_sprs(self):
     """measure robust sparsity of current assignment subset c"""
@@ -79,513 +257,122 @@ class KClusterModel(nn.Module):
     norm_x_ = torch.mean(norm_x_ / (norm_x + 1e-8))
     return norm_x_
 
-  def get_groups(self):
-    """compute group assignment."""
-    groups = torch.argmax(self.c.data, dim=1).cpu()
-    return groups
+  def eval_rank(self, tol=.001):
+    """Compute rank and singular values of subspace bases."""
+    ranks_svs = [ut.rank(self.Us.data[ii, :, :], tol) for ii in range(self.k)]
+    ranks, svs = zip(*ranks_svs)
+    return ranks, svs
 
 
-class KManifoldClusterModel(KClusterModel):
-  """Model of union of low-dimensional manifolds generalizing
-  k-means/k-subspaces."""
+class MNISTDCTrunkEncoder(nn.Module):
+  def __init__(self, conv_filters=10, H_dim=100):
+    super(MNISTDCTrunkEncoder, self).__init__()
 
-  def __init__(self, k, d, N, batch_size, group_models, use_cuda=False,
-        store_C_V=True):
-    super(KManifoldClusterModel, self).__init__(k, d, N, batch_size,
-        group_models)
+    self.conv_filters = conv_filters
+    self.H_dim = H_dim
+    self.feat_dim = 4*conv_filters*4*4
 
-    # Assignment and coefficient matrices, used with sparse embedding.
-    # Don't want these potentially huge variables ever sent to gpu.
-    # At some point might not even want them in memory.
-    self.store_C_V = store_C_V
-    if store_C_V:
-      self.C = torch.Tensor(N, k)
-      self.V = torch.Tensor(N, d, k)
-      if use_cuda:
-        # should speed up copy to cuda memory
-        self.C = self.C.pin_memory()
-        self.V = self.V.pin_memory()
-    else:
-      self.C = None
-      self.V = None
-    self.use_cuda = use_cuda
-    self.v = nn.Parameter(torch.Tensor(batch_size, d, k))
-    self.reset_parameters()
-    return
+    self.conv_feat = nn.Sequential(OrderedDict([
+        # input (1, 32, 32)
+        ('conv1', nn.Conv2d(1, conv_filters, 4, 2, 1, bias=True)),
+        ('lrelu1', nn.LeakyReLU(0.2, inplace=True)),
+        # (conv_filters, 16, 16)
+        ('conv2', nn.Conv2d(conv_filters, conv_filters*2, 4, 2, 1,
+            bias=False)),
+        ('bn2', nn.BatchNorm2d(conv_filters*2)),
+        ('lrelu2', nn.LeakyReLU(0.2, inplace=True)),
+        # (2*conv_filters, 8, 8)
+        ('conv3', nn.Conv2d(conv_filters*2, conv_filters*4, 4, 2, 1,
+            bias=False)),
+        ('bn3', nn.BatchNorm2d(conv_filters*4)),
+        ('lrelu3', nn.LeakyReLU(0.2, inplace=True))
+        # (4*conv_filters, 4, 4)
+    ]))
 
-  def reset_parameters(self):
-    """Initialize V with entries drawn from normal with std 0.1/sqrt(d), and C
-    with entries from normal distribution, mean=1, sigma=0.01."""
-    v_std = .1 / np.sqrt(self.d)
-    self.v.data.normal_(0., v_std)
-    if self.store_C_V:
-      self.V.data.normal_(0., v_std)
-      self.C.data.normal_(1., 0.01).abs_()
-      self.C.data.div_(self.C.data.sum(dim=1, keepdim=True))
-    super(KManifoldClusterModel, self).reset_parameters()
-    return
-
-  def forward(self, ii=None):
-    """compute manifold embedding for ith data point(s)."""
-    if ii is not None:
-      self.set_cv(ii)
-    # compute embeddings for each group and concatenate
-    # NOTE: is this efficient on gpu/cpu?
-    # NOTE: could use jit trace to get some optimization (although doesn't seem
-    # to make a big difference in simple test).
-    # NOTE: stack along 0 dimension so that shape of x doesn't matter, and
-    # memory layout should also be better.
-    x_ = torch.stack([gm(self.v[:, :, jj])
-        for jj, gm in enumerate(self.group_models)], dim=0)
-    return x_
-
-  def objective(self, x, ii=None, lamb_U=.01, lamb_V=None, wrt='all',
-        prox_nonsmooth=False):
-    if wrt not in ['all', 'V', 'C', 'U']:
-      raise ValueError(("Objective must be computed wrt 'all', "
-          "'V', 'C', or 'U'"))
-    lamb_V = lamb_U if lamb_V is None else lamb_V
-
-    # evaluate loss: least-squares weighted by assignment, as in k-means.
-    x_ = self(ii)
-    loss = torch.sum((x.unsqueeze(0) - x_)**2,
-        dim=tuple(range(2, x_.dim()))).t()
-    if wrt in ['all', 'U']:
-      loss = torch.mean(torch.sum(self.c*loss, dim=1))
-    elif wrt == 'V':
-      loss = torch.mean(torch.sum(loss, dim=1))
-    # for wrt C, use batch_size x k matrix of losses for computing closed form
-    # assignment.
-
-    # evaluate U regularizer
-    if wrt in ['all', 'C', 'U']:
-      Ureg = self.gm_reg(prox_nonsmooth).view(1, -1)
-      if wrt in ['all', 'U']:
-        Ureg = torch.mean(torch.sum(self.c*Ureg, dim=1))
-      # for wrt C, use 1 x k vector of U reg values for closed form assignment.
-    else:
-      Ureg = 0.0
-
-    # evaluate V l2 squared regularizer
-    if wrt in ['all', 'V', 'C']:
-      Vreg = torch.sum(self.v**2, dim=1)
-      if wrt == 'all':
-        Vreg = torch.mean(torch.sum(self.c*Vreg, dim=1))
-      elif wrt == 'V':
-        Vreg = torch.mean(torch.sum(Vreg, dim=1))
-      # for wrt C, use batch_size x n matrix of V reg values for closed form
-      # assignment.
-    else:
-      Vreg = 0.0
-
-    reg = lamb_U*Ureg + lamb_V*Vreg
-    obj = loss + reg
-    return obj, loss, reg, Ureg, Vreg, x_
-
-  def set_cv(self, ii):
-    """set c, v to reflect subset of C, V given by ii."""
-    # NOTE: in the case this is transferring cpu to gpu, does pinning memory
-    # make it faster?
-    if not self.store_C_V:
-      raise RuntimeError("C, V not stored!")
-    self.c.data.copy_(self.C[ii, :])
-    self.v.data.copy_(self.V[ii, :, :])
-    return
-
-  def set_CV(self, ii):
-    """update full segmentation coefficients with values from current
-    mini-batch."""
-    if not self.store_C_V:
-      raise RuntimeError("C, V not stored!")
-    # NOTE: is this asynchronous?
-    self.C[ii, :] = self.c.data.cpu()
-    self.V[ii, :, :] = self.v.data.cpu()
-    return
-
-  def get_groups(self, full=False):
-    """compute group assignment."""
-    if full:
-      if not self.store_C_V:
-        raise RuntimeError("C, V not stored!")
-      groups = torch.argmax(self.C.data, dim=1).cpu()
-    else:
-      groups = torch.argmax(self.c.data, dim=1).cpu()
-    return groups
-
-
-class KManifoldAEClusterModel(KClusterModel):
-  """Model of union of low-dimensional manifolds generalizing
-  k-means/k-subspaces. Coefficients computed using auto-encoder."""
-
-  def __init__(self, k, d, N, batch_size, group_models):
-    super(KManifoldAEClusterModel, self).__init__(k, d, N, batch_size,
-        group_models)
-    self.reset_parameters()
+    self.uos_proj = nn.Sequential(OrderedDict([
+        ('fc1', nn.Linear(self.feat_dim, H_dim, bias=True)),
+        ('relu1', nn.ReLU(True))]))
     return
 
   def forward(self, x):
-    """compute manifold ae embedding."""
-    # compute embeddings for each group and concatenate
-    # NOTE: is this efficient on gpu/cpu?
-    # NOTE: could use jit trace to get some optimization.
-    # NOTE: stack along 0 dimension so that shape of x doesn't matter, and
-    # memory layout should also be better.
-    x_ = torch.stack([gm(x) for gm in self.group_models], dim=0)
-    return x_
-
-  def objective(self, x, lamb=.01, wrt='all', prox_nonsmooth=False):
-    if wrt not in ['all', 'C', 'U_V']:
-      raise ValueError("Objective must be computed wrt 'all', 'C', or 'U_V'")
-
-    # evaluate loss: least-squares weighted by assignment, as in k-means.
-    x_ = self(x)
-    loss = torch.sum((x.unsqueeze(0) - x_)**2,
-        dim=tuple(range(2, x_.dim()))).t()
-    if wrt in ['all', 'U_V']:
-      # NOTE: c assumed to be already updated with respect to current sample.
-      loss = torch.mean(torch.sum(self.c*loss, dim=1))
-    # for wrt C, use batch_size x k matrix of losses for computing closed form
-    # assignment.
-
-    # evaluate U regularizer
-    reg = self.gm_reg(prox_nonsmooth).view(1, -1)
-    if wrt in ['all', 'U_V']:
-      reg = torch.mean(torch.sum(self.c*reg, dim=1))
-    # for wrt C, use 1 x k vector of U reg values for closed form assignment.
-
-    reg = lamb*reg
-    obj = loss + reg
-    return obj, loss, reg, x_
-
-
-class SubspaceModel(nn.Module):
-  """Model of single low-dimensional affine or linear subspace."""
-
-  def __init__(self, d, D, affine=False, reg='fro_sqr'):
-    super(SubspaceModel, self).__init__()
-    self.d = d  # manifold dimension
-    self.D = D  # ambient dimension
-    self.affine = affine  # whether affine or linear subspaces.
-
-    if reg not in ('fro_sqr', 'grp_sprs'):
-      raise ValueError(("Invalid regularization choice "
-          "(must be one of 'fro_sqr', 'grp_sprs')."))
-    self.reg_mode = reg
-
-    # construct subspace parameters and initialize
-    # logic taken from pytorch Linear layer code
-    self.U = nn.Parameter(torch.Tensor(D, d))
-    if affine:
-      self.b = nn.Parameter(torch.Tensor(D))
-    else:
-      self.register_parameter('b', None)
-    self.reset_parameters()
-    return
-
-  def reset_parameters(self):
-    """Initialize U, b with entries drawn from normal with std 0.1/sqrt(D)."""
-    std = .1 / np.sqrt(self.D)
-    self.U.data.normal_(0., std)
-    if self.b is not None:
-      self.b.data.normal_(0., std)
-    return
-
-  def forward(self, v):
-    """Compute subspace embedding using coefficients v."""
-    x = F.linear(v, self.U, self.b)
+    x = self.conv_feat(x)
+    x = x.view(x.size(0), self.feat_dim)
+    x = self.uos_proj(x)
     return x
 
-  def reg(self, prox_nonsmooth=False):
-    """Compute regularization on subspace basis."""
-    if self.reg_mode == 'grp_sprs':
-      if prox_nonsmooth:
-        reg = torch.tensor(0.0)
-      else:
-        reg = torch.sum(torch.norm(self.U, p=2, dim=0))
-    else:
-      reg = torch.sum(self.U**2)
-    return reg
-
-  def rank(self, tol=RANK_TOL):
-    """Compute rank of subspace basis."""
-    return ut.rank(self.U.data, tol)
+  def reg(self):
+    # for compatibility
+    return 0.0
 
 
-class ResidualManifoldModel(nn.Module):
-  """Model of single low-dimensional manifold.
+class MNISTDCDiscriminator(nn.Module):
+  def __init__(self, conv_filters=10):
+    super(MNISTDCDiscriminator, self).__init__()
 
-  Represented as affine subspace + nonlinear residual. Residual module is just
-  a single hidden layer network with ReLU activation and dropout."""
+    self.conv_filters = conv_filters
 
-  def __init__(self, d, xshape, H=None, drop_p=0.5, res_lamb=1.0):
-    super(ResidualManifoldModel, self).__init__()
-    self.d = d  # manifold dimension
-    self.D = np.prod(xshape)  # ambient dimension
-    self.xshape = xshape
-
-    self.H = H if H else self.D  # size of hidden layer
-    self.drop_p = drop_p
-    self.res_lamb = res_lamb  # residual weights regularization parameter
-
-    self.subspace_embedding = SubspaceModel(d, self.D, affine=True)
-    self.res_fc1 = nn.Linear(d, self.H, bias=False)
-    self.res_fc2 = nn.Linear(self.H, self.D, bias=False)
+    self.main = nn.Sequential(OrderedDict([
+        # input (1, 32, 32)
+        ('conv1', nn.Conv2d(1, conv_filters, 4, 2, 1, bias=True)),
+        ('lrelu1', nn.LeakyReLU(0.2, inplace=True)),
+        # (conv_filters, 16, 16)
+        ('conv2', nn.Conv2d(conv_filters, conv_filters*2, 4, 2, 1,
+            bias=False)),
+        ('bn2', nn.BatchNorm2d(conv_filters*2)),
+        ('lrelu2', nn.LeakyReLU(0.2, inplace=True)),
+        # (2*conv_filters, 8, 8)
+        ('conv3', nn.Conv2d(conv_filters*2, conv_filters*4, 4, 2, 1,
+            bias=False)),
+        ('bn3', nn.BatchNorm2d(conv_filters*4)),
+        ('lrelu3', nn.LeakyReLU(0.2, inplace=True)),
+        # (4*conv_filters, 4, 4)
+        ('fc4', nn.Conv2d(conv_filters*4, 1, 4, 1, 0, bias=True)),
+        ('sig', nn.Sigmoid())
+    ]))
     return
 
-  def forward(self, v):
-    """Compute residual manifold embedding using coefficients v."""
-    x = self.subspace_embedding(v)
-    z = F.relu(self.res_fc1(v))
-    z = F.dropout(z, p=self.drop_p, training=self.training)
-    z = self.res_fc2(z)
-    x = x + z
-    x = x.view((-1,) + self.xshape)
+  def forward(self, x):
+    return self.main(x).squeeze()
+
+
+class MNISTDCTrunkDecoder(nn.Module):
+  def __init__(self, conv_filters=10, H_dim=100):
+    super(MNISTDCTrunkDecoder, self).__init__()
+
+    self.H_dim = H_dim
+    self.conv_filters = conv_filters
+
+    self.uos_embed = nn.Sequential(OrderedDict([
+        ('fc1', nn.Linear(H_dim, 4*conv_filters*4*4, bias=True)),
+        ('relu1', nn.ReLU(True))]))
+
+    self.deconv_generator = nn.Sequential(OrderedDict([
+        # input from uos_embed (4*conv_filters, 4, 4)
+        ('convt1', nn.ConvTranspose2d(4*conv_filters, 2*conv_filters, 4, 2, 1,
+            bias=False)),
+        ('bn1', nn.BatchNorm2d(2*conv_filters)),
+        ('relu1', nn.ReLU(True)),
+        # (2*conv_filters, 8, 8)
+        ('convt2', nn.ConvTranspose2d(2*conv_filters, conv_filters, 4, 2, 1,
+            bias=False)),
+        ('bn2', nn.BatchNorm2d(conv_filters)),
+        ('relu2', nn.ReLU(True)),
+        # (conv_filters, 16, 16)
+        ('convt3', nn.ConvTranspose2d(conv_filters, 1, 4, 2, 1, bias=True)),
+        ('tanh', nn.Tanh())
+        # (1, 32, 32)
+    ]))
+    return
+
+  def forward(self, x):
+    x = self.uos_embed(x)
+    x = x.view(x.size(0), 4*self.conv_filters, 4, 4)
+    x = self.deconv_generator(x)
     return x
 
-  def reg(self, prox_nonsmooth=False):
-    """Compute L2 squared regularization on subspace basis and residual
-    module."""
-    reg = torch.sum(self.subspace_embedding.U**2)
-    # Intuition is for weights of residual module to be strongly regularized so
-    # that residual is Lipschitz with a small constant, controlling the
-    # curvature of the manifold.
-    reg += self.res_lamb*(torch.sum(self.res_fc1.weight**2) +
-        torch.sum(self.res_fc2.weight**2))
-    return reg
-
-  def rank(self, tol=RANK_TOL):
-    raise NotImplementedError("rank not implemented for residual manifold")
-
-
-class MNISTDCManifoldModel(nn.Module):
-  def __init__(self, d, filters, drop_p=0.5):
-    super(MNISTDCManifoldModel, self).__init__()
-    self.conv_generator = nn.Sequential(
-        nn.ConvTranspose2d(d, 2*filters, 7, 1, 0, bias=False),
-        nn.BatchNorm2d(2*filters),
-        nn.ReLU(),
-        nn.Dropout2d(p=drop_p),
-        # size (2*filters, 7, 7)
-        nn.ConvTranspose2d(2*filters, filters, 4, 2, 1, bias=False),
-        nn.BatchNorm2d(filters),
-        nn.ReLU(),
-        nn.Dropout2d(p=drop_p),
-        # size (filters, 14, 14)
-        nn.ConvTranspose2d(filters, 1, 4, 2, 1, bias=True)
-        # nn.Tanh()
-        # size (1, 28, 28)
-    )
-    self.d = d
-    self.filters = filters
-    return
-
-  def forward(self, v):
-    """Compute deep convolutional manifold embedding using coefficients v."""
-    x = self.conv_generator(v.view(-1, self.d, 1, 1))
-    return x
-
-  def reg(self, prox_nonsmooth=False):
-    """Compute l2 squared regularizer on last batchnorm weight and last conv
-    filter."""
-    # NOTE: confirm that network is ph degree zero wrt earlier weights?
-    # last batchnorm should reset ph for all previous layers
-    reg = (self.conv_generator[5].weight.pow(2).sum() +
-        self.conv_generator[8].weight.pow(2).sum())
-    return reg
-
-  def rank(self, tol=RANK_TOL):
-    raise NotImplementedError("rank not implemented for mnist deep conv model")
-
-
-class SubspaceAEModel(nn.Module):
-  """Model of single low-dimensional affine or linear subspace auto-encoder
-  (i.e. pca)."""
-
-  def __init__(self, d, D, affine=False, reg='fro_sqr'):
-    super(SubspaceAEModel, self).__init__()
-    self.d = d  # manifold dimension
-    self.D = D  # ambient dimension
-    self.affine = affine  # whether affine or linear subspaces.
-
-    if reg not in ('fro_sqr', 'grp_sprs'):
-      raise ValueError(("Invalid regularization choice "
-          "(must be one of 'fro_sqr', 'grp_sprs')."))
-    self.reg_mode = reg
-
-    # NOTE: should V really be U^T, as in pca?
-    self.U = nn.Parameter(torch.Tensor(D, d))
-    self.V = nn.Parameter(torch.Tensor(d, D))
-    if affine:
-      self.b = nn.Parameter(torch.Tensor(D))
-    else:
-      self.register_parameter('b', None)
-    self.reset_parameters()
-    return
-
-  def reset_parameters(self):
-    """Initialize U, V, b with entries drawn from normal with std
-    0.1/sqrt(D)."""
-    std = .1 / np.sqrt(self.D)
-    self.U.data.normal_(0., std)
-    self.V.data.normal_(0., std)
-    if self.affine:
-      self.b.data.normal_(0., std)
-    return
-
-  def forward(self, x):
-    """Compute subspace embedding from data x."""
-    # NOTE: would it make sense to include batch norm on the coeffs v?
-    v = self.encode(x)
-    x_ = self.decode(v)
-    return x_
-
-  def encode(self, x):
-    """Compute coefficients v from x."""
-    if self.affine:
-      x = x.sub(self.b)
-    v = F.linear(x, self.V)
-    return v
-
-  def decode(self, v):
-    """Compute reconstruction x_ from v."""
-    x_ = F.linear(v, self.U, self.b)
-    return x_
-
-  def reg(self, prox_nonsmooth=False):
-    """Compute L2 regularization on subspace basis."""
-    if self.reg_mode == 'grp_sprs':
-      if prox_nonsmooth:
-        Ureg = torch.tensor(0.0)
-      else:
-        Ureg = torch.sum(torch.norm(self.U, p=2, dim=0))
-    else:
-      Ureg = torch.sum(self.U**2)
-    Vreg = torch.sum(self.V**2)
-    reg = Ureg + Vreg
-    return reg
-
-  def rank(self, tol=RANK_TOL):
-    return ut.rank(self.U.data, tol)
-
-
-class ResidualManifoldAEModel(nn.Module):
-  """Model of single low-dimensional manifold.
-
-  Represented as affine subspace + nonlinear residual. Residual module is just
-  a single hidden layer network with ReLU activation and dropout."""
-
-  def __init__(self, d, D, H=None, drop_p=0.5, res_lamb=1.0):
-    super(ResidualManifoldAEModel, self).__init__()
-    self.d = d  # manifold dimension
-    self.D = D  # ambient dimension
-
-    self.H = H if H else D  # size of hidden layer
-    self.drop_p = drop_p
-    self.res_lamb = res_lamb  # residual weights regularization parameter
-
-    self.subspace_ae = SubspaceAEModel(d, D, affine=True)
-    # NOTE: think about the justification for bias or not here.
-    # no bias on dec_fc1 because I might want to use group sparsity
-    # regularization to control dimension. but for others I have no good
-    # reason.
-    self.enc_fc1 = nn.Linear(D, self.H, bias=False)
-    self.enc_fc2 = nn.Linear(self.H, d, bias=False)
-    self.dec_fc1 = nn.Linear(d, self.H, bias=False)
-    self.dec_fc2 = nn.Linear(self.H, D, bias=False)
-    # NOTE: not calling reset_parameters since already done.
-    return
-
-  def forward(self, x):
-    """Compute residual manifold embedding from data x."""
-    # NOTE: would it make sense to include batch norm on the coeffs v?
-    v = self.encode(x)
-    x_ = self.decode(v)
-    return x_
-
-  def encode(self, x):
-    """Compute coefficients v from x."""
-    v = self.subspace_ae.encode(x)
-    z = F.relu(self.enc_fc1(x))
-    z = F.dropout(z, p=self.drop_p, training=self.training)
-    z = self.enc_fc2(z)
-    v = v + z
-    return v
-
-  def decode(self, v):
-    """Compute reconstruction x_ from v."""
-    x_ = self.subspace_ae.decode(v)
-    z = F.relu(self.dec_fc1(v))
-    z = F.dropout(z, p=self.drop_p, training=self.training)
-    z = self.dec_fc2(z)
-    x_ = x_ + z
-    return x_
-
-  def reg(self, prox_nonsmooth=False):
-    """Compute L2 squared regularization on subspace basis and residual
-    module."""
-    reg = self.subspace_ae.reg(prox_nonsmooth)
-    # Intuition is for weights of residual module to be strongly regularized so
-    # that residual is Lipschitz with a small constant, controlling the
-    # curvature of the manifold.
-    reg += 0.5*self.res_lamb*sum([layer.weight.pow(2).sum() for layer in
-        [self.enc_fc1, self.enc_fc2, self.dec_fc1, self.dec_fc2]])
-    return reg
-
-  def rank(self, tol=RANK_TOL):
-    raise NotImplementedError("rank not implemented for residual AE model")
-
-
-class MNISTMlpAEModel(nn.Module):
-  D = 784
-
-  def __init__(self, d, filters, drop_p=0.0, sigma=0.1, reg='fro_sqr'):
-    if reg not in ['fro_sqr', 'fro_prod']:
-      raise ValueError("Invalid reg {}".format(reg))
-
-    super(MNISTMlpAEModel, self).__init__()
-    self.d = d
-    self.filters = filters
-    self.drop_p = drop_p
-    self.sigma = sigma
-    self.reg_mode = reg
-
-    self.encoder = nn.Sequential(OrderedDict([
-        ('fc1', nn.Linear(self.D, filters, bias=True)),
-        ('drop1', nn.Dropout(drop_p)),
-        ('relu1', nn.ReLU()),
-        ('fc2', nn.Linear(filters, filters, bias=True)),
-        ('drop2', nn.Dropout(drop_p)),
-        ('relu2', nn.ReLU()),
-        ('fc3', nn.Linear(filters, d, bias=False))]))
-
-    self.decoder = nn.Sequential(OrderedDict([
-        ('noise1', NoiseInject(sigma=self.sigma)),
-        ('fc1', nn.Linear(d, filters, bias=True)),
-        ('drop1', nn.Dropout(drop_p)),
-        ('relu1', nn.ReLU()),
-        ('fc2', nn.Linear(filters, filters, bias=True)),
-        ('drop2', nn.Dropout(drop_p)),
-        ('relu2', nn.ReLU()),
-        ('fc3', nn.Linear(filters, self.D, bias=True))]))
-    return
-
-  def forward(self, x):
-    """Compute subspace embedding from data x."""
-    v = self.encoder(x.view(-1, self.D))
-    x_ = self.decoder(v).view(*x.shape)
-    return x_
-
-  def reg(self, prox_nonsmooth=False):
-    if self.reg_mode == 'fro_sqr':
-      reg = sum((layer.weight.pow(2).sum()
-          for name, layer in self.named_modules() if 'fc' in name))
-    else:
-      reg = torch.prod(torch.stack([torch.norm(layer.weight)
-          for name, layer in self.named_modules() if 'fc' in name]))
-    return reg
-
-  def rank(self, tol=RANK_TOL):
-    return ut.rank(self.encoder.fc3.data, tol)
+  def reg(self):
+    # for compatibility
+    return 0.0
 
 
 class NoiseInject(nn.Module):
@@ -607,7 +394,7 @@ class NoiseInject(nn.Module):
       self.sqrtD = np.sqrt(np.prod(x.data.shape[1:]))
       self.ndim = x.data.dim()
     self.z.normal_()
-    xnorm = x.data.pow(2).sum(dim=tuple(range(1,self.ndim)),
+    xnorm = x.data.pow(2).sum(dim=tuple(range(1, self.ndim)),
         keepdim=True).sqrt()
     sigma = xnorm.mul(self.sigma/self.sqrtD)
     self.z.mul_(sigma)
