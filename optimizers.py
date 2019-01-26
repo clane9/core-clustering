@@ -102,7 +102,7 @@ class KManifoldAEMetaOptimizer(optim.Optimizer):
       D_x = pred_real.mean().item()
       # model samples
       # noise sampled from gaussian fit to latent low-dim codes
-      noise = torch.randn(self.k, self.d, batch_size // self.k)
+      noise = torch.randn(self.k, self.d, batch_size // self.k, device=device)
       noise = torch.matmul(self.model.z_cov_sqrt, noise).transpose(1, 2)
       noise.add_(self.model.running_z_mean.unsqueeze(1))
       samples = self.model.decode(noise)
