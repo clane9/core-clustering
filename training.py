@@ -176,7 +176,7 @@ def train_epoch(model, data_loader, optimizer, device, dist_mode=False,
     batch_metrics = optimizer.step(x)
 
     # eval batch cluster confusion
-    batch_conf_mat = ut.eval_confusion(model.groups, groups, k=model.k,
+    batch_conf_mat = ut.eval_confusion(model.groups.cpu(), groups, k=model.k,
         true_classes=data_loader.dataset.classes)
     if dist_mode:
       bufs = batch_metrics + (batch_conf_mat,)
