@@ -53,6 +53,7 @@ def main():
       symmetric=True, loss='l2_sqr', trunks=(trunk_encoder, trunk_decoder),
       soft_assign=args.soft_assign, c_sigma=.01)
   model.to(device)
+  discriminator.to(device)
 
   # optimizer
   optimizer = opt.KManifoldAEMetaOptimizer(model, optim.Adam, lr=args.init_lr,
