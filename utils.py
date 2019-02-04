@@ -4,7 +4,6 @@ from __future__ import division
 import numpy as np
 import shutil
 import torch
-import torch.nn.functional as F
 from scipy.optimize import linear_sum_assignment
 
 
@@ -83,6 +82,15 @@ def eval_cluster_error(*args, **kwargs):
   correct = conf_mat[row_ind, col_ind].sum()
   N = conf_mat.sum()
   cluster_error = 1.0 - correct/N
+
+  # re-order conf_mat
+  if row_ind.size < conf_mat.shape[0]:
+    row_ind = np.concatenate([row_ind,
+      np.setdiff1d(np.arange(conf_mat.shape[0]), row_ind)])
+  if col_ind.size < conf_mat.shape[1]:
+    col_ind = np.concatenate([col_ind,
+      np.setdiff1d(np.arange(conf_mat.shape[1]), col_ind)])
+  conf_mat = conf_mat[row_ind, :][:, col_ind]
   return cluster_error, conf_mat
 
 
@@ -121,20 +129,37 @@ def eval_confusion(groups, true_groups, k=None, true_k=None,
   return conf_mat
 
 
-def prox_fro_sqr(X, lamb):
-  """Evaluate proximal operator of g(X) = lambda ||X||_F^2."""
-  return (1./(1.+2.*lamb))*X
-
-
-def prox_grp_sprs(X, lamb):
-  """Evaluate proximal operator of g(X) = lambda ||X||_{2 1}."""
-  Xnorm = torch.norm(X, p=2, dim=0)
-  m, n = X.shape
-  coeff = F.relu(torch.ones(1, n) - lamb/(Xnorm + 1e-8))
-  return coeff*X
-
-
 def rank(X, tol=.01):
   """Evaluate approximate rank of X."""
   _, svs, _ = torch.svd(X)
   return (svs > tol*svs.max()).sum(), svs
+
+
+def find_soft_assign(losses, T=1.):
+  """soft assignment found by shifting up negative losses by T, thresholding
+  and normalizing.
+
+  Args:
+    losses (Tensor): (Nb, n) matrix of loss values.
+    T (float): soft assignment parameter in (0, \infty).
+
+  .. note::
+    For any T there is a tau such that the returned c is a solution to
+
+      min_c c^T l  s.t.  c >= 0, c^T 1 = 1, ||c||_2^2 <= tau
+
+    Since the optimality conditions of this problem yield
+
+      c^* = 1/gamma( lambda \1 - l)_+
+
+    for gamma, lambda Lagrange multipliers.
+  """
+  if T <= 0:
+    raise ValueError("soft assignment T must be > 0.")
+  # normalize loss to that T has consistent interpretation.
+  # NOTE: minimum loss can't be exactly zero
+  loss_min, _ = losses.min(dim=1, keepdim=True)
+  losses = losses.div(loss_min)
+  c = torch.clamp(T + 1. - losses, min=0.)
+  c = c.div(c.sum(dim=1, keepdim=True))
+  return c

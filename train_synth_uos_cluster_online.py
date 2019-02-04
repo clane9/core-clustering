@@ -1,5 +1,4 @@
-"""Train and evaluate factorized manifold clustering model on synthetic union
-of subspaces."""
+"""Train and evaluate k-subspace model on synthetic union of subspaces."""
 
 from __future__ import absolute_import
 from __future__ import division
@@ -10,28 +9,42 @@ import os
 import shutil
 import pickle
 
-import numpy as np
 import torch
 import torch.distributed as dist
 from torch.utils.data import DataLoader
 
 import datasets as dat
 import models as mod
-import optimizers as opt
 import training as tr
-import utils as ut
-
-CHKP_FREQ = 50
-STOP_FREQ = 10
 
 
 def main():
   use_cuda = args.cuda and torch.cuda.is_available()
-  if use_cuda and args.dist:
-    raise ValueError("Cannot use cuda in distributed mode")
+  torch.set_num_threads(args.num_threads)
+
+  if args.dist:
+    if use_cuda:
+      dist.init_process_group(backend="nccl")
+    else:
+      dist.init_process_group(backend="mpi")
+
+  is_logging = (not args.dist) or (dist.get_rank() == 0)
+  # create output directory, deleting any existing results.
+  if is_logging:
+    if os.path.exists(args.out_dir):
+      shutil.rmtree(args.out_dir)
+    os.mkdir(args.out_dir)
+    # save args
+    with open('{}/args.pkl'.format(args.out_dir), 'wb') as f:
+      pickle.dump(args, f)
 
   device = torch.device('cuda' if use_cuda else 'cpu')
-  torch.set_num_threads(args.num_threads)
+  if use_cuda:
+    cuda_devices = map(int, os.environ['CUDA_VISIBLE_DEVICES'].split(','))
+    if len(cuda_devices) != dist.get_world_size():
+      raise RuntimeError("Visible cuda devices must equal world size")
+    device_id = cuda_devices[dist.get_rank()]
+    torch.cuda.set_device(device_id)
 
   # construct dataset
   synth_dataset = dat.SynthUoSOnlineDataset(args.n, args.d, args.D, args.N,
@@ -49,46 +62,40 @@ def main():
   synth_data_loader = DataLoader(synth_dataset, batch_size=args.batch_size,
       shuffle=False, drop_last=True, **kwargs)
 
-  torch.manual_seed(args.seed)
-  np.random.seed(args.seed)
-
   # construct model
-  model_d = args.model_d if args.model_d > 0 else args.d
-  if args.auto_enc:
-    group_models = [mod.SubspaceAEModel(model_d, args.D, args.affine,
-        reg=args.reg_U) for _ in range(args.n)]
-    model = mod.KManifoldAEClusterModel(args.n, model_d, args.N,
-        args.batch_size, group_models)
+  torch.manual_seed(args.seed)
+  model_d = args.model_d
+  if model_d is None or model_d <= 0:
+    model_d = args.d
+  if args.proj_form:
+    model = mod.KSubspaceProjModel(args.n, model_d, args.D, args.affine,
+        args.symmetric, lamb=args.lamb, soft_assign=args.soft_assign,
+        c_sigma=args.c_sigma, size_scale=args.size_scale)
   else:
-    group_models = [mod.SubspaceModel(model_d, args.D, args.affine,
-        reg=args.reg_U) for _ in range(args.n)]
-    model = mod.KManifoldClusterModel(args.n, model_d, args.N, args.batch_size,
-        group_models, use_cuda, store_C_V=False)
+    model = mod.KSubspaceModel(args.n, model_d, args.D, args.affine,
+        U_lamb=args.lamb, z_lamb=args.z_lamb, soft_assign=args.soft_assign,
+        c_sigma=args.c_sigma, size_scale=args.size_scale)
   model = model.to(device)
-
-  # optimizer & lr schedule
-  if args.auto_enc:
-    optimizer = opt.KManifoldAESGD(model, lr=args.init_lr,
-        lamb=args.lamb_U, momentum=args.momentum, nesterov=args.nesterov,
-        soft_assign=args.soft_assign, dist_mode=args.dist,
-        size_scale=args.size_scale)
-  else:
-    if args.prox_reg_U:
-      prox_U = (ut.prox_grp_sprs if args.reg_U == 'grp_sprs'
-          else ut.prox_fro_sqr)
-      optimizer = opt.KSubspaceAltProxSGD(model, lr=args.init_lr,
-          lamb_U=args.lamb_U, lamb_V=args.lamb_V, momentum=args.momentum,
-          prox_U=prox_U, soft_assign=args.soft_assign,
-          dist_mode=args.dist, size_scale=args.size_scale)
+  if args.dist:
+    if use_cuda:
+      model = torch.nn.parallel.DistributedDataParallel(model,
+          device_ids=[device_id], output_device=device_id)
     else:
-      optimizer = opt.KSubspaceAltSGD(model, lr=args.init_lr,
-          lamb_U=args.lamb_U, lamb_V=args.lamb_V, momentum=args.momentum,
-          nesterov=args.nesterov, soft_assign=args.soft_assign,
-          dist_mode=args.dist, size_scale=args.size_scale)
+      model = torch.nn.parallel.DistributedDataParallelCPU(model)
 
+  # optimizer
+  optimizer = torch.optim.SGD(model.parameters(), lr=args.init_lr,
+      momentum=args.momentum, nesterov=args.nesterov)
+
+  chkp_freq = args.chkp_freq
+  if chkp_freq is None or chkp_freq <= 0:
+    chkp_freq = args.epochs
+  stop_freq = args.stop_freq
+  if stop_freq is None or stop_freq <= 0:
+    stop_freq = -1
   tr.train_loop(model, synth_data_loader, device, optimizer,
-      args.out_dir, args.epochs, CHKP_FREQ, STOP_FREQ, args.dist,
-      eval_rank=True)
+      args.out_dir, args.epochs, chkp_freq, stop_freq, scheduler=None,
+      dist_mode=args.dist, eval_rank=args.eval_rank)
   return
 
 
@@ -105,7 +112,6 @@ if __name__ == '__main__':
                       help='Ambient dimension [default: 100]')
   parser.add_argument('--N', type=int, default=100000,
                       help='Total data points [default: 10^5]')
-
   parser.add_argument('--affine', action='store_true',
                       help='Affine setting')
   parser.add_argument('--sigma', type=float, default=0.01,
@@ -113,21 +119,23 @@ if __name__ == '__main__':
   parser.add_argument('--data-seed', type=int, default=1904,
                       help='Data random seed [default: 1904]')
   # model settings
-  parser.add_argument('--model-d', type=int, default=-1,
+  parser.add_argument('--proj-form', action='store_true', default=False,
+                      help='Use projection matrix formulation')
+  parser.add_argument('--model-d', type=int, default=None,
                       help='Model subspace dimension [default: d]')
-  parser.add_argument('--auto-enc', action='store_true', default=False,
-                      help='use auto-encoder formulation')
-  parser.add_argument('--reg-U', type=str, default='fro_sqr',
-                      help=("U reg function (one of 'fro_sqr', 'grp_sprs') "
-                          "[default: fro_sqr]"))
-  parser.add_argument('--prox-reg-U', action='store_true', default=False,
-                      help='update U by proximal gradient')
-  parser.add_argument('--lamb-U', type=float, default=1e-4,
-                      help='U reg parameter [default: 1e-4]')
-  parser.add_argument('--lamb-V', type=float, default=0.1,
-                      help='V reg parameter [default: 0.1]')
+  parser.add_argument('--symmetric', action='store_true',
+                      help='Projection matrix is U^T')
+  parser.add_argument('--lamb', type=float, default=1e-4,
+                      help='Subspace reg parameter [default: 1e-4]')
+  parser.add_argument('--z-lamb', type=float, default=0.1,
+                      help='Coefficient reg parameter [default: 0.1]')
   parser.add_argument('--soft-assign', type=float, default=0.1,
-                      help='soft assignment parameter [default: 0.1]')
+                      help='Soft assignment parameter [default: 0.1]')
+  parser.add_argument('--c-sigma', type=float, default=0.01,
+                      help='Assignment noise parameter [default: 0.01]')
+  parser.add_argument('--size-scale', action='store_true',
+                      help=('Scale gradients to compensate for cluster '
+                          'size imbalance'))
   # training settings
   parser.add_argument('--batch-size', type=int, default=100,
                       help='Input batch size for training [default: 100]')
@@ -141,9 +149,6 @@ if __name__ == '__main__':
                       help='Use nesterov form of acceleration')
   parser.add_argument('--dist', action='store_true', default=False,
                       help='Enables distributed training')
-  parser.add_argument('--size-scale', action='store_true', default=False,
-                      help=('Scale objective wrt U to compensate for '
-                      'size imbalance'))
   parser.add_argument('--cuda', action='store_true', default=False,
                       help='Enables CUDA training')
   parser.add_argument('--num-threads', type=int, default=1,
@@ -152,18 +157,12 @@ if __name__ == '__main__':
                       help='Number of workers for data loading [default: 1]')
   parser.add_argument('--seed', type=int, default=2018,
                       help='Training random seed [default: 2018]')
+  parser.add_argument('--eval-rank', action='store_true', default=False,
+                      help='Evaluate ranks of subspace models')
+  parser.add_argument('--chkp-freq', type=int, default=10,
+                      help='How often to save checkpoints [default: 10]')
+  parser.add_argument('--stop-freq', type=int, default=None,
+                      help='How often to stop in ipdb [default: None]')
   args = parser.parse_args()
 
-  if args.dist:
-    dist.init_process_group(backend="mpi")
-
-  is_logging = (not args.dist) or (dist.get_rank() == 0)
-  # create output directory, deleting any existing results.
-  if is_logging:
-    if os.path.exists(args.out_dir):
-      shutil.rmtree(args.out_dir)
-    os.mkdir(args.out_dir)
-    # save args
-    with open('{}/args.pkl'.format(args.out_dir), 'wb') as f:
-      pickle.dump(args, f)
   main()
