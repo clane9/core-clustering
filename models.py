@@ -15,13 +15,11 @@ class _KSubspaceBaseModel(nn.Module):
   """Base K-subspace class."""
 
   def __init__(self, k, d, D, affine=False, soft_assign=0.0, c_sigma=0.0,
-        U_drop_prob=0.0, size_scale=False):
+        size_scale=False):
     if soft_assign < 0:
       raise ValueError("Invalid soft-assign parameter {}".format(soft_assign))
     if c_sigma < 0:
       raise ValueError("Invalid assignment noise parameter {}".format(c_sigma))
-    if U_drop_prob < 0 or U_drop_prob >= 1:
-      raise ValueError("Invalid U column drop prob {}".format(U_drop_prob))
 
     super(_KSubspaceBaseModel, self).__init__()
     self.k = k  # number of groups
@@ -30,8 +28,8 @@ class _KSubspaceBaseModel(nn.Module):
     self.affine = affine
     self.soft_assign = soft_assign
     self.c_sigma = c_sigma
-    self.U_drop_prob = U_drop_prob
     self.size_scale = size_scale
+    self.assign_reg_terms = None  # assigned in child
 
     # group assignment, ultimate shape (batch_size, k)
     self.c = None
@@ -45,8 +43,6 @@ class _KSubspaceBaseModel(nn.Module):
     else:
       self.register_parameter('bs', None)
     self.register_buffer('c_mean', torch.ones(k).div_(k))
-    self.register_buffer('U_drop_mask', torch.ones(k, 1, d))
-    self.Us_drop = None
     return
 
   def reset_parameters(self):
@@ -63,7 +59,6 @@ class _KSubspaceBaseModel(nn.Module):
     Returns:
       x_: shape (k, batch_size, D)
     """
-    self.drop_U_cols()
     z = self.encode(x)
     self.z = z.data
     x_ = self.decode(z)
@@ -94,20 +89,10 @@ class _KSubspaceBaseModel(nn.Module):
 
     # x_ = U z + b
     # shape (k, batch_size, D)
-    x_ = torch.matmul(self.Us_drop, z.transpose(1, 2)).transpose(1, 2)
+    x_ = torch.matmul(self.Us, z.transpose(1, 2)).transpose(1, 2)
     if self.affine:
       x_ = x_.add(self.bs.unsqueeze(1))
     return x_
-
-  def drop_U_cols(self):
-    """Randomly dropout columns of bases U."""
-    if self.training and self.U_drop_prob > 0:
-      self.U_drop_mask.uniform_()
-      torch.threshold_(self.U_drop_mask, self.U_drop_prob, 0.0).sign_()
-      self.Us_drop = self.Us.mul(self.U_drop_mask)
-    else:
-      self.Us_drop = self.Us.clone()
-    return
 
   def objective(self, x):
     """Evaluate objective function.
@@ -116,34 +101,41 @@ class _KSubspaceBaseModel(nn.Module):
       x: data, shape (batch_size, D)
 
     Returns:
-      obj, scale_obj, loss, reg, inc_reg
+      obj, scale_obj, loss, reg
       x_: reconstruction, shape (k, batch_size, D)
     """
     x_ = self(x)
-    loss = self.loss(x, x_)
-    reg, inc_reg = self.reg()
+    losses = self.loss(x, x_)
+    regs = self.reg()
 
     # update assignment c
-    assign_obj = loss.data + reg.data
+    assign_obj = losses.data + sum([regs[k].data for k in regs
+        if k in self.assign_reg_terms])
     self.set_assign(assign_obj)
 
-    # shape (k,)
-    loss = torch.mean(self.c*loss, dim=0)
-    reg = torch.mean(self.c*reg, dim=0)
+    # weight loss, reg by assignment where needed, and average over batch
+    losses = torch.mean(self.c*losses, dim=0)
+    for k, reg in regs.items():
+      if k in self.assign_reg_terms:
+        reg = self.c*reg if reg.dim() == 2 else self._batch_c_mean*reg
+      if reg.dim() == 2:
+        reg = reg.mean(dim=0)
+      regs[k] = reg
+    # combine reg terms
+    regs = sum(regs.values()) if len(regs) > 0 else torch.zeros_like(losses)
 
+    loss = losses.sum()
+    reg = regs.sum()
+    obj = loss + reg
+
+    # only justified as lr scaling when loss + all reg terms weighted by c_ij
+    # init enforces this
     if self.size_scale:
-      scale_loss = loss.div(self.c_mean + EPS)
-      scale_reg = reg.div(self.c_mean + EPS)
-
-    loss = loss.sum()
-    reg = reg.sum()
-    obj = loss + reg + inc_reg
-
-    if self.size_scale:
-      scale_obj = (scale_loss + scale_reg).sum() + inc_reg
+      scale_obj = (losses.div(self.c_mean + EPS).sum() +
+          regs.div(self.c_mean + EPS).sum())
     else:
       scale_obj = obj
-    return obj, scale_obj, loss, reg, inc_reg, x_
+    return obj, scale_obj, loss, reg, x_
 
   def loss(self, x, x_):
     """Evaluate reconstruction loss
@@ -184,8 +176,8 @@ class _KSubspaceBaseModel(nn.Module):
       self.c.add_(c_z)
       self.c.div_(self.c.sum(dim=1, keepdim=True))
 
-    batch_c_mean = torch.mean(self.c, dim=0)
-    self.c_mean.mul_(EMA_DECAY).add_(1-EMA_DECAY, batch_c_mean)
+    self._batch_c_mean = torch.mean(self.c, dim=0)
+    self.c_mean.mul_(EMA_DECAY).add_(1-EMA_DECAY, self._batch_c_mean)
     return
 
   def eval_sprs(self):
@@ -222,8 +214,7 @@ class _KSubspaceBaseModel(nn.Module):
         (largest values chosen). (default: c_mean)
 
     Returns:
-      reset_ids, split_ids: indices of reset, split clusters
-      fail_count: total reset failure count
+      reset_count, fail_count: current reset count and previous fail count
     """
     # NOTE: need more principled way of setting various constants: size
     # reduction threshold (0.95), empty cluster threshold (.01), duplication
@@ -233,49 +224,39 @@ class _KSubspaceBaseModel(nn.Module):
     if split_metric.shape != (self.k,):
       raise ValueError("Invalid splitting metric")
 
-    # track whether previous split "failed", i.e. did not significantly reduce
-    # cluster size. do not want to try to split these again, at least not
-    # before trying others. a bit arbitrary/unprincipled...
-    if not hasattr(self, '_prev_split_ids'):
+    if not hasattr(self, '_reset_thr'):
+      # nearly unused: <= 1% (1/k)
+      # expected value of folded gaussian distribution: sqrt(2/pi)*sigma
+      # https://en.wikipedia.org/wiki/Folded_normal_distribution
+      self._reset_thr = ((self.c_sigma/self.k)*np.sqrt(2/np.pi) + .01/self.k)
+      # for tracking split success/failure
       self._prev_split_ids, self._prev_reset_ids = [], []
       self._split_fail_count = torch.zeros_like(self.c_mean)
       self._prev_c_mean = self.c_mean.clone()
 
-    if len(self._prev_split_ids) > 0:
-      fail_thr = 0.95*self._prev_c_mean[self._prev_split_ids]
-
-      split_ids_fail_mask = (self.c_mean[self._prev_split_ids] >=
-          fail_thr).type(self.c_mean.dtype)
-      self._split_fail_count[self._prev_split_ids] += split_ids_fail_mask
-
-      reset_ids_fail_mask = (self.c_mean[self._prev_reset_ids] >=
-          fail_thr).type(self.c_mean.dtype)
-      self._split_fail_count[self._prev_reset_ids] += reset_ids_fail_mask
-
-      fail_count = (split_ids_fail_mask.sum().item() +
-          reset_ids_fail_mask.sum().item())
-    else:
-      fail_count = 0.0
-
-    # record "previous" c_mean before adjusting following split
-    self._prev_c_mean.copy_(self.c_mean)
-
-    # nearly unused: <= 1% (1/k)
-    # expected value of folded gaussian distribution: sqrt(2/pi)*sigma
-    # https://en.wikipedia.org/wiki/Folded_normal_distribution
-    reset_thr = ((self.c_sigma/self.k)*np.sqrt(2/np.pi) + .01/self.k)
-    reset_ids = torch.nonzero(self.c_mean <= reset_thr).view(-1)
-    n_reset = reset_ids.size(0)
-    if n_reset > 0:
+    reset_ids = torch.nonzero(self.c_mean <= self._reset_thr).view(-1)
+    reset_count = reset_ids.size(0)
+    fail_count = 0
+    if reset_count > 0:
       # can't reset more that k/2 clusters.
-      if n_reset > self.k / 2:
-        n_reset = (self.k - n_reset)
-        reset_ids = reset_ids[:n_reset]
+      if reset_count > self.k / 2:
+        reset_count = (self.k - reset_count)
+        reset_ids = reset_ids[:reset_count]
 
-      # don't split clusters that we have recently tried and failed to split.
+      # check for split failures from the last reset. i.e. did not
+      # significantly reduce cluster size. do not want to try to split these
+      # again, at least not before trying others. a bit
+      # arbitrary/unprincipled...
+      if len(self._prev_split_ids) > 0:
+        fail_thr = 0.9*self._prev_c_mean[self._prev_split_ids]
+        for prev_ids in [self._prev_split_ids, self._prev_reset_ids]:
+          fail_mask = (self.c_mean[prev_ids] >= fail_thr).type(fail_thr.dtype)
+          self._split_fail_count[prev_ids] += fail_mask
+          fail_count += fail_mask.sum().item()
+
       split_metric = split_metric.sub(self._split_fail_count)
       split_metric[reset_ids] = float('-inf')
-      split_ids = torch.argsort(split_metric, descending=True)[:n_reset]
+      split_ids = torch.argsort(split_metric, descending=True)[:reset_count]
 
       # "split" clusters by duplicating bases with small (0.1%) perturbation
       split_Us = self.Us.data[split_ids, :]
@@ -285,15 +266,13 @@ class _KSubspaceBaseModel(nn.Module):
 
       # very important to update c_mean for split clusters when using size
       # scaled objective
+      self._prev_c_mean.copy_(self.c_mean)
       self.c_mean[split_ids] *= 0.5
       self.c_mean[reset_ids] = self.c_mean[split_ids]
-    else:
-      # reset_ids is empty, just copy
-      split_ids = reset_ids.clone()
-    self._prev_reset_ids = reset_ids
-    self._prev_split_ids = split_ids
-    return (reset_ids.cpu().numpy(), split_ids.cpu().numpy(),
-        fail_count)
+
+      self._prev_reset_ids = reset_ids
+      self._prev_split_ids = split_ids
+    return reset_count, fail_count
 
 
 class KSubspaceModel(_KSubspaceBaseModel):
@@ -301,8 +280,8 @@ class KSubspaceModel(_KSubspaceBaseModel):
   form."""
 
   def __init__(self, k, d, D, affine=False, U_lamb=0.001, z_lamb=0.1,
-        inc_gamma=0.0, soft_assign=0.0, c_sigma=0.0, U_drop_prob=0.0,
-        size_scale=False):
+        inc_gamma=0.0, soft_assign=0.0, c_sigma=0.0,
+        assign_reg_terms=('U', 'z'), size_scale=False):
     if U_lamb < 0:
       raise ValueError("Invalid U reg parameter {}".format(U_lamb))
     if z_lamb < 0:
@@ -310,13 +289,19 @@ class KSubspaceModel(_KSubspaceBaseModel):
     if inc_gamma < 0:
       raise ValueError(("Invalid incoherence reg "
           "parameter {}").format(inc_gamma))
+    if not ('z' in assign_reg_terms or z_lamb == 0):
+      raise ValueError("Assignment objective must contain z reg")
+    if size_scale and not (('U' in assign_reg_terms or U_lamb == 0) and
+          ('inc' in assign_reg_terms or inc_gamma == 0)):
+      raise ValueError("Size scaled objective is only valid when "
+          "assignment objective includes all reg terms (U, z, inc)")
 
     super(KSubspaceModel, self).__init__(k, d, D, affine, soft_assign, c_sigma,
-        U_drop_prob, size_scale)
+        size_scale)
     self.U_lamb = U_lamb
     self.z_lamb = z_lamb
     self.inc_gamma = inc_gamma
-
+    self.assign_reg_terms = assign_reg_terms
     self.reset_parameters()
     return
 
@@ -345,9 +330,9 @@ class KSubspaceModel(_KSubspaceBaseModel):
     assert(x.dim() == 2 and x.size(1) == self.D)
 
     # shape (k x d x D)
-    Uts = self.Us_drop.data.transpose(1, 2)
+    Uts = self.Us.data.transpose(1, 2)
     # (k x d x d)
-    A = torch.matmul(Uts, self.Us_drop.data)
+    A = torch.matmul(Uts, self.Us.data)
     if self.z_lamb > 0:
       # (d x d)
       lambeye = torch.eye(self.d, dtype=A.dtype, device=A.device)
@@ -372,49 +357,60 @@ class KSubspaceModel(_KSubspaceBaseModel):
 
   def reg(self):
     """Evaluate subspace regularization."""
+    regs = dict()
     # (k,)
-    # regularizer not evaluated on Us_drop
     if self.U_lamb > 0:
-      U_reg = torch.sum(self.Us.pow(2), dim=(1, 2)).mul(0.5)
-    else:
-      U_reg = torch.zeros(self.k, dtype=self.Us.dtype, device=self.Us.device)
+      regs['U'] = torch.sum(self.Us.pow(2), dim=(1, 2)).mul(self.U_lamb*0.5)
 
     # (batch_size, k)
     # does not affect gradients, only included to ensure objective value
     # is accurate
     if self.z_lamb > 0:
-      z_reg = torch.sum(self.z.data.pow(2), dim=2).mul(0.5).t()
-    else:
-      z_reg = 0.0
-    reg = self.U_lamb*U_reg + self.z_lamb*z_reg
+      regs['z'] = torch.sum(self.z.data.pow(2), dim=2).t().mul(self.z_lamb*0.5)
 
     if self.inc_gamma > 0:
-      inc_reg = self.inc_gamma*sum([torch.matmul(self.Us[ii, :].t(),
-          self.Us[jj, :]).pow(2).sum()
-          for ii in range(self.k-1) for jj in range(ii+1, self.k)])
-    else:
-      inc_reg = torch.tensor(0.0, dtype=reg.dtype, device=reg.device)
-    return reg, inc_reg
+      # testing two approaches. batched should be faster on gpu, but some
+      # wasted computation, and possibly awkward gradient computation.
+      batched = True
+      if batched:
+        # (k, k, d, d)
+        inc_reg = torch.matmul(self.Us.transpose(1, 2).unsqueeze(1),
+            self.Us.unsqueeze(0)).pow(2)
+        inc_reg = inc_reg.sum(dim=(2, 3))
+        inc_reg = inc_reg.sub(inc_reg.diag().diag())
+        inc_reg = inc_reg.sum(dim=0).mul(self.inc_gamma*0.5)
+        regs['inc'] = inc_reg
+      else:
+        regs['inc'] = torch.stack([
+            sum([torch.matmul(self.Us[ii, :].t(), self.Us[jj, :]).pow(2).sum()
+            for jj in range(self.k) if jj != ii])
+            for ii in range(self.k)]).mul(self.inc_gamma*0.5)
+    return regs
 
 
 class KSubspaceProjModel(_KSubspaceBaseModel):
   """K-subspace model where low-dim coefficients are computed by a projection
   matrix."""
 
-  def __init__(self, k, d, D, affine=False, symmetric=False, lamb=0.001,
-        inc_gamma=0.0, soft_assign=0.0, c_sigma=0.0, U_drop_prob=0.0,
+  def __init__(self, k, d, D, affine=False, symmetric=False, U_lamb=0.001,
+        inc_gamma=0.0, soft_assign=0.0, c_sigma=0.0, assign_reg_terms=('U'),
         size_scale=False):
-    if lamb < 0:
-      raise ValueError("Invalid reg parameter {}".format(lamb))
+    if U_lamb < 0:
+      raise ValueError("Invalid reg parameter {}".format(U_lamb))
     if inc_gamma < 0:
       raise ValueError(("Invalid incoherence reg "
           "parameter {}").format(inc_gamma))
+    if size_scale and not (('U' in assign_reg_terms or U_lamb == 0) and
+          ('inc' in assign_reg_terms or inc_gamma == 0)):
+      raise ValueError("Size scaled objective is only valid when "
+          "assignment objective includes all reg terms (U, inc)")
 
     super(KSubspaceProjModel, self).__init__(k, d, D, affine, soft_assign,
-        c_sigma, U_drop_prob, size_scale)
+        c_sigma, size_scale)
     self.symmetric = symmetric
-    self.lamb = lamb
+    self.U_lamb = U_lamb
     self.inc_gamma = inc_gamma
+    self.assign_reg_terms = assign_reg_terms
 
     if self.symmetric:
       self.register_parameter('Vs', None)
@@ -462,20 +458,29 @@ class KSubspaceProjModel(_KSubspaceBaseModel):
 
   def reg(self):
     """Evaluate subspace regularization."""
-    if self.lamb > 0:
+    regs = dict()
+    if self.U_lamb > 0:
       if self.symmetric:
-        reg = torch.sum(self.Us.pow(2), dim=(1, 2))
+        regs['U'] = torch.sum(self.Us.pow(2), dim=(1, 2)).mul(self.U_lamb)
       else:
-        reg = (torch.sum(self.Us.pow(2), dim=(1, 2)) +
-            torch.sum(self.Vs.pow(2), dim=(1, 2))).mul(0.5)
-      reg *= self.lamb
-    else:
-      reg = torch.zeros(self.k, dtype=self.Us.dtype, device=self.Us.device)
+        regs['U'] = (torch.sum(self.Us.pow(2), dim=(1, 2)) +
+            torch.sum(self.Vs.pow(2), dim=(1, 2))).mul(self.U_lamb*0.5)
 
     if self.inc_gamma > 0:
-      inc_reg = self.inc_gamma*sum([torch.matmul(self.Us[ii, :].t(),
-          self.Us[jj, :]).pow(2).sum()
-          for ii in range(self.k-1) for jj in range(ii+1, self.k)])
-    else:
-      inc_reg = torch.tensor(0.0, dtype=reg.dtype, device=reg.device)
-    return reg, inc_reg
+      # testing two approaches. batched should be faster on gpu, but some
+      # wasted computation, and possibly awkward gradient computation.
+      batched = True
+      if batched:
+        # (k, k, d, d)
+        inc_reg = torch.matmul(self.Us.transpose(1, 2).unsqueeze(1),
+            self.Us.unsqueeze(0)).pow(2)
+        inc_reg = inc_reg.sum(dim=(2, 3))
+        inc_reg = inc_reg.sub(inc_reg.diag().diag())
+        inc_reg = inc_reg.sum(dim=0).mul(self.inc_gamma*0.5)
+        regs['inc'] = inc_reg
+      else:
+        regs['inc'] = torch.stack([
+            sum([torch.matmul(self.Us[ii, :].t(), self.Us[jj, :]).pow(2).sum()
+            for jj in range(self.k) if jj != ii])
+            for ii in range(self.k)]).mul(self.inc_gamma*0.5)
+    return regs

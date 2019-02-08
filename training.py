@@ -35,7 +35,7 @@ def train_loop(model, data_loader, device, optimizer, out_dir=None, epochs=200,
     reset_unused: whether to reset unused clusters (default: False)
   """
   printformstr = ('(epoch {:d}/{:d}) lr={:.3e} err={:.4f} obj={:.3e} '
-      'loss={:.3e} reg={:.3e} inc={:.3e} sprs={:.2f} |x_|={:.3e} ')
+      'loss={:.3e} reg={:.3e} sprs={:.2f} |x_|={:.3e} ')
   if eval_rank:
     printformstr += 'rank(min)(max)={:.0f},{:.0f},{:.0f} '
   if reset_unused:
@@ -47,14 +47,13 @@ def train_loop(model, data_loader, device, optimizer, out_dir=None, epochs=200,
   is_logging = (not dist_mode) or (dist.get_rank() == 0)
 
   if is_logging and out_dir is not None:
-    logheader = 'Epoch,LR,Err,Obj,Loss,Reg,Inc.reg,Sprs,Norm.x_,'
+    logheader = 'Epoch,LR,Err,Obj,Loss,Reg,Sprs,Norm.x_,'
     if eval_rank:
       logheader += 'Rank.med,Rank.min,Rank.max,'
     if reset_unused:
       logheader += 'Resets,Reset.fails,'
     logheader += 'Samp.s,RT'
-    logformstr = ('{:d},{:.9e},{:.9f},{:.9e},{:.9e},{:.9e},{:.9e},'
-        '{:.9e},{:.9e},')
+    logformstr = '{:d},{:.9e},{:.9f},{:.9e},{:.9e},{:.9e},{:.9e},{:.9e},'
     if eval_rank:
       logformstr += '{:.9f},{:.0f},{:.0f},'
     if reset_unused:
@@ -169,14 +168,14 @@ def train_epoch(model, data_loader, optimizer, device, dist_mode=False,
     # opt step
     optimizer.zero_grad()
     (batch_obj, batch_scale_obj, batch_loss,
-        batch_reg, batch_inc_reg, x_) = model.objective(x)
+        batch_reg, x_) = model.objective(x)
     batch_scale_obj.backward()
     optimizer.step()
 
     batch_sprs = model.eval_sprs()
     batch_norm_x_ = model.eval_shrink(x, x_)
-    batch_metrics = (batch_obj, batch_loss, batch_reg, batch_inc_reg,
-        batch_sprs, batch_norm_x_)
+    batch_metrics = (batch_obj, batch_loss, batch_reg, batch_sprs,
+        batch_norm_x_)
 
     # eval batch cluster confusion
     batch_conf_mat = ut.eval_confusion(model.groups.data.cpu(), groups,
@@ -211,17 +210,17 @@ def train_epoch(model, data_loader, optimizer, device, dist_mode=False,
   rtime = time.time() - epoch_tic
   cluster_error, conf_mat = ut.eval_cluster_error(conf_mat.sum,
       sort_conf_mat=False)
+
   if eval_rank:
     ranks, svs = model.eval_rank()
     ranks = torch.stack(ranks).cpu().numpy()
     svs = torch.stack(svs).cpu().numpy()
     rank_stats = [np.median(ranks), ranks.min(), ranks.max()]
   else:
-    rank_stats = []
-    svs = None
+    rank_stats, svs = [], None
+
   if reset_unused:
-    reset_ids, _, reset_fails = model.reset_unused()
-    reset_stats = [len(reset_ids), reset_fails]
+    reset_stats = list(model.reset_unused())
   else:
     reset_stats = []
 
