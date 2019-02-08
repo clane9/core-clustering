@@ -205,74 +205,67 @@ class _KSubspaceBaseModel(nn.Module):
     ranks, svs = zip(*ranks_svs)
     return ranks, svs
 
-  def reset_unused(self, split_metric=None):
+  def reset_unused(self, split_metric=None, sample_p=None, reset_thr=.01,
+        split_sigma=.001):
     """Reset (nearly) unused clusters by duplicating clusters likely to contain
     >1 group. By default, choose to duplicate largest clusters.
 
     Args:
       split_metric: shape (k,) metric used to rank groups for splitting
-        (largest values chosen). (default: c_mean)
+        (largest values chosen) (default: c_mean).
+      sample_p: probability of splitting group j is proportional to
+        split_metric[j]**sample_p (default: round(log_2(k))).
+      reset_thr: size threshold for nearly empty clusters in 1/k units
+        (default: .01).
+      split_sigma: noise added to duplicate clusters, relative to basis column
+        norms (default: .001).
 
     Returns:
-      reset_count, fail_count: current reset count and previous fail count
+      reset_ids, split_ids
     """
-    # NOTE: need more principled way of setting various constants: size
-    # reduction threshold (0.95), empty cluster threshold (.01), duplication
-    # noise (.001)
     if split_metric is None:
       split_metric = self.c_mean
+    if sample_p is None:
+      # default chosen so that a cluster twice as "big" has k times prob of
+      # getting split
+      sample_p = int(np.round(np.log2(self.k)))
     if split_metric.shape != (self.k,):
       raise ValueError("Invalid splitting metric")
+    if sample_p < 0:
+      raise ValueError("Invalid sample power {}".format(sample_p))
+    if reset_thr < 0:
+      raise ValueError("Invalid reset threshold {}".format(reset_thr))
+    if split_sigma < 0:
+      raise ValueError("Invalid split noise leve {}".format(split_sigma))
 
-    if not hasattr(self, '_reset_thr'):
-      # nearly unused: <= 1% (1/k)
-      # expected value of folded gaussian distribution: sqrt(2/pi)*sigma
-      # https://en.wikipedia.org/wiki/Folded_normal_distribution
-      self._reset_thr = ((self.c_sigma/self.k)*np.sqrt(2/np.pi) + .01/self.k)
-      # for tracking split success/failure
-      self._prev_split_ids, self._prev_reset_ids = [], []
-      self._split_fail_count = torch.zeros_like(self.c_mean)
-      self._prev_c_mean = self.c_mean.clone()
-
-    reset_ids = torch.nonzero(self.c_mean <= self._reset_thr).view(-1)
+    # expected value of assignment noise (folded gaussian) is sigma*sqrt(2/pi)
+    reset_thr = ((self.c_sigma/self.k)*np.sqrt(2/np.pi) + reset_thr/self.k)
+    reset_ids = torch.nonzero(self.c_mean <= reset_thr).view(-1)
     reset_count = reset_ids.size(0)
-    fail_count = 0
     if reset_count > 0:
       # can't reset more that k/2 clusters.
       if reset_count > self.k / 2:
         reset_count = (self.k - reset_count)
         reset_ids = reset_ids[:reset_count]
 
-      # check for split failures from the last reset. i.e. did not
-      # significantly reduce cluster size. do not want to try to split these
-      # again, at least not before trying others. a bit
-      # arbitrary/unprincipled...
-      if len(self._prev_split_ids) > 0:
-        fail_thr = 0.9*self._prev_c_mean[self._prev_split_ids]
-        for prev_ids in [self._prev_split_ids, self._prev_reset_ids]:
-          fail_mask = (self.c_mean[prev_ids] >= fail_thr).type(fail_thr.dtype)
-          self._split_fail_count[prev_ids] += fail_mask
-          fail_count += fail_mask.sum().item()
+      split_metric = split_metric.pow(sample_p)
+      split_metric[reset_ids] = 0.0
+      split_ids = torch.multinomial(split_metric, reset_count)
 
-      split_metric = split_metric.sub(self._split_fail_count)
-      split_metric[reset_ids] = float('-inf')
-      split_ids = torch.argsort(split_metric, descending=True)[:reset_count]
-
-      # "split" clusters by duplicating bases with small (0.1%) perturbation
+      # "split" clusters by duplicating bases with small perturbation
       split_Us = self.Us.data[split_ids, :]
-      w = torch.randn_like(split_Us).mul_(.001/np.sqrt(self.D))
+      w = torch.randn_like(split_Us).mul_(split_sigma/np.sqrt(self.D))
       w.mul_(torch.norm(split_Us, dim=1, keepdim=True))
       self.Us.data[reset_ids, :] = split_Us + w
+      self.Us.data[split_ids, :] = split_Us - w
 
       # very important to update c_mean for split clusters when using size
       # scaled objective
-      self._prev_c_mean.copy_(self.c_mean)
       self.c_mean[split_ids] *= 0.5
       self.c_mean[reset_ids] = self.c_mean[split_ids]
-
-      self._prev_reset_ids = reset_ids
-      self._prev_split_ids = split_ids
-    return reset_count, fail_count
+    else:
+      split_ids = torch.clone(reset_ids)
+    return reset_ids.cpu().numpy(), split_ids.cpu().numpy()
 
 
 class KSubspaceModel(_KSubspaceBaseModel):

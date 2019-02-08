@@ -39,7 +39,7 @@ def train_loop(model, data_loader, device, optimizer, out_dir=None, epochs=200,
   if eval_rank:
     printformstr += 'rank(min)(max)={:.0f},{:.0f},{:.0f} '
   if reset_unused:
-    printformstr += 'resets(fails)={:d},{:.0f} '
+    printformstr += 'resets={:d} '
   printformstr += 'samp/s={:.0f} rtime={:.3f}'
 
   if dist_mode and not (dist.is_initialized()):
@@ -51,13 +51,13 @@ def train_loop(model, data_loader, device, optimizer, out_dir=None, epochs=200,
     if eval_rank:
       logheader += 'Rank.med,Rank.min,Rank.max,'
     if reset_unused:
-      logheader += 'Resets,Reset.fails,'
+      logheader += 'Resets'
     logheader += 'Samp.s,RT'
     logformstr = '{:d},{:.9e},{:.9f},{:.9e},{:.9e},{:.9e},{:.9e},{:.9e},'
     if eval_rank:
-      logformstr += '{:.9f},{:.0f},{:.0f},'
+      logformstr += '{:.9f},{:0f},{:.0f},'
     if reset_unused:
-      logformstr += '{:d},{:.0f},'
+      logformstr += '{:d},'
     logformstr += '{:.0f},{:.9f}'
     val_logf = '{}/val_log.csv'.format(out_dir)
     with open(val_logf, 'w') as f:
@@ -67,10 +67,11 @@ def train_loop(model, data_loader, device, optimizer, out_dir=None, epochs=200,
 
   conf_mats = np.zeros((epochs, model.k, data_loader.dataset.classes.size),
       dtype=np.int64)
-  if eval_rank:
-    svs = np.zeros((epochs, model.k, model.d), dtype=np.float32)
-  else:
-    svs = None
+  svs = (np.zeros((epochs, model.k, model.d), dtype=np.float32)
+      if eval_rank else None)
+  # NOTE: resets will likely be very sparse
+  resets = (np.zeros((epochs, model.k, model.k), dtype=np.int64)
+      if reset_unused else None)
 
   if scheduler is None:
     min_lr = 1e-6*ut.get_learning_rate(optimizer)
@@ -87,14 +88,15 @@ def train_loop(model, data_loader, device, optimizer, out_dir=None, epochs=200,
       if isinstance(data_loader.sampler, DistributedSampler):
         data_loader.sampler.set_epoch(epoch)
 
-      metrics, conf_mats[epoch-1, :], epoch_svs = train_epoch(model,
-          data_loader, optimizer, device, dist_mode, eval_rank,
-          reset_unused)
+      (metrics, conf_mats[epoch-1, :], epoch_svs,
+          epoch_resets) = train_epoch(model, data_loader, optimizer, device,
+              dist_mode, eval_rank, reset_unused)
       lr = ut.get_learning_rate(optimizer)
 
       if eval_rank:
-        # otherwise epoch_svs is None
         svs[epoch-1, :] = epoch_svs
+      if reset_unused:
+        resets[epoch-1, :] = epoch_resets
 
       if is_logging:
         if val_logf is not None:
@@ -150,9 +152,12 @@ def train_loop(model, data_loader, device, optimizer, out_dir=None, epochs=200,
       if eval_rank:
         with open('{}/svs.npz'.format(out_dir), 'wb') as f:
           np.savez(f, svs=svs[:epoch, :])
+      if reset_unused:
+        with open('{}/resets.npz'.format(out_dir), 'wb') as f:
+          np.savez(f, resets=resets[:epoch, :])
     if err is not None:
       raise err
-  return conf_mats, svs
+  return conf_mats, svs, resets
 
 
 def train_epoch(model, data_loader, optimizer, device, dist_mode=False,
@@ -161,6 +166,7 @@ def train_epoch(model, data_loader, optimizer, device, dist_mode=False,
   epoch_tic = time.time()
   metrics = None
   conf_mat, sampsec = [ut.AverageMeter() for _ in range(2)]
+  resets = np.zeros((model.k, model.k), dtype=np.int64)
   for x, groups in data_loader:
     tic = time.time()
     x = x.to(device)
@@ -201,6 +207,10 @@ def train_epoch(model, data_loader, optimizer, device, dist_mode=False,
       metrics[kk].update(batch_metrics[kk].item(), batch_size)
     conf_mat.update(batch_conf_mat, 1)
 
+    if reset_unused:
+      reset_ids, split_ids = model.reset_unused()
+      resets[reset_ids, split_ids] += 1
+
     batch_time = time.time() - tic
     sampsec.update(batch_size/batch_time, batch_size)
 
@@ -209,7 +219,7 @@ def train_epoch(model, data_loader, optimizer, device, dist_mode=False,
 
   rtime = time.time() - epoch_tic
   cluster_error, conf_mat = ut.eval_cluster_error(conf_mat.sum,
-      sort_conf_mat=False)
+      sort_conf_mat=True)
 
   if eval_rank:
     ranks, svs = model.eval_rank()
@@ -218,13 +228,9 @@ def train_epoch(model, data_loader, optimizer, device, dist_mode=False,
     rank_stats = [np.median(ranks), ranks.min(), ranks.max()]
   else:
     rank_stats, svs = [], None
-
-  if reset_unused:
-    reset_stats = list(model.reset_unused())
-  else:
-    reset_stats = []
+  reset_count = resets.sum() if reset_unused else 0
 
   metrics = [met.avg for met in metrics]
   metrics = ([cluster_error] + metrics +
-      rank_stats + reset_stats + [sampsec.avg, rtime])
-  return metrics, conf_mat, svs
+      rank_stats + [reset_count] + [sampsec.avg, rtime])
+  return metrics, conf_mat, svs, resets
