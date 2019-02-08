@@ -53,13 +53,14 @@ def eval_cluster_error(*args, **kwargs):
   """Evaluate clustering error.
 
   Examples:
-    cluster_error = eval_cluster_error(conf_mat)
-    cluster_error = eval_cluster_error(groups, true_groups)
+    cluster_error, conf_mat = eval_cluster_error(conf_mat)
+    cluster_error, conf_mat = eval_cluster_error(groups, true_groups)
 
   Args:
     conf_mat: (n, n) group confusion matrix
     groups: (N,) group assignment
     true_groups: (N,) true group assignment
+    sort_conf_mat: (bool) return sorted confusion matrix sort confusion matrix.
   """
   if len(args) not in (1, 2):
     raise ValueError("Invalid number of arguments")
@@ -84,13 +85,14 @@ def eval_cluster_error(*args, **kwargs):
   cluster_error = 1.0 - correct/N
 
   # re-order conf_mat
-  if row_ind.size < conf_mat.shape[0]:
-    row_ind = np.concatenate([row_ind,
-      np.setdiff1d(np.arange(conf_mat.shape[0]), row_ind)])
-  if col_ind.size < conf_mat.shape[1]:
-    col_ind = np.concatenate([col_ind,
-      np.setdiff1d(np.arange(conf_mat.shape[1]), col_ind)])
-  conf_mat = conf_mat[row_ind, :][:, col_ind]
+  if 'sort_conf_mat' in kwargs and kwargs['sort_conf_mat']:
+    if row_ind.size < conf_mat.shape[0]:
+      row_ind = np.concatenate([row_ind,
+        np.setdiff1d(np.arange(conf_mat.shape[0]), row_ind)])
+    if col_ind.size < conf_mat.shape[1]:
+      col_ind = np.concatenate([col_ind,
+        np.setdiff1d(np.arange(conf_mat.shape[1]), col_ind)])
+    conf_mat = conf_mat[row_ind, :][:, col_ind]
   return cluster_error, conf_mat
 
 

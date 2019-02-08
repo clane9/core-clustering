@@ -16,7 +16,7 @@ import utils as ut
 
 def train_loop(model, data_loader, device, optimizer, out_dir=None, epochs=200,
       chkp_freq=50, stop_freq=-1, scheduler=None, dist_mode=False,
-      eval_rank=False):
+      eval_rank=False, reset_unused=False):
   """Train k-subspace model for series of epochs.
 
   Args:
@@ -32,11 +32,14 @@ def train_loop(model, data_loader, device, optimizer, out_dir=None, epochs=200,
     dist_mode: whether doing distributed training (default: False)
     eval_rank: evaluate ranks of group models, only implemented for subspace
       models (default: False)
+    reset_unused: whether to reset unused clusters (default: False)
   """
   printformstr = ('(epoch {:d}/{:d}) lr={:.3e} err={:.4f} obj={:.3e} '
-      'loss={:.3e} reg={:.3e} sprs={:.2f} |x_|={:.3e} ')
+      'loss={:.3e} reg={:.3e} inc={:.3e} sprs={:.2f} |x_|={:.3e} ')
   if eval_rank:
     printformstr += 'rank(min)(max)={:.0f},{:.0f},{:.0f} '
+  if reset_unused:
+    printformstr += 'resets(fails)={:d},{:.0f} '
   printformstr += 'samp/s={:.0f} rtime={:.3f}'
 
   if dist_mode and not (dist.is_initialized()):
@@ -44,13 +47,18 @@ def train_loop(model, data_loader, device, optimizer, out_dir=None, epochs=200,
   is_logging = (not dist_mode) or (dist.get_rank() == 0)
 
   if is_logging and out_dir is not None:
-    logheader = 'Epoch,LR,Err,Obj,Loss,Reg,Sprs,Norm.x_,'
+    logheader = 'Epoch,LR,Err,Obj,Loss,Reg,Inc.reg,Sprs,Norm.x_,'
     if eval_rank:
       logheader += 'Rank.med,Rank.min,Rank.max,'
+    if reset_unused:
+      logheader += 'Resets,Reset.fails,'
     logheader += 'Samp.s,RT'
-    logformstr = '{:d},{:.9e},{:.9f},{:.9e},{:.9e},{:.9e},{:.9e},{:.9e},'
+    logformstr = ('{:d},{:.9e},{:.9f},{:.9e},{:.9e},{:.9e},{:.9e},'
+        '{:.9e},{:.9e},')
     if eval_rank:
       logformstr += '{:.9f},{:.0f},{:.0f},'
+    if reset_unused:
+      logformstr += '{:d},{:.0f},'
     logformstr += '{:.0f},{:.9f}'
     val_logf = '{}/val_log.csv'.format(out_dir)
     with open(val_logf, 'w') as f:
@@ -81,7 +89,8 @@ def train_loop(model, data_loader, device, optimizer, out_dir=None, epochs=200,
         data_loader.sampler.set_epoch(epoch)
 
       metrics, conf_mats[epoch-1, :], epoch_svs = train_epoch(model,
-          data_loader, optimizer, device, dist_mode, eval_rank)
+          data_loader, optimizer, device, dist_mode, eval_rank,
+          reset_unused)
       lr = ut.get_learning_rate(optimizer)
 
       if eval_rank:
@@ -148,11 +157,11 @@ def train_loop(model, data_loader, device, optimizer, out_dir=None, epochs=200,
 
 
 def train_epoch(model, data_loader, optimizer, device, dist_mode=False,
-      eval_rank=False):
+      eval_rank=False, reset_unused=False):
   """train model for one epoch and record convergence measures."""
-  metrics = None
-  conf_mat, sampsec = ut.AverageMeter(), ut.AverageMeter()
   epoch_tic = time.time()
+  metrics = None
+  conf_mat, sampsec = [ut.AverageMeter() for _ in range(2)]
   for x, groups in data_loader:
     tic = time.time()
     x = x.to(device)
@@ -160,14 +169,14 @@ def train_epoch(model, data_loader, optimizer, device, dist_mode=False,
     # opt step
     optimizer.zero_grad()
     (batch_obj, batch_scale_obj, batch_loss,
-        batch_reg, x_) = model.objective(x)
+        batch_reg, batch_inc_reg, x_) = model.objective(x)
     batch_scale_obj.backward()
     optimizer.step()
 
     batch_sprs = model.eval_sprs()
     batch_norm_x_ = model.eval_shrink(x, x_)
-    batch_metrics = (batch_obj, batch_loss, batch_reg, batch_sprs,
-        batch_norm_x_)
+    batch_metrics = (batch_obj, batch_loss, batch_reg, batch_inc_reg,
+        batch_sprs, batch_norm_x_)
 
     # eval batch cluster confusion
     batch_conf_mat = ut.eval_confusion(model.groups.data.cpu(), groups,
@@ -200,7 +209,8 @@ def train_epoch(model, data_loader, optimizer, device, dist_mode=False,
       raise RuntimeError('Divergence! NaN objective.')
 
   rtime = time.time() - epoch_tic
-  cluster_error, conf_mat = ut.eval_cluster_error(conf_mat.sum)
+  cluster_error, conf_mat = ut.eval_cluster_error(conf_mat.sum,
+      sort_conf_mat=False)
   if eval_rank:
     ranks, svs = model.eval_rank()
     ranks = torch.stack(ranks).cpu().numpy()
@@ -209,6 +219,13 @@ def train_epoch(model, data_loader, optimizer, device, dist_mode=False,
   else:
     rank_stats = []
     svs = None
+  if reset_unused:
+    reset_ids, _, reset_fails = model.reset_unused()
+    reset_stats = [len(reset_ids), reset_fails]
+  else:
+    reset_stats = []
+
   metrics = [met.avg for met in metrics]
-  metrics = [cluster_error] + metrics + rank_stats + [sampsec.avg, rtime]
+  metrics = ([cluster_error] + metrics +
+      rank_stats + reset_stats + [sampsec.avg, rtime])
   return metrics, conf_mat, svs

@@ -57,8 +57,6 @@ def main():
   kwargs = {'num_workers': args.num_workers}
   if use_cuda:
     kwargs['pin_memory'] = True
-  if args.batch_size <= 0 or args.batch_size > args.N:
-    raise ValueError("Invalid batch size")
   synth_data_loader = DataLoader(synth_dataset, batch_size=args.batch_size,
       shuffle=False, drop_last=True, **kwargs)
 
@@ -67,14 +65,19 @@ def main():
   model_d = args.model_d
   if model_d is None or model_d <= 0:
     model_d = args.d
+  model_n = args.model_n
+  if model_n is None or model_n <= 0:
+    model_n = args.n
   if args.proj_form:
-    model = mod.KSubspaceProjModel(args.n, model_d, args.D, args.affine,
-        args.symmetric, lamb=args.lamb, soft_assign=args.soft_assign,
-        c_sigma=args.c_sigma, size_scale=args.size_scale)
+    model = mod.KSubspaceProjModel(model_n, model_d, args.D, args.affine,
+        args.symmetric, lamb=args.lamb, inc_gamma=args.inc_gamma,
+        soft_assign=args.soft_assign, c_sigma=args.c_sigma,
+        U_drop_prob=args.drop_prob, size_scale=args.size_scale)
   else:
-    model = mod.KSubspaceModel(args.n, model_d, args.D, args.affine,
-        U_lamb=args.lamb, z_lamb=args.z_lamb, soft_assign=args.soft_assign,
-        c_sigma=args.c_sigma, size_scale=args.size_scale)
+    model = mod.KSubspaceModel(model_n, model_d, args.D, args.affine,
+        U_lamb=args.lamb, z_lamb=args.z_lamb, inc_gamma=args.inc_gamma,
+        soft_assign=args.soft_assign, c_sigma=args.c_sigma,
+        U_drop_prob=args.drop_prob, size_scale=args.size_scale)
   model = model.to(device)
   if args.dist:
     if use_cuda:
@@ -95,7 +98,8 @@ def main():
     stop_freq = -1
   tr.train_loop(model, synth_data_loader, device, optimizer,
       args.out_dir, args.epochs, chkp_freq, stop_freq, scheduler=None,
-      dist_mode=args.dist, eval_rank=args.eval_rank)
+      dist_mode=args.dist, eval_rank=args.eval_rank,
+      reset_unused=args.reset_unused)
   return
 
 
@@ -121,6 +125,8 @@ if __name__ == '__main__':
   # model settings
   parser.add_argument('--proj-form', action='store_true', default=False,
                       help='Use projection matrix formulation')
+  parser.add_argument('--model-n', type=int, default=None,
+                      help='Model number of subspaces [default: n]')
   parser.add_argument('--model-d', type=int, default=None,
                       help='Model subspace dimension [default: d]')
   parser.add_argument('--symmetric', action='store_true',
@@ -129,6 +135,10 @@ if __name__ == '__main__':
                       help='Subspace reg parameter [default: 1e-4]')
   parser.add_argument('--z-lamb', type=float, default=0.1,
                       help='Coefficient reg parameter [default: 0.1]')
+  parser.add_argument('--inc-gamma', type=float, default=0.0,
+                      help='Incoherence reg parameter [default: 0.0]')
+  parser.add_argument('--drop-prob', type=float, default=0.0,
+                      help='Basis column dropout probability [default: 0.0]')
   parser.add_argument('--soft-assign', type=float, default=0.1,
                       help='Soft assignment parameter [default: 0.1]')
   parser.add_argument('--c-sigma', type=float, default=0.01,
@@ -147,6 +157,8 @@ if __name__ == '__main__':
                       help='Initial learning rate [default: 0.9]')
   parser.add_argument('--nesterov', action='store_true', default=False,
                       help='Use nesterov form of acceleration')
+  parser.add_argument('--reset-unused', action='store_true', default=False,
+                      help='Whether to reset unused clusters [default: None]')
   parser.add_argument('--dist', action='store_true', default=False,
                       help='Enables distributed training')
   parser.add_argument('--cuda', action='store_true', default=False,
