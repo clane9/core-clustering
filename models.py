@@ -89,7 +89,7 @@ class _KSubspaceBaseModel(nn.Module):
 
     # x_ = U z + b
     # shape (k, batch_size, D)
-    x_ = torch.matmul(self.Us, z.transpose(1, 2)).transpose(1, 2)
+    x_ = torch.matmul(z, self.Us.transpose(1, 2))
     if self.affine:
       x_ = x_.add(self.bs.unsqueeze(1))
     return x_
@@ -199,9 +199,11 @@ class _KSubspaceBaseModel(nn.Module):
     norm_x_ = torch.mean(norm_x_ / (norm_x + 1e-8))
     return norm_x_
 
-  def eval_rank(self, tol=.001):
+  def eval_rank(self, tol=.001, cpu=True):
     """Compute rank and singular values of subspace bases."""
-    ranks_svs = [ut.rank(self.Us.data[ii, :, :], tol) for ii in range(self.k)]
+    # svd is ~1000x faster on cpu for small matrices (100 x 10).
+    Us = self.Us.data.cpu() if cpu else self.Us.data
+    ranks_svs = [ut.rank(Us[ii, :], tol) for ii in range(self.k)]
     ranks, svs = zip(*ranks_svs)
     return ranks, svs
 
@@ -408,7 +410,7 @@ class KSubspaceProjModel(_KSubspaceBaseModel):
     if self.symmetric:
       self.register_parameter('Vs', None)
     else:
-      self.Vs = nn.Parameter(torch.Tensor(k, d, D))
+      self.Vs = nn.Parameter(torch.Tensor(k, D, d))
     self.reset_parameters()
     return
 
@@ -443,10 +445,9 @@ class KSubspaceProjModel(_KSubspaceBaseModel):
       x = x.unsqueeze(0)
     if self.symmetric:
       # shape (k, batch_size, d)
-      z = torch.matmul(self.Us.transpose(1, 2),
-          x.transpose(1, 2)).transpose(1, 2)
+      z = torch.matmul(x, self.Us)
     else:
-      z = torch.matmul(self.Vs, x.transpose(1, 2)).transpose(1, 2)
+      z = torch.matmul(x, self.Vs)
     return z
 
   def reg(self):

@@ -39,7 +39,7 @@ def main():
       pickle.dump(args, f)
 
   device = torch.device('cuda' if use_cuda else 'cpu')
-  if use_cuda:
+  if args.dist and use_cuda:
     cuda_devices = map(int, os.environ['CUDA_VISIBLE_DEVICES'].split(','))
     if len(cuda_devices) != dist.get_world_size():
       raise RuntimeError("Visible cuda devices must equal world size")
