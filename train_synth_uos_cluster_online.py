@@ -90,15 +90,13 @@ def main():
   optimizer = torch.optim.SGD(model.parameters(), lr=args.init_lr,
       momentum=args.momentum, nesterov=args.nesterov)
 
-  chkp_freq = args.chkp_freq
-  if chkp_freq is None or chkp_freq <= 0:
-    chkp_freq = args.epochs
-  stop_freq = args.stop_freq
-  if stop_freq is None or stop_freq <= 0:
-    stop_freq = -1
+  if args.chkp_freq is None or args.chkp_freq <= 0:
+    args.chkp_freq = args.epochs
+  if args.stop_freq is None or args.stop_freq <= 0:
+    args.stop_freq = -1
   tr.train_loop(model, synth_data_loader, device, optimizer,
-      args.out_dir, args.epochs, chkp_freq, stop_freq, scheduler=None,
-      dist_mode=args.dist, eval_rank=args.eval_rank,
+      args.out_dir, args.epochs, args.chkp_freq, args.stop_freq,
+      scheduler=None, dist_mode=args.dist, eval_rank=args.eval_rank,
       reset_unused=args.reset_unused)
   return
 
@@ -155,7 +153,7 @@ if __name__ == '__main__':
   parser.add_argument('--init-lr', type=float, default=0.5,
                       help='Initial learning rate [default: 0.5]')
   parser.add_argument('--momentum', type=float, default=0.9,
-                      help='Initial learning rate [default: 0.9]')
+                      help='Momentum acceleration parameter [default: 0.9]')
   parser.add_argument('--nesterov', action='store_true', default=False,
                       help='Use nesterov form of acceleration')
   parser.add_argument('--reset-unused', action='store_true', default=False,

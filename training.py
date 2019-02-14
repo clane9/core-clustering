@@ -38,9 +38,7 @@ def train_loop(model, data_loader, device, optimizer, out_dir=None, epochs=200,
       'loss={:.3e} reg={:.3e} sprs={:.2f} |x_|={:.3e} ')
   if eval_rank:
     printformstr += 'rank(min)(max)={:.0f},{:.0f},{:.0f} '
-  if reset_unused:
-    printformstr += 'resets={:d} '
-  printformstr += 'samp/s={:.0f} rtime={:.3f}'
+  printformstr += 'resets={:d} samp/s={:.0f} rtime={:.3f}'
 
   if dist_mode and not (dist.is_initialized()):
     raise RuntimeError("Distributed package not initialized")
@@ -50,15 +48,11 @@ def train_loop(model, data_loader, device, optimizer, out_dir=None, epochs=200,
     logheader = 'Epoch,LR,Err,Obj,Loss,Reg,Sprs,Norm.x_,'
     if eval_rank:
       logheader += 'Rank.med,Rank.min,Rank.max,'
-    if reset_unused:
-      logheader += 'Resets'
-    logheader += 'Samp.s,RT'
+    logheader += 'Resets,Samp.s,RT'
     logformstr = '{:d},{:.9e},{:.9f},{:.9e},{:.9e},{:.9e},{:.9e},{:.9e},'
     if eval_rank:
-      logformstr += '{:.9f},{:0f},{:.0f},'
-    if reset_unused:
-      logformstr += '{:d},'
-    logformstr += '{:.0f},{:.9f}'
+      logformstr += '{:.9f},{:.0f},{:.0f},'
+    logformstr += '{:d},{:.0f},{:.9f}'
     val_logf = '{}/val_log.csv'.format(out_dir)
     with open(val_logf, 'w') as f:
       print(logheader, file=f)

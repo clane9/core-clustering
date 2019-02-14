@@ -40,7 +40,7 @@ def main():
       pickle.dump(args, f)
 
   device = torch.device('cuda' if use_cuda else 'cpu')
-  if use_cuda:
+  if args.dist and use_cuda:
     cuda_devices = map(int, os.environ['CUDA_VISIBLE_DEVICES'].split(','))
     if len(cuda_devices) != dist.get_world_size():
       raise RuntimeError("Visible cuda devices must equal world size")
@@ -56,24 +56,30 @@ def main():
   if args.dist:
     sampler = DistributedSampler(synth_dataset, dist.get_world_size(),
         dist.get_rank())
+    synth_data_loader = DataLoader(synth_dataset, batch_size=args.batch_size,
+        sampler=sampler, drop_last=True, **kwargs)
   else:
-    sampler = DistributedSampler(synth_dataset, 1, 0)
-  synth_data_loader = DataLoader(synth_dataset, batch_size=args.batch_size,
-      sampler=sampler, drop_last=True, **kwargs)
+    synth_data_loader = DataLoader(synth_dataset, batch_size=args.batch_size,
+        shuffle=True, drop_last=True, **kwargs)
 
   # construct model
   torch.manual_seed(args.seed)
-  model_d = args.model_d
-  if model_d is None or model_d <= 0:
-    model_d = args.d
+  if args.model_d is None or args.model_d <= 0:
+    args.model_d = args.d
+  if args.model_n is None or args.model_n <= 0:
+    args.model_n = args.n
+  args.assign_reg_terms = args.assign_reg_terms.split(',')
   if args.proj_form:
-    model = mod.KSubspaceProjModel(args.n, model_d, args.D, args.affine,
-        args.symmetric, lamb=args.lamb, soft_assign=args.soft_assign,
-        c_sigma=args.c_sigma, size_scale=args.size_scale)
+    model = mod.KSubspaceProjModel(args.model_n, args.model_d, args.D,
+        args.affine, args.symmetric, U_lamb=args.U_lamb,
+        inc_gamma=args.inc_gamma, soft_assign=args.soft_assign,
+        c_sigma=args.c_sigma, assign_reg_terms=args.assign_reg_terms,
+        size_scale=args.size_scale)
   else:
-    model = mod.KSubspaceModel(args.n, model_d, args.D, args.affine,
-        U_lamb=args.lamb, z_lamb=args.z_lamb, soft_assign=args.soft_assign,
-        c_sigma=args.c_sigma, size_scale=args.size_scale)
+    model = mod.KSubspaceModel(args.model_n, args.model_d, args.D, args.affine,
+        U_lamb=args.U_lamb, z_lamb=args.z_lamb, inc_gamma=args.inc_gamma,
+        soft_assign=args.soft_assign, c_sigma=args.c_sigma,
+        assign_reg_terms=args.assign_reg_terms, size_scale=args.size_scale)
   model = model.to(device)
   if args.dist:
     if use_cuda:
@@ -86,15 +92,14 @@ def main():
   optimizer = torch.optim.SGD(model.parameters(), lr=args.init_lr,
       momentum=args.momentum, nesterov=args.nesterov)
 
-  chkp_freq = args.chkp_freq
-  if chkp_freq is None or chkp_freq <= 0:
-    chkp_freq = args.epochs
-  stop_freq = args.stop_freq
-  if stop_freq is None or stop_freq <= 0:
-    stop_freq = -1
+  if args.chkp_freq is None or args.chkp_freq <= 0:
+    args.chkp_freq = args.epochs
+  if args.stop_freq is None or args.stop_freq <= 0:
+    args.stop_freq = -1
   tr.train_loop(model, synth_data_loader, device, optimizer,
-      args.out_dir, args.epochs, chkp_freq, stop_freq, scheduler=None,
-      dist_mode=args.dist, eval_rank=args.eval_rank)
+      args.out_dir, args.epochs, args.chkp_freq, args.stop_freq,
+      scheduler=None, dist_mode=args.dist, eval_rank=args.eval_rank,
+      reset_unused=args.reset_unused)
   return
 
 
@@ -120,18 +125,25 @@ if __name__ == '__main__':
   # model settings
   parser.add_argument('--proj-form', action='store_true', default=False,
                       help='Use projection matrix formulation')
+  parser.add_argument('--model-n', type=int, default=None,
+                      help='Model number of subspaces [default: n]')
   parser.add_argument('--model-d', type=int, default=None,
                       help='Model subspace dimension [default: d]')
   parser.add_argument('--symmetric', action='store_true',
                       help='Projection matrix is U^T')
-  parser.add_argument('--lamb', type=float, default=1e-4,
+  parser.add_argument('--U-lamb', type=float, default=1e-4,
                       help='Subspace reg parameter [default: 1e-4]')
   parser.add_argument('--z-lamb', type=float, default=0.1,
                       help='Coefficient reg parameter [default: 0.1]')
+  parser.add_argument('--inc-gamma', type=float, default=0.0,
+                      help='Incoherence reg parameter [default: 0.0]')
   parser.add_argument('--soft-assign', type=float, default=0.1,
                       help='Soft assignment parameter [default: 0.1]')
   parser.add_argument('--c-sigma', type=float, default=0.01,
                       help='Assignment noise parameter [default: 0.01]')
+  parser.add_argument('--assign-reg-terms', type=str, default='U,z',
+                      help=('Assignment reg terms, subset of U,z,inc '
+                          '[default: U,z]'))
   parser.add_argument('--size-scale', action='store_true',
                       help=('Scale gradients to compensate for cluster '
                           'size imbalance'))
@@ -146,6 +158,8 @@ if __name__ == '__main__':
                       help='Momentum acceleration parameter [default: 0.9]')
   parser.add_argument('--nesterov', action='store_true', default=False,
                       help='Use nesterov form of acceleration')
+  parser.add_argument('--reset-unused', action='store_true', default=False,
+                      help='Whether to reset unused clusters [default: None]')
   parser.add_argument('--dist', action='store_true', default=False,
                       help='Enables distributed training')
   parser.add_argument('--cuda', action='store_true', default=False,

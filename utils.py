@@ -71,7 +71,9 @@ def eval_cluster_error(*args, **kwargs):
     groups = args[0]
     true_groups = args[1]
     # number of groups and labels will be inferred from groups and true_groups.
-    conf_mat = eval_confusion(groups, true_groups)
+    conf_mat = eval_confusion(groups, true_groups,
+        k=kwargs.get('k', None), true_k=kwargs.get('true_k', None),
+        true_classes=kwargs.get('true_classes', None))
 
   if torch.is_tensor(conf_mat):
     conf_mat = conf_mat.numpy()

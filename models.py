@@ -237,8 +237,8 @@ class _KSubspaceBaseModel(nn.Module):
       raise ValueError("Invalid sample power {}".format(sample_p))
     if reset_thr < 0:
       raise ValueError("Invalid reset threshold {}".format(reset_thr))
-    if split_sigma < 0:
-      raise ValueError("Invalid split noise leve {}".format(split_sigma))
+    if split_sigma <= 0:
+      raise ValueError("Invalid split noise level {}".format(split_sigma))
 
     # expected value of assignment noise (folded gaussian) is sigma*sqrt(2/pi)
     reset_thr = ((self.c_sigma/self.k)*np.sqrt(2/np.pi) + reset_thr/self.k)
