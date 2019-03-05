@@ -4,6 +4,7 @@ from __future__ import division
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 import utils as ut
 
@@ -199,7 +200,7 @@ class _KSubspaceBaseModel(nn.Module):
     norm_x_ = torch.mean(norm_x_ / (norm_x + 1e-8))
     return norm_x_
 
-  def eval_rank(self, tol=.001, cpu=True):
+  def eval_rank(self, tol=.01, cpu=True):
     """Compute rank and singular values of subspace bases."""
     # svd is ~1000x faster on cpu for small matrices (100 x 10).
     Us = self.Us.data.cpu() if cpu else self.Us.data
@@ -208,7 +209,7 @@ class _KSubspaceBaseModel(nn.Module):
     return ranks, svs
 
   def reset_unused(self, split_metric=None, sample_p=None, reset_thr=.01,
-        split_sigma=.001):
+        split_sigma=.1):
     """Reset (nearly) unused clusters by duplicating clusters likely to contain
     >1 group. By default, choose to duplicate largest clusters.
 
@@ -216,11 +217,12 @@ class _KSubspaceBaseModel(nn.Module):
       split_metric: shape (k,) metric used to rank groups for splitting
         (largest values chosen) (default: c_mean).
       sample_p: probability of splitting group j is proportional to
-        split_metric[j]**sample_p (default: round(log_2(k))).
+        split_metric[j]**sample_p. Default chosen so that a cluster twice as
+        "bad" will be selected with at least 50% prob (default: ceil(log2(k))).
       reset_thr: size threshold for nearly empty clusters in 1/k units
         (default: .01).
       split_sigma: noise added to duplicate clusters, relative to basis column
-        norms (default: .001).
+        norms (default: .1).
 
     Returns:
       reset_ids, split_ids
@@ -228,10 +230,11 @@ class _KSubspaceBaseModel(nn.Module):
     if split_metric is None:
       split_metric = self.c_mean
     if sample_p is None:
-      # default chosen so that a cluster twice as "big" has k times prob of
-      # getting split
-      sample_p = int(np.round(np.log2(self.k)))
-    if split_metric.shape != (self.k,):
+      sample_p = np.log2(self.k)
+    if sample_p < 0:
+      raise ValueError("Invalid sample_p {}".format(sample_p))
+    sample_p = int(np.ceil(sample_p))
+    if split_metric.shape != (self.k,) or split_metric.min() < 0:
       raise ValueError("Invalid splitting metric")
     if sample_p < 0:
       raise ValueError("Invalid sample power {}".format(sample_p))
@@ -260,14 +263,21 @@ class _KSubspaceBaseModel(nn.Module):
       w.mul_(torch.norm(split_Us, dim=1, keepdim=True))
       self.Us.data[reset_ids, :] = split_Us + w
       self.Us.data[split_ids, :] = split_Us - w
+      if self.affine:
+        self.bs[reset_ids, :] = self.bs[split_ids, :]
 
       # very important to update c_mean for split clusters when using size
       # scaled objective
       self.c_mean[split_ids] *= 0.5
       self.c_mean[reset_ids] = self.c_mean[split_ids]
+
+      split_ranks = split_metric.argsort(descending=True).argsort()[split_ids]
     else:
-      split_ids = torch.clone(reset_ids)
-    return reset_ids.cpu().numpy(), split_ids.cpu().numpy()
+      split_ids = torch.zeros_like(reset_ids)
+      split_ranks = torch.zeros_like(reset_ids)
+
+    return (reset_ids.cpu().numpy(), split_ids.cpu().numpy(),
+        split_ranks.cpu().numpy())
 
 
 class KSubspaceModel(_KSubspaceBaseModel):
@@ -275,27 +285,31 @@ class KSubspaceModel(_KSubspaceBaseModel):
   form."""
 
   def __init__(self, k, d, D, affine=False, U_lamb=0.001, z_lamb=0.1,
-        inc_gamma=0.0, soft_assign=0.0, c_sigma=0.0,
+        coh_gamma=0.0, coh_margin=0.75, soft_assign=0.0, c_sigma=0.0,
         assign_reg_terms=('U', 'z'), size_scale=False):
     if U_lamb < 0:
       raise ValueError("Invalid U reg parameter {}".format(U_lamb))
     if z_lamb < 0:
       raise ValueError("Invalid z reg parameter {}".format(z_lamb))
-    if inc_gamma < 0:
-      raise ValueError(("Invalid incoherence reg "
-          "parameter {}").format(inc_gamma))
+    if coh_gamma < 0:
+      raise ValueError(("Invalid coherence reg "
+          "parameter {}").format(coh_gamma))
+    if coh_gamma > 0 and coh_margin < 0:
+      raise ValueError(("Invalid coherence margin "
+          "parameter {}").format(coh_margin))
     if not ('z' in assign_reg_terms or z_lamb == 0):
       raise ValueError("Assignment objective must contain z reg")
     if size_scale and not (('U' in assign_reg_terms or U_lamb == 0) and
-          ('inc' in assign_reg_terms or inc_gamma == 0)):
+          ('coh' in assign_reg_terms or coh_gamma == 0)):
       raise ValueError("Size scaled objective is only valid when "
-          "assignment objective includes all reg terms (U, z, inc)")
+          "assignment objective includes all reg terms (U, z, coh)")
 
     super(KSubspaceModel, self).__init__(k, d, D, affine, soft_assign, c_sigma,
         size_scale)
     self.U_lamb = U_lamb
     self.z_lamb = z_lamb
-    self.inc_gamma = inc_gamma
+    self.coh_gamma = coh_gamma
+    self.coh_margin = coh_margin
     self.assign_reg_terms = assign_reg_terms
     self.reset_parameters()
     return
@@ -363,23 +377,19 @@ class KSubspaceModel(_KSubspaceBaseModel):
     if self.z_lamb > 0:
       regs['z'] = torch.sum(self.z.data.pow(2), dim=2).t().mul(self.z_lamb*0.5)
 
-    if self.inc_gamma > 0:
-      # testing two approaches. batched should be faster on gpu, but some
-      # wasted computation, and possibly awkward gradient computation.
-      batched = True
-      if batched:
-        # (k, k, d, d)
-        inc_reg = torch.matmul(self.Us.transpose(1, 2).unsqueeze(1),
-            self.Us.unsqueeze(0)).pow(2)
-        inc_reg = inc_reg.sum(dim=(2, 3))
-        inc_reg = inc_reg.sub(inc_reg.diag().diag())
-        inc_reg = inc_reg.sum(dim=0).mul(self.inc_gamma*0.5)
-        regs['inc'] = inc_reg
-      else:
-        regs['inc'] = torch.stack([
-            sum([torch.matmul(self.Us[ii, :].t(), self.Us[jj, :]).pow(2).sum()
-            for jj in range(self.k) if jj != ii])
-            for ii in range(self.k)]).mul(self.inc_gamma*0.5)
+    if self.coh_gamma > 0:
+      unitUs = self.Us.div(
+          torch.norm(self.Us, p=2, dim=1, keepdim=True).add(EPS))
+      # coherence (sum of squared cosine angles) between subspace bases,
+      # normalized by "self-coherence".
+      # (k, k)
+      coh = torch.matmul(unitUs.transpose(1, 2).unsqueeze(1),
+          unitUs.unsqueeze(0)).pow(2).sum(dim=(2, 3))
+      coh = coh.div(coh.diag().view(-1, 1))
+      # soft-threshold to incur no penalty if bases sufficiently incoherent
+      coh = F.relu(coh - self.coh_margin)
+      regs['coh'] = coh.sum(dim=1).sub(coh.diag()).mul(
+          self.coh_gamma/(self.k-1))
     return regs
 
 
@@ -388,23 +398,27 @@ class KSubspaceProjModel(_KSubspaceBaseModel):
   matrix."""
 
   def __init__(self, k, d, D, affine=False, symmetric=False, U_lamb=0.001,
-        inc_gamma=0.0, soft_assign=0.0, c_sigma=0.0, assign_reg_terms=('U'),
-        size_scale=False):
+        coh_gamma=0.0, coh_margin=0.75, soft_assign=0.0, c_sigma=0.0,
+        assign_reg_terms=('U'), size_scale=False):
     if U_lamb < 0:
       raise ValueError("Invalid reg parameter {}".format(U_lamb))
-    if inc_gamma < 0:
-      raise ValueError(("Invalid incoherence reg "
-          "parameter {}").format(inc_gamma))
+    if coh_gamma < 0:
+      raise ValueError(("Invalid coherence reg "
+          "parameter {}").format(coh_gamma))
+    if coh_gamma > 0 and coh_margin < 0:
+      raise ValueError(("Invalid coherence margin "
+          "parameter {}").format(coh_margin))
     if size_scale and not (('U' in assign_reg_terms or U_lamb == 0) and
-          ('inc' in assign_reg_terms or inc_gamma == 0)):
+          ('coh' in assign_reg_terms or coh_gamma == 0)):
       raise ValueError("Size scaled objective is only valid when "
-          "assignment objective includes all reg terms (U, inc)")
+          "assignment objective includes all reg terms (U, coh)")
 
     super(KSubspaceProjModel, self).__init__(k, d, D, affine, soft_assign,
         c_sigma, size_scale)
     self.symmetric = symmetric
     self.U_lamb = U_lamb
-    self.inc_gamma = inc_gamma
+    self.coh_gamma = coh_gamma
+    self.coh_margin = coh_margin
     self.assign_reg_terms = assign_reg_terms
 
     if self.symmetric:
@@ -460,21 +474,17 @@ class KSubspaceProjModel(_KSubspaceBaseModel):
         regs['U'] = (torch.sum(self.Us.pow(2), dim=(1, 2)) +
             torch.sum(self.Vs.pow(2), dim=(1, 2))).mul(self.U_lamb*0.5)
 
-    if self.inc_gamma > 0:
-      # testing two approaches. batched should be faster on gpu, but some
-      # wasted computation, and possibly awkward gradient computation.
-      batched = True
-      if batched:
-        # (k, k, d, d)
-        inc_reg = torch.matmul(self.Us.transpose(1, 2).unsqueeze(1),
-            self.Us.unsqueeze(0)).pow(2)
-        inc_reg = inc_reg.sum(dim=(2, 3))
-        inc_reg = inc_reg.sub(inc_reg.diag().diag())
-        inc_reg = inc_reg.sum(dim=0).mul(self.inc_gamma*0.5)
-        regs['inc'] = inc_reg
-      else:
-        regs['inc'] = torch.stack([
-            sum([torch.matmul(self.Us[ii, :].t(), self.Us[jj, :]).pow(2).sum()
-            for jj in range(self.k) if jj != ii])
-            for ii in range(self.k)]).mul(self.inc_gamma*0.5)
+    if self.coh_gamma > 0:
+      unitUs = self.Us.div(
+          torch.norm(self.Us, p=2, dim=1, keepdim=True).add(EPS))
+      # coherence (sum of squared cosine angles) between subspace bases,
+      # normalized by "self-coherence".
+      # (k, k)
+      coh = torch.matmul(unitUs.transpose(1, 2).unsqueeze(1),
+          unitUs.unsqueeze(0)).pow(2).sum(dim=(2, 3))
+      coh = coh.div(coh.diag().view(-1, 1))
+      # soft-threshold to incur no penalty if bases sufficiently incoherent
+      coh = F.relu(coh - self.coh_margin)
+      regs['coh'] = coh.sum(dim=1).sub(coh.diag()).mul(
+          self.coh_gamma/(self.k-1))
     return regs

@@ -6,6 +6,8 @@ import shutil
 import torch
 from scipy.optimize import linear_sum_assignment
 
+EPS = 1e-8
+
 
 class AverageMeter(object):
   """Computes and stores the average and current value.
@@ -167,3 +169,21 @@ def find_soft_assign(losses, T=1.):
   c = torch.clamp(T + 1. - losses, min=0.)
   c = c.div(c.sum(dim=1, keepdim=True))
   return c
+
+
+def coherence(U1, U2, normalize=False):
+  """Compute coherence between U1, U2.
+
+  Args:
+    U1, U2: (D x d) matrices
+    normalize: normalize columns of U1, U2 (default: False)
+
+  Returns:
+    coh: scalar coherence loss
+  """
+  d = U1.size(1)
+  if normalize:
+    U1 = U1.div(torch.norm(U1, p=2, dim=0, keepdim=True).add(EPS))
+    U2 = U2.div(torch.norm(U2, p=2, dim=0, keepdim=True).add(EPS))
+  coh = torch.matmul(U1.t(), U2).pow(2).sum().div(d)
+  return coh

@@ -69,15 +69,17 @@ def main():
   if args.model_n is None or args.model_n <= 0:
     args.model_n = args.n
   args.assign_reg_terms = args.assign_reg_terms.split(',')
+  if 'U' not in args.assign_reg_terms:
+    args.U_lamb /= args.model_n
   if args.proj_form:
     model = mod.KSubspaceProjModel(args.model_n, args.model_d, args.D,
         args.affine, args.symmetric, U_lamb=args.U_lamb,
-        inc_gamma=args.inc_gamma, soft_assign=args.soft_assign,
+        coh_gamma=args.coh_gamma, soft_assign=args.soft_assign,
         c_sigma=args.c_sigma, assign_reg_terms=args.assign_reg_terms,
         size_scale=args.size_scale)
   else:
     model = mod.KSubspaceModel(args.model_n, args.model_d, args.D, args.affine,
-        U_lamb=args.U_lamb, z_lamb=args.z_lamb, inc_gamma=args.inc_gamma,
+        U_lamb=args.U_lamb, z_lamb=args.z_lamb, coh_gamma=args.coh_gamma,
         soft_assign=args.soft_assign, c_sigma=args.c_sigma,
         assign_reg_terms=args.assign_reg_terms, size_scale=args.size_scale)
   model = model.to(device)
@@ -89,17 +91,25 @@ def main():
       model = torch.nn.parallel.DistributedDataParallelCPU(model)
 
   # optimizer
-  optimizer = torch.optim.SGD(model.parameters(), lr=args.init_lr,
-      momentum=args.momentum, nesterov=args.nesterov)
+  if args.optim == 'SGD':
+    optimizer = torch.optim.SGD(model.parameters(), lr=args.init_lr,
+        momentum=0.9, nesterov=True)
+  elif args.optim == 'Adam':
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.init_lr,
+        betas=(0.9, 0.9), amsgrad=True)
+  else:
+    raise ValueError("Invalid optimizer {}.".format(args.optim))
 
   if args.chkp_freq is None or args.chkp_freq <= 0:
     args.chkp_freq = args.epochs
   if args.stop_freq is None or args.stop_freq <= 0:
     args.stop_freq = -1
+  reset_kwargs = {'split_sigma': args.reset_split_sigma,
+      'sample_p': args.reset_sample_p}
   tr.train_loop(model, synth_data_loader, device, optimizer,
       args.out_dir, args.epochs, args.chkp_freq, args.stop_freq,
       scheduler=None, dist_mode=args.dist, eval_rank=args.eval_rank,
-      reset_unused=args.reset_unused)
+      reset_unused=args.reset_unused, reset_kwargs=reset_kwargs)
   return
 
 
@@ -135,14 +145,14 @@ if __name__ == '__main__':
                       help='Subspace reg parameter [default: 1e-4]')
   parser.add_argument('--z-lamb', type=float, default=0.1,
                       help='Coefficient reg parameter [default: 0.1]')
-  parser.add_argument('--inc-gamma', type=float, default=0.0,
-                      help='Incoherence reg parameter [default: 0.0]')
+  parser.add_argument('--coh-gamma', type=float, default=0.0,
+                      help='Coherence reg parameter [default: 0.0]')
   parser.add_argument('--soft-assign', type=float, default=0.1,
                       help='Soft assignment parameter [default: 0.1]')
   parser.add_argument('--c-sigma', type=float, default=0.01,
                       help='Assignment noise parameter [default: 0.01]')
   parser.add_argument('--assign-reg-terms', type=str, default='U,z',
-                      help=('Assignment reg terms, subset of U,z,inc '
+                      help=('Assignment reg terms, subset of U,z,coh '
                           '[default: U,z]'))
   parser.add_argument('--size-scale', action='store_true',
                       help=('Scale gradients to compensate for cluster '
@@ -152,14 +162,16 @@ if __name__ == '__main__':
                       help='Input batch size for training [default: 100]')
   parser.add_argument('--epochs', type=int, default=50,
                       help='Number of epochs to train [default: 50]')
+  parser.add_argument('--optim', type=str, default='SGD',
+                      help='Optimizer [default: SGD]')
   parser.add_argument('--init-lr', type=float, default=0.5,
                       help='Initial learning rate [default: 0.5]')
-  parser.add_argument('--momentum', type=float, default=0.9,
-                      help='Momentum acceleration parameter [default: 0.9]')
-  parser.add_argument('--nesterov', action='store_true', default=False,
-                      help='Use nesterov form of acceleration')
   parser.add_argument('--reset-unused', action='store_true', default=False,
-                      help='Whether to reset unused clusters [default: None]')
+                      help='Whether to reset unused clusters')
+  parser.add_argument('--reset-split-sigma', type=float, default=0.1,
+                      help='Reset split perturbation parameter [default: 0.1]')
+  parser.add_argument('--reset-sample-p', type=float, default=None,
+                      help='Reset (over-)sampling parameter [default: None]')
   parser.add_argument('--dist', action='store_true', default=False,
                       help='Enables distributed training')
   parser.add_argument('--cuda', action='store_true', default=False,
