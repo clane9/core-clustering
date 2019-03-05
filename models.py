@@ -271,7 +271,8 @@ class _KSubspaceBaseModel(nn.Module):
       self.c_mean[split_ids] *= 0.5
       self.c_mean[reset_ids] = self.c_mean[split_ids]
 
-      split_ranks = split_metric.argsort(descending=True).argsort()[split_ids]
+      idx = torch.sort(split_metric, descending=True)[1]
+      split_ranks = torch.sort(idx)[1][split_ids]
     else:
       split_ids = torch.zeros_like(reset_ids)
       split_ranks = torch.zeros_like(reset_ids)
