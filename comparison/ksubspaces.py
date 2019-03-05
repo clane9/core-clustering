@@ -168,7 +168,11 @@ class KSubspaceBatchAltModel(nn.Module):
     else:
       b = None
 
-    if solver == 'svd':
+    if X.shape[0] < self.d:
+      # special case where N_i < d
+      _, s, U = torch.svd(X, some=False)
+      s, Ut = s[:self.d], U[:, :self.d].t()
+    elif solver == 'svd':
       _, s, U = torch.svd(X)
       s, Ut = s[:self.d], U[:, :self.d].t()
     else:
