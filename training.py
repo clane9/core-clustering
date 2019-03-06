@@ -228,8 +228,6 @@ def train_epoch(model, data_loader, optimizer, device, dist_mode=False,
 
   if eval_rank:
     ranks, svs = model.eval_rank()
-    ranks = torch.stack(ranks).cpu().numpy()
-    svs = torch.stack(svs).cpu().numpy()
     rank_stats = [np.median(ranks), ranks.min(), ranks.max()]
   else:
     rank_stats, svs = [], None

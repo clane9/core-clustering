@@ -204,12 +204,12 @@ class _KSubspaceBaseModel(nn.Module):
     """Compute rank and singular values of subspace bases."""
     # svd is ~1000x faster on cpu for small matrices (100 x 10).
     Us = self.Us.data.cpu() if cpu else self.Us.data
-    ranks_svs = [ut.rank(Us[ii, :], tol) for ii in range(self.k)]
-    ranks, svs = zip(*ranks_svs)
-    return ranks, svs
+    svs = torch.stack([torch.svd(Us[ii, :])[1] for ii in range(self.k)])
+    ranks = (svs > tol*svs[:, 0].median()).sum(dim=1)
+    return ranks.cpu().numpy(), svs.cpu().numpy()
 
   def reset_unused(self, split_metric=None, sample_p=None, reset_thr=.01,
-        split_sigma=.1):
+        split_thr=1.5, split_sigma=.1):
     """Reset (nearly) unused clusters by duplicating clusters likely to contain
     >1 group. By default, choose to duplicate largest clusters.
 
@@ -221,6 +221,8 @@ class _KSubspaceBaseModel(nn.Module):
         "bad" will be selected with at least 50% prob (default: ceil(log2(k))).
       reset_thr: size threshold for nearly empty clusters in 1/k units
         (default: .01).
+      split_thr: threshold relative to median split metric a cluster must
+        surpass to be considered for splitting (default: 0.0).
       split_sigma: noise added to duplicate clusters, relative to basis column
         norms (default: .1).
 
@@ -240,22 +242,28 @@ class _KSubspaceBaseModel(nn.Module):
       raise ValueError("Invalid sample power {}".format(sample_p))
     if reset_thr < 0:
       raise ValueError("Invalid reset threshold {}".format(reset_thr))
+    if split_thr < 0:
+      raise ValueError("Invalid split threshold {}".format(split_thr))
     if split_sigma <= 0:
       raise ValueError("Invalid split noise level {}".format(split_sigma))
 
     # expected value of assignment noise (folded gaussian) is sigma*sqrt(2/pi)
     reset_thr = ((self.c_sigma/self.k)*np.sqrt(2/np.pi) + reset_thr/self.k)
-    reset_ids = torch.nonzero(self.c_mean <= reset_thr).view(-1)
+    reset_mask = self.c_mean <= reset_thr
+    reset_ids = reset_mask.nonzero().view(-1)
     reset_count = reset_ids.size(0)
-    if reset_count > 0:
-      # can't reset more that k/2 clusters.
-      if reset_count > self.k / 2:
-        reset_count = (self.k - reset_count)
-        reset_ids = reset_ids[:reset_count]
 
-      split_metric = split_metric.pow(sample_p)
-      split_metric[reset_ids] = 0.0
-      split_ids = torch.multinomial(split_metric, reset_count)
+    split_thr = split_thr*split_metric[reset_mask == 0].median()
+    split_cand_mask = split_metric >= split_thr
+    split_cand_mask[reset_ids] = 0
+    split_cands = split_cand_mask.nonzero().view(-1)
+    split_cand_count = split_cands.size(0)
+
+    reset_count = min(reset_count, split_cand_count)
+    reset_ids = reset_ids[:reset_count]
+    if reset_count > 0:
+      split_prob = split_metric[split_cands].pow(sample_p)
+      split_ids = split_cands[torch.multinomial(split_prob, reset_count)]
 
       # "split" clusters by duplicating bases with small perturbation
       split_Us = self.Us.data[split_ids, :]
@@ -266,7 +274,7 @@ class _KSubspaceBaseModel(nn.Module):
       if self.affine:
         self.bs[reset_ids, :] = self.bs[split_ids, :]
 
-      # very important to update c_mean for split clusters when using size
+      # important to update c_mean for split clusters when using size
       # scaled objective
       self.c_mean[split_ids] *= 0.5
       self.c_mean[reset_ids] = self.c_mean[split_ids]
