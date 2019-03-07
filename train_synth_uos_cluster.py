@@ -71,17 +71,22 @@ def main():
   args.assign_reg_terms = args.assign_reg_terms.split(',')
   if 'U' not in args.assign_reg_terms:
     args.U_lamb /= args.model_n
+  olpool = mod.OutlierPool(20*args.model_d, args.model_d, stale_thr=1.0,
+      outlier_thr=0.0, ema_decay=0.9, sample_p=2, coh_super_nbd_size=None,
+      svd=True)
+  ol_reg_terms = ('U', 'z')
   if args.proj_form:
     model = mod.KSubspaceProjModel(args.model_n, args.model_d, args.D,
         args.affine, args.symmetric, U_lamb=args.U_lamb,
-        coh_gamma=args.coh_gamma, soft_assign=args.soft_assign,
+        coh_gamma=args.coh_gamma, coh_margin=0.0, soft_assign=args.soft_assign,
         c_sigma=args.c_sigma, assign_reg_terms=args.assign_reg_terms,
-        size_scale=args.size_scale)
+        size_scale=args.size_scale, olpool=olpool, ol_reg_terms=ol_reg_terms)
   else:
     model = mod.KSubspaceModel(args.model_n, args.model_d, args.D, args.affine,
         U_lamb=args.U_lamb, z_lamb=args.z_lamb, coh_gamma=args.coh_gamma,
-        soft_assign=args.soft_assign, c_sigma=args.c_sigma,
-        assign_reg_terms=args.assign_reg_terms, size_scale=args.size_scale)
+        coh_margin=0.0, soft_assign=args.soft_assign, c_sigma=args.c_sigma,
+        assign_reg_terms=args.assign_reg_terms, size_scale=args.size_scale,
+        olpool=olpool, ol_reg_terms=ol_reg_terms)
   model = model.to(device)
   if args.dist:
     if use_cuda:
@@ -104,12 +109,10 @@ def main():
     args.chkp_freq = args.epochs
   if args.stop_freq is None or args.stop_freq <= 0:
     args.stop_freq = -1
-  reset_kwargs = {'split_sigma': args.reset_split_sigma,
-      'sample_p': args.reset_sample_p}
   tr.train_loop(model, synth_data_loader, device, optimizer,
       args.out_dir, args.epochs, args.chkp_freq, args.stop_freq,
       scheduler=None, dist_mode=args.dist, eval_rank=args.eval_rank,
-      reset_unused=args.reset_unused, reset_kwargs=reset_kwargs)
+      reset_unused=args.reset_unused)
   return
 
 
@@ -168,10 +171,6 @@ if __name__ == '__main__':
                       help='Initial learning rate [default: 0.5]')
   parser.add_argument('--reset-unused', action='store_true', default=False,
                       help='Whether to reset unused clusters')
-  parser.add_argument('--reset-split-sigma', type=float, default=0.1,
-                      help='Reset split perturbation parameter [default: 0.1]')
-  parser.add_argument('--reset-sample-p', type=float, default=None,
-                      help='Reset (over-)sampling parameter [default: None]')
   parser.add_argument('--dist', action='store_true', default=False,
                       help='Enables distributed training')
   parser.add_argument('--cuda', action='store_true', default=False,

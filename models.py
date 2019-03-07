@@ -16,7 +16,7 @@ class _KSubspaceBaseModel(nn.Module):
   """Base K-subspace class."""
 
   def __init__(self, k, d, D, affine=False, soft_assign=0.0, c_sigma=0.0,
-        size_scale=False):
+        size_scale=False, olpool=None):
     if soft_assign < 0:
       raise ValueError("Invalid soft-assign parameter {}".format(soft_assign))
     if c_sigma < 0:
@@ -31,6 +31,7 @@ class _KSubspaceBaseModel(nn.Module):
     self.c_sigma = c_sigma
     self.size_scale = size_scale
     self.assign_reg_terms = None  # assigned in child
+    self.ol_reg_terms = None  # assigned in child
 
     # group assignment, ultimate shape (batch_size, k)
     self.c = None
@@ -44,6 +45,12 @@ class _KSubspaceBaseModel(nn.Module):
     else:
       self.register_parameter('bs', None)
     self.register_buffer('c_mean', torch.ones(k).div_(k))
+
+    if olpool is None:
+      self.olpool = OutlierPool(20*d, d)
+    else:
+      self.olpool = olpool
+      self.olpool.reset()
     return
 
   def reset_parameters(self):
@@ -95,11 +102,12 @@ class _KSubspaceBaseModel(nn.Module):
       x_ = x_.add(self.bs.unsqueeze(1))
     return x_
 
-  def objective(self, x):
+  def objective(self, x, update_ol=True):
     """Evaluate objective function.
 
     Input:
       x: data, shape (batch_size, D)
+      update_ol: update outlier pool
 
     Returns:
       obj, scale_obj, loss, reg
@@ -113,6 +121,13 @@ class _KSubspaceBaseModel(nn.Module):
     assign_obj = losses.data + sum([regs[k].data for k in regs
         if k in self.assign_reg_terms])
     self.set_assign(assign_obj)
+
+    # update outlier pool
+    if update_ol:
+      ol_obj = losses.data + sum([regs[k].data for k in regs
+          if k in self.ol_reg_terms])
+      ol_obj = (self.c*ol_obj).sum(dim=1)
+      self.olpool.append(x, ol_obj)
 
     # weight loss, reg by assignment where needed, and average over batch
     losses = torch.mean(self.c*losses, dim=0)
@@ -208,85 +223,28 @@ class _KSubspaceBaseModel(nn.Module):
     ranks = (svs > tol*svs[:, 0].median()).sum(dim=1)
     return ranks.cpu().numpy(), svs.cpu().numpy()
 
-  def reset_unused(self, split_metric=None, sample_p=None, reset_thr=.01,
-        split_thr=1.5, split_sigma=.1):
-    """Reset (nearly) unused clusters by duplicating clusters likely to contain
-    >1 group. By default, choose to duplicate largest clusters.
-
-    Args:
-      split_metric: shape (k,) metric used to rank groups for splitting
-        (largest values chosen) (default: c_mean).
-      sample_p: probability of splitting group j is proportional to
-        split_metric[j]**sample_p. Default chosen so that a cluster twice as
-        "bad" will be selected with at least 50% prob (default: ceil(log2(k))).
-      reset_thr: size threshold for nearly empty clusters in 1/k units
-        (default: .01).
-      split_thr: threshold relative to median split metric a cluster must
-        surpass to be considered for splitting (default: 0.0).
-      split_sigma: noise added to duplicate clusters, relative to basis column
-        norms (default: .1).
+  def reset_unused(self, reset_thr=.01):
+    """Reset (nearly) unused clusters by sampling neighborhood from pool of
+    outliers.
 
     Returns:
-      reset_ids, split_ids
+      reset_ids: clusters that were reset
     """
-    if split_metric is None:
-      split_metric = self.c_mean
-    if sample_p is None:
-      sample_p = np.log2(self.k)
-    if sample_p < 0:
-      raise ValueError("Invalid sample_p {}".format(sample_p))
-    sample_p = int(np.ceil(sample_p))
-    if split_metric.shape != (self.k,) or split_metric.min() < 0:
-      raise ValueError("Invalid splitting metric")
-    if sample_p < 0:
-      raise ValueError("Invalid sample power {}".format(sample_p))
-    if reset_thr < 0:
-      raise ValueError("Invalid reset threshold {}".format(reset_thr))
-    if split_thr < 0:
-      raise ValueError("Invalid split threshold {}".format(split_thr))
-    if split_sigma <= 0:
-      raise ValueError("Invalid split noise level {}".format(split_sigma))
-
     # expected value of assignment noise (folded gaussian) is sigma*sqrt(2/pi)
     reset_thr = ((self.c_sigma/self.k)*np.sqrt(2/np.pi) + reset_thr/self.k)
     reset_mask = self.c_mean <= reset_thr
     reset_ids = reset_mask.nonzero().view(-1)
-    reset_count = reset_ids.size(0)
 
-    split_thr = split_thr*split_metric[reset_mask == 0].median()
-    split_cand_mask = split_metric >= split_thr
-    split_cand_mask[reset_ids] = 0
-    split_cands = split_cand_mask.nonzero().view(-1)
-    split_cand_count = split_cands.size(0)
-
-    reset_count = min(reset_count, split_cand_count)
-    reset_ids = reset_ids[:reset_count]
-    if reset_count > 0:
-      split_prob = split_metric[split_cands].pow(sample_p)
-      split_ids = split_cands[torch.multinomial(split_prob, reset_count)]
-
-      # "split" clusters by duplicating bases with small perturbation
-      split_Us = self.Us.data[split_ids, :]
-      w = torch.randn_like(split_Us).mul_(split_sigma/np.sqrt(self.D))
-      w.mul_(torch.norm(split_Us, dim=1, keepdim=True))
-      self.Us.data[reset_ids, :] = split_Us + w
-      self.Us.data[split_ids, :] = split_Us - w
+    for ii, idx in enumerate(reset_ids):
+      newU = self.olpool.sample()
+      if newU is None:
+        reset_ids = reset_ids[:ii]
+        break
+      self.Us.data[idx, :] = newU
       if self.affine:
-        self.bs[reset_ids, :] = self.bs[split_ids, :]
-
-      # important to update c_mean for split clusters when using size
-      # scaled objective
-      self.c_mean[split_ids] *= 0.5
-      self.c_mean[reset_ids] = self.c_mean[split_ids]
-
-      idx = torch.sort(split_metric, descending=True)[1]
-      split_ranks = torch.sort(idx)[1][split_ids]
-    else:
-      split_ids = torch.zeros_like(reset_ids)
-      split_ranks = torch.zeros_like(reset_ids)
-
-    return (reset_ids.cpu().numpy(), split_ids.cpu().numpy(),
-        split_ranks.cpu().numpy())
+        self.bs.data[idx, :] = 0.0
+      self.c_mean[idx] = 1.0/self.k
+    return reset_ids.cpu().numpy()
 
 
 class KSubspaceModel(_KSubspaceBaseModel):
@@ -295,7 +253,8 @@ class KSubspaceModel(_KSubspaceBaseModel):
 
   def __init__(self, k, d, D, affine=False, U_lamb=0.001, z_lamb=0.1,
         coh_gamma=0.0, coh_margin=0.75, soft_assign=0.0, c_sigma=0.0,
-        assign_reg_terms=('U', 'z'), size_scale=False):
+        assign_reg_terms=('z'), size_scale=False, olpool=None,
+        ol_reg_terms=('U', 'z')):
     if U_lamb < 0:
       raise ValueError("Invalid U reg parameter {}".format(U_lamb))
     if z_lamb < 0:
@@ -314,12 +273,13 @@ class KSubspaceModel(_KSubspaceBaseModel):
           "assignment objective includes all reg terms (U, z, coh)")
 
     super(KSubspaceModel, self).__init__(k, d, D, affine, soft_assign, c_sigma,
-        size_scale)
+        size_scale, olpool)
     self.U_lamb = U_lamb
     self.z_lamb = z_lamb
     self.coh_gamma = coh_gamma
     self.coh_margin = coh_margin
     self.assign_reg_terms = assign_reg_terms
+    self.ol_reg_terms = ol_reg_terms
     self.reset_parameters()
     return
 
@@ -396,7 +356,8 @@ class KSubspaceModel(_KSubspaceBaseModel):
           unitUs.unsqueeze(0)).pow(2).sum(dim=(2, 3))
       coh = coh.div(coh.diag().view(-1, 1))
       # soft-threshold to incur no penalty if bases sufficiently incoherent
-      coh = F.relu(coh - self.coh_margin)
+      if self.coh_margin > 0:
+        coh = F.relu(coh - self.coh_margin)
       regs['coh'] = coh.sum(dim=1).sub(coh.diag()).mul(
           self.coh_gamma/(self.k-1))
     return regs
@@ -408,7 +369,8 @@ class KSubspaceProjModel(_KSubspaceBaseModel):
 
   def __init__(self, k, d, D, affine=False, symmetric=False, U_lamb=0.001,
         coh_gamma=0.0, coh_margin=0.75, soft_assign=0.0, c_sigma=0.0,
-        assign_reg_terms=('U'), size_scale=False):
+        assign_reg_terms=(), size_scale=False, olpool=None,
+        ol_reg_terms=('U',)):
     if U_lamb < 0:
       raise ValueError("Invalid reg parameter {}".format(U_lamb))
     if coh_gamma < 0:
@@ -423,12 +385,13 @@ class KSubspaceProjModel(_KSubspaceBaseModel):
           "assignment objective includes all reg terms (U, coh)")
 
     super(KSubspaceProjModel, self).__init__(k, d, D, affine, soft_assign,
-        c_sigma, size_scale)
+        c_sigma, size_scale, olpool)
     self.symmetric = symmetric
     self.U_lamb = U_lamb
     self.coh_gamma = coh_gamma
     self.coh_margin = coh_margin
     self.assign_reg_terms = assign_reg_terms
+    self.ol_reg_terms = ol_reg_terms
 
     if self.symmetric:
       self.register_parameter('Vs', None)
@@ -493,7 +456,147 @@ class KSubspaceProjModel(_KSubspaceBaseModel):
           unitUs.unsqueeze(0)).pow(2).sum(dim=(2, 3))
       coh = coh.div(coh.diag().view(-1, 1))
       # soft-threshold to incur no penalty if bases sufficiently incoherent
-      coh = F.relu(coh - self.coh_margin)
+      if self.coh_margin > 0:
+        coh = F.relu(coh - self.coh_margin)
       regs['coh'] = coh.sum(dim=1).sub(coh.diag()).mul(
           self.coh_gamma/(self.k-1))
     return regs
+
+
+class OutlierPool(object):
+  """Represent running pool of outier data points."""
+  def __init__(self, maxlen, nbd_size, stale_thr=1.0, outlier_thr=0.0,
+        ema_decay=0.9, sample_p=2, coh_super_nbd_size=None, svd=True):
+    if stale_thr <= 0:
+      raise ValueError("Invalid stale_thr {}".format(stale_thr))
+    if ema_decay <= 0 or ema_decay >= 1:
+      raise ValueError("Invalid ema_decay {}".format(ema_decay))
+    if sample_p < 0:
+      raise ValueError("Invalid sample_p {}".format(sample_p))
+    if coh_super_nbd_size is not None and coh_super_nbd_size <= nbd_size:
+      raise ValueError(
+          "Invalid coh_super_nbd_size {}".format(coh_super_nbd_size))
+
+    self.maxlen = maxlen
+    self.nbd_size = nbd_size
+    self.outlier_thr = outlier_thr
+    self.stale_thr = stale_thr
+    self.ema_decay = ema_decay
+    self.sample_p = sample_p
+    self.coh_super_nbd_size = coh_super_nbd_size
+    self.svd = svd
+    self.reset()
+    return
+
+  def reset(self):
+    self.error_avg = None
+    self.error_var = None
+    self.error_std = None
+    self.errors = None
+    self.error_avgs = None
+    self.outliers = None
+    return
+
+  def append(self, x, errors):
+    """Append outlier points in x to current pool, while clearing stale points
+    and maintaining max size.
+
+    NOTE: possibly naive implementation.
+    """
+    # initialize
+    if self.outliers is None:
+      self.outliers = torch.zeros((0, x.shape[1]),
+          dtype=x.dtype, device=x.device)
+      self.errors = torch.zeros((0,),
+          dtype=errors.dtype, device=errors.device)
+      self.error_avgs = torch.zeros((0,),
+          dtype=errors.dtype, device=errors.device)
+
+    # update error average and var
+    batch_error_avg = errors.mean()
+    batch_error_var = errors.var()
+    if self.error_avg is None:
+      self.error_avg = batch_error_avg
+      self.error_var = batch_error_var
+    else:
+      self.error_avg = (self.ema_decay*self.error_avg +
+          (1-self.ema_decay)*batch_error_avg)
+      self.error_var = (self.ema_decay*self.error_var +
+          (1-self.ema_decay)*batch_error_var)
+    self.error_std = self.error_var.sqrt()
+
+    # check for stale points, i.e. whose error avg at insertion time is
+    # sufficiently large
+    fresh_mask = (self.error_avgs - self.error_avg <
+        self.stale_thr*self.error_std)
+    if fresh_mask.sum() < fresh_mask.shape[0]:
+      self.errors = self.errors[fresh_mask]
+      self.error_avgs = self.error_avgs[fresh_mask]
+      self.outliers = self.outliers[fresh_mask]
+
+    # test for big errors
+    if self.outlier_thr is not None:
+      big_error_mask = (errors - self.error_avg >=
+          self.outlier_thr*self.error_std)
+      x = x[big_error_mask, :]
+      errors = errors[big_error_mask]
+
+    # update outliers by choosing top worst from x + current pool.
+    if x.shape[0] > 0:
+      outlier_count = self.outliers.shape[0]
+      self.outliers = torch.cat((self.outliers, x))
+      self.errors = torch.cat((self.errors, errors))
+      self.error_avgs = torch.cat((self.error_avgs,
+          torch.full_like(errors, self.error_avg)))
+      Idx = torch.sort(self.errors, descending=True)[1]
+      Idx = Idx[:self.maxlen]
+
+      self.outliers = self.outliers[Idx]
+      self.errors = self.errors[Idx]
+      self.error_avgs = self.error_avgs[Idx]
+
+      new_outlier_count = (Idx >= outlier_count).sum()
+    else:
+      new_outlier_count = 0
+    return new_outlier_count
+
+  def sample(self):
+    """Sample a neighborhood of points from the current pool of outliers."""
+    if self.outliers.shape[0] < self.nbd_size:
+      return None
+
+    # sample
+    sample_prob = self.errors.pow(self.sample_p)
+    idx = torch.multinomial(sample_prob, 1)
+
+    # find nbd
+    unit_outliers = self.outliers.div(
+        torch.norm(self.outliers, dim=1, keepdim=True).add(EPS))
+    cos = torch.matmul(unit_outliers, unit_outliers[idx, :].t()).abs().view(-1)
+    cos[idx] = 0.0
+    if self.coh_super_nbd_size is not None:
+      super_nbd_size = min(self.coh_super_nbd_size, self.outliers.shape[0])
+      _, super_nbd = torch.topk(cos, super_nbd_size, largest=True)
+      coh = torch.matmul(unit_outliers[super_nbd, :],
+          unit_outliers[super_nbd, :].t()).pow(2).sum(dim=1)
+      _, nbd = torch.topk(coh, self.nbd_size-1, largest=True)
+    else:
+      _, nbd = torch.topk(cos, self.nbd_size-1, largest=True)
+    nbd = torch.cat((idx, nbd))
+    outliers_nbd = self.outliers[nbd, :]
+
+    # drop nbd from current outliers
+    not_nbd_mask = torch.ones_like(self.errors, dtype=torch.uint8)
+    not_nbd_mask[nbd] = 0
+    self.outliers = self.outliers[not_nbd_mask]
+    self.errors = self.errors[not_nbd_mask]
+    self.error_avgs = self.error_avgs[not_nbd_mask]
+
+    if self.svd:
+      # outliers_nbd is (m, D)
+      # assume m ~= d <= D, so U is (D, m)
+      _, s, U = torch.svd(outliers_nbd, some=True)
+      U.mul_(torch.norm(s)/np.sqrt(U.shape[1]))
+    else:
+      U = outliers_nbd.t()
+    return U
