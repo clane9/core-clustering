@@ -294,7 +294,7 @@ class KSubspaceModel(_KSubspaceBaseModel):
   form."""
 
   def __init__(self, k, d, D, affine=False, U_lamb=0.001, z_lamb=0.1,
-        coh_gamma=0.0, coh_margin=0.75, soft_assign=0.0, c_sigma=0.0,
+        coh_gamma=0.0, coh_margin=0.0, soft_assign=0.0, c_sigma=0.0,
         assign_reg_terms=('U', 'z'), size_scale=False):
     if U_lamb < 0:
       raise ValueError("Invalid U reg parameter {}".format(U_lamb))
@@ -396,7 +396,8 @@ class KSubspaceModel(_KSubspaceBaseModel):
           unitUs.unsqueeze(0)).pow(2).sum(dim=(2, 3))
       coh = coh.div(coh.diag().view(-1, 1))
       # soft-threshold to incur no penalty if bases sufficiently incoherent
-      coh = F.relu(coh - self.coh_margin)
+      if self.coh_margin > 0:
+        coh = F.relu(coh - self.coh_margin)
       regs['coh'] = coh.sum(dim=1).sub(coh.diag()).mul(
           self.coh_gamma/(self.k-1))
     return regs
@@ -407,7 +408,7 @@ class KSubspaceProjModel(_KSubspaceBaseModel):
   matrix."""
 
   def __init__(self, k, d, D, affine=False, symmetric=False, U_lamb=0.001,
-        coh_gamma=0.0, coh_margin=0.75, soft_assign=0.0, c_sigma=0.0,
+        coh_gamma=0.0, coh_margin=0.0, soft_assign=0.0, c_sigma=0.0,
         assign_reg_terms=('U'), size_scale=False):
     if U_lamb < 0:
       raise ValueError("Invalid reg parameter {}".format(U_lamb))
@@ -493,7 +494,8 @@ class KSubspaceProjModel(_KSubspaceBaseModel):
           unitUs.unsqueeze(0)).pow(2).sum(dim=(2, 3))
       coh = coh.div(coh.diag().view(-1, 1))
       # soft-threshold to incur no penalty if bases sufficiently incoherent
-      coh = F.relu(coh - self.coh_margin)
+      if self.coh_margin > 0:
+        coh = F.relu(coh - self.coh_margin)
       regs['coh'] = coh.sum(dim=1).sub(coh.diag()).mul(
           self.coh_gamma/(self.k-1))
     return regs
