@@ -209,7 +209,7 @@ class _KSubspaceBaseModel(nn.Module):
     return ranks.cpu().numpy(), svs.cpu().numpy()
 
   def reset_unused(self, split_metric=None, sample_p=None, reset_thr=.01,
-        split_thr=1.5, split_sigma=.1):
+        split_thr=0.0, split_sigma=.1):
     """Reset (nearly) unused clusters by duplicating clusters likely to contain
     >1 group. By default, choose to duplicate largest clusters.
 
