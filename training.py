@@ -100,7 +100,9 @@ def train_loop(model, data_loader, device, optimizer, out_dir=None, epochs=200,
 
       cluster_error, obj = metrics[:2]
       is_conv = lr <= min_lr or epoch == epochs
-      scheduler.step(obj)
+      # don't decay lr if still resetting clusters
+      if not reset_unused or epoch_resets.shape[0] == 0:
+        scheduler.step(obj)
 
       save_chkp = (is_logging and out_dir is not None and
           (epoch % chkp_freq == 0 or is_conv))
@@ -170,9 +172,8 @@ def train_epoch(model, data_loader, optimizer, device, dist_mode=False,
 
     # opt step
     optimizer.zero_grad()
-    (batch_obj, batch_scale_obj, batch_loss,
-        batch_reg, x_) = model.objective(x)
-    batch_scale_obj.backward()
+    (batch_obj, batch_loss, batch_reg, x_) = model.objective(x)
+    batch_obj.backward()
     optimizer.step()
 
     batch_sprs = model.eval_sprs()
@@ -223,7 +224,7 @@ def train_epoch(model, data_loader, optimizer, device, dist_mode=False,
 
   rtime = time.time() - epoch_tic
   cluster_error, conf_mat = ut.eval_cluster_error(conf_mat.sum,
-      sort_conf_mat=True)
+      sort_conf_mat=False)
 
   if eval_rank:
     ranks, svs = model.eval_rank()

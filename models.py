@@ -1,10 +1,12 @@
 from __future__ import print_function
 from __future__ import division
 
+import warnings
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from sklearn.linear_model import lars_path
 
 import utils as ut
 
@@ -15,12 +17,10 @@ EMA_DECAY = 0.9
 class _KSubspaceBaseModel(nn.Module):
   """Base K-subspace class."""
 
-  def __init__(self, k, d, D, affine=False, soft_assign=0.0, c_sigma=0.0,
-        size_scale=False, olpool=None):
+  def __init__(self, k, d, D, affine=False, soft_assign=0.0, olpool=None,
+        ol_size_scale=True):
     if soft_assign < 0:
       raise ValueError("Invalid soft-assign parameter {}".format(soft_assign))
-    if c_sigma < 0:
-      raise ValueError("Invalid assignment noise parameter {}".format(c_sigma))
 
     super(_KSubspaceBaseModel, self).__init__()
     self.k = k  # number of groups
@@ -28,10 +28,9 @@ class _KSubspaceBaseModel(nn.Module):
     self.D = D  # number of data points
     self.affine = affine
     self.soft_assign = soft_assign
-    self.c_sigma = c_sigma
-    self.size_scale = size_scale
     self.assign_reg_terms = None  # assigned in child
     self.ol_reg_terms = None  # assigned in child
+    self.ol_size_scale = ol_size_scale
 
     # group assignment, ultimate shape (batch_size, k)
     self.c = None
@@ -126,6 +125,8 @@ class _KSubspaceBaseModel(nn.Module):
     if update_ol:
       ol_obj = losses.data + sum([regs[k].data for k in regs
           if k in self.ol_reg_terms])
+      if self.ol_size_scale:
+        ol_obj = ol_obj*self.c_mean
       ol_obj = (self.c*ol_obj).sum(dim=1)
       self.olpool.append(x, ol_obj)
 
@@ -143,15 +144,7 @@ class _KSubspaceBaseModel(nn.Module):
     loss = losses.sum()
     reg = regs.sum()
     obj = loss + reg
-
-    # only justified as lr scaling when loss + all reg terms weighted by c_ij
-    # init enforces this
-    if self.size_scale:
-      scale_obj = (losses.div(self.c_mean + EPS).sum() +
-          regs.div(self.c_mean + EPS).sum())
-    else:
-      scale_obj = obj
-    return obj, scale_obj, loss, reg, x_
+    return obj, loss, reg, x_
 
   def loss(self, x, x_):
     """Evaluate reconstruction loss
@@ -185,12 +178,6 @@ class _KSubspaceBaseModel(nn.Module):
     else:
       self.c = ut.find_soft_assign(assign_obj.data, self.soft_assign)
     self.groups = torch.argmax(self.c, dim=1)
-
-    if self.c_sigma > 0:
-      c_z = torch.zeros_like(self.c)
-      c_z.normal_(mean=0, std=(self.c_sigma/self.k)).abs_()
-      self.c.add_(c_z)
-      self.c.div_(self.c.sum(dim=1, keepdim=True))
 
     self._batch_c_mean = torch.mean(self.c, dim=0)
     self.c_mean.mul_(EMA_DECAY).add_(1-EMA_DECAY, self._batch_c_mean)
@@ -230,11 +217,8 @@ class _KSubspaceBaseModel(nn.Module):
     Returns:
       reset_ids: clusters that were reset
     """
-    # expected value of assignment noise (folded gaussian) is sigma*sqrt(2/pi)
-    reset_thr = ((self.c_sigma/self.k)*np.sqrt(2/np.pi) + reset_thr/self.k)
-    reset_mask = self.c_mean <= reset_thr
+    reset_mask = self.c_mean <= reset_thr/self.k
     reset_ids = reset_mask.nonzero().view(-1)
-
     for ii, idx in enumerate(reset_ids):
       newU = self.olpool.sample()
       if newU is None:
@@ -252,9 +236,9 @@ class KSubspaceModel(_KSubspaceBaseModel):
   form."""
 
   def __init__(self, k, d, D, affine=False, U_lamb=0.001, z_lamb=0.1,
-        coh_gamma=0.0, coh_margin=0.75, soft_assign=0.0, c_sigma=0.0,
-        assign_reg_terms=('z'), size_scale=False, olpool=None,
-        ol_reg_terms=('U', 'z')):
+        coh_gamma=0.0, coh_margin=0.75, soft_assign=0.0,
+        assign_reg_terms=('z'), olpool=None, ol_reg_terms=('U', 'z'),
+        ol_size_scale=True):
     if U_lamb < 0:
       raise ValueError("Invalid U reg parameter {}".format(U_lamb))
     if z_lamb < 0:
@@ -267,13 +251,9 @@ class KSubspaceModel(_KSubspaceBaseModel):
           "parameter {}").format(coh_margin))
     if not ('z' in assign_reg_terms or z_lamb == 0):
       raise ValueError("Assignment objective must contain z reg")
-    if size_scale and not (('U' in assign_reg_terms or U_lamb == 0) and
-          ('coh' in assign_reg_terms or coh_gamma == 0)):
-      raise ValueError("Size scaled objective is only valid when "
-          "assignment objective includes all reg terms (U, z, coh)")
 
-    super(KSubspaceModel, self).__init__(k, d, D, affine, soft_assign, c_sigma,
-        size_scale, olpool)
+    super(KSubspaceModel, self).__init__(k, d, D, affine, soft_assign, olpool,
+        ol_size_scale)
     self.U_lamb = U_lamb
     self.z_lamb = z_lamb
     self.coh_gamma = coh_gamma
@@ -347,8 +327,7 @@ class KSubspaceModel(_KSubspaceBaseModel):
       regs['z'] = torch.sum(self.z.data.pow(2), dim=2).t().mul(self.z_lamb*0.5)
 
     if self.coh_gamma > 0:
-      unitUs = self.Us.div(
-          torch.norm(self.Us, p=2, dim=1, keepdim=True).add(EPS))
+      unitUs = ut.unit_normalize(self.Us, p=2, dim=1)
       # coherence (sum of squared cosine angles) between subspace bases,
       # normalized by "self-coherence".
       # (k, k)
@@ -368,9 +347,8 @@ class KSubspaceProjModel(_KSubspaceBaseModel):
   matrix."""
 
   def __init__(self, k, d, D, affine=False, symmetric=False, U_lamb=0.001,
-        coh_gamma=0.0, coh_margin=0.75, soft_assign=0.0, c_sigma=0.0,
-        assign_reg_terms=(), size_scale=False, olpool=None,
-        ol_reg_terms=('U',)):
+        coh_gamma=0.0, coh_margin=0.75, soft_assign=0.0, assign_reg_terms=(),
+        olpool=None, ol_reg_terms=('U',), ol_size_scale=True):
     if U_lamb < 0:
       raise ValueError("Invalid reg parameter {}".format(U_lamb))
     if coh_gamma < 0:
@@ -379,13 +357,9 @@ class KSubspaceProjModel(_KSubspaceBaseModel):
     if coh_gamma > 0 and coh_margin < 0:
       raise ValueError(("Invalid coherence margin "
           "parameter {}").format(coh_margin))
-    if size_scale and not (('U' in assign_reg_terms or U_lamb == 0) and
-          ('coh' in assign_reg_terms or coh_gamma == 0)):
-      raise ValueError("Size scaled objective is only valid when "
-          "assignment objective includes all reg terms (U, coh)")
 
     super(KSubspaceProjModel, self).__init__(k, d, D, affine, soft_assign,
-        c_sigma, size_scale, olpool)
+        olpool, ol_size_scale)
     self.symmetric = symmetric
     self.U_lamb = U_lamb
     self.coh_gamma = coh_gamma
@@ -447,8 +421,7 @@ class KSubspaceProjModel(_KSubspaceBaseModel):
             torch.sum(self.Vs.pow(2), dim=(1, 2))).mul(self.U_lamb*0.5)
 
     if self.coh_gamma > 0:
-      unitUs = self.Us.div(
-          torch.norm(self.Us, p=2, dim=1, keepdim=True).add(EPS))
+      unitUs = ut.unit_normalize(self.Us, p=2, dim=1)
       # coherence (sum of squared cosine angles) between subspace bases,
       # normalized by "self-coherence".
       # (k, k)
@@ -466,24 +439,26 @@ class KSubspaceProjModel(_KSubspaceBaseModel):
 class OutlierPool(object):
   """Represent running pool of outier data points."""
   def __init__(self, maxlen, nbd_size, stale_thr=1.0, outlier_thr=0.0,
-        ema_decay=0.9, sample_p=2, coh_super_nbd_size=None, svd=True):
+        cos_thr=None, ema_decay=0.9, sample_p=2, nbd_type='cos', svd=True):
     if stale_thr <= 0:
       raise ValueError("Invalid stale_thr {}".format(stale_thr))
+    if cos_thr is not None and (cos_thr <= 0 or cos_thr > 1):
+      raise ValueError("Invalid cos_thr {}".format(cos_thr))
     if ema_decay <= 0 or ema_decay >= 1:
       raise ValueError("Invalid ema_decay {}".format(ema_decay))
     if sample_p < 0:
       raise ValueError("Invalid sample_p {}".format(sample_p))
-    if coh_super_nbd_size is not None and coh_super_nbd_size <= nbd_size:
-      raise ValueError(
-          "Invalid coh_super_nbd_size {}".format(coh_super_nbd_size))
+    if nbd_type not in ('cos', 'lasso'):
+      raise ValueError("Invalid nbd_type {}".format(nbd_type))
 
     self.maxlen = maxlen
     self.nbd_size = nbd_size
     self.outlier_thr = outlier_thr
     self.stale_thr = stale_thr
+    self.cos_thr = cos_thr
     self.ema_decay = ema_decay
     self.sample_p = sample_p
-    self.coh_super_nbd_size = coh_super_nbd_size
+    self.nbd_type = nbd_type
     self.svd = svd
     self.reset()
     return
@@ -540,29 +515,47 @@ class OutlierPool(object):
           self.outlier_thr*self.error_std)
       x = x[big_error_mask, :]
       errors = errors[big_error_mask]
+    if x.shape[0] == 0:
+      return 0
 
-    # update outliers by choosing top worst from x + current pool.
-    if x.shape[0] > 0:
-      outlier_count = self.outliers.shape[0]
-      self.outliers = torch.cat((self.outliers, x))
-      self.errors = torch.cat((self.errors, errors))
-      self.error_avgs = torch.cat((self.error_avgs,
-          torch.full_like(errors, self.error_avg)))
-      Idx = torch.sort(self.errors, descending=True)[1]
-      Idx = Idx[:self.maxlen]
+    outlier_count = self.outliers.shape[0]
+    if outlier_count == self.maxlen:
+      big_error_mask = errors > self.errors.min()
+      x = x[big_error_mask, :]
+      errors = errors[big_error_mask]
+    if x.shape[0] == 0:
+      return 0
 
-      self.outliers = self.outliers[Idx]
-      self.errors = self.errors[Idx]
-      self.error_avgs = self.error_avgs[Idx]
+    # test for excessive coherence (e.g. for when data points are repeated
+    # across epochs)
+    if outlier_count > 0 and self.cos_thr is not None and self.cos_thr < 1:
+      unit_x = ut.unit_normalize(x, p=2, dim=1)
+      unit_outliers = ut.unit_normalize(self.outliers, p=2, dim=1)
+      cos = torch.matmul(unit_x, unit_outliers.t()).abs().max(dim=1)[0]
+      cos_mask = cos < self.cos_thr
+      x = x[cos_mask, :]
+      errors = errors[cos_mask]
+    if x.shape[0] == 0:
+      return 0
 
-      new_outlier_count = (Idx >= outlier_count).sum()
-    else:
-      new_outlier_count = 0
+    # update outliers by choosing worst from x + current pool.
+    self.outliers = torch.cat((self.outliers, x))
+    self.errors = torch.cat((self.errors, errors))
+    self.error_avgs = torch.cat((self.error_avgs,
+        torch.full_like(errors, self.error_avg)))
+    Idx = torch.sort(self.errors, descending=True)[1]
+    Idx = Idx[:self.maxlen]
+
+    self.outliers = self.outliers[Idx]
+    self.errors = self.errors[Idx]
+    self.error_avgs = self.error_avgs[Idx]
+
+    new_outlier_count = (Idx >= outlier_count).sum()
     return new_outlier_count
 
   def sample(self):
     """Sample a neighborhood of points from the current pool of outliers."""
-    if self.outliers.shape[0] < self.nbd_size:
+    if self.outliers.shape[0] < self.nbd_size+1:
       return None
 
     # sample
@@ -570,20 +563,46 @@ class OutlierPool(object):
     idx = torch.multinomial(sample_prob, 1)
 
     # find nbd
-    unit_outliers = self.outliers.div(
-        torch.norm(self.outliers, dim=1, keepdim=True).add(EPS))
-    cos = torch.matmul(unit_outliers, unit_outliers[idx, :].t()).abs().view(-1)
-    cos[idx] = 0.0
-    if self.coh_super_nbd_size is not None:
-      super_nbd_size = min(self.coh_super_nbd_size, self.outliers.shape[0])
-      _, super_nbd = torch.topk(cos, super_nbd_size, largest=True)
-      coh = torch.matmul(unit_outliers[super_nbd, :],
-          unit_outliers[super_nbd, :].t()).pow(2).sum(dim=1)
-      _, nbd = torch.topk(coh, self.nbd_size-1, largest=True)
+    unit_outliers = ut.unit_normalize(self.outliers, p=2, dim=1)
+    if self.nbd_type == 'cos':
+      # (num_samples, num_outliers)
+      cos = torch.matmul(unit_outliers[idx, :],
+          unit_outliers.t()).abs().view(-1)
+      _, nbd = torch.topk(cos, self.nbd_size, largest=True)
     else:
-      _, nbd = torch.topk(cos, self.nbd_size-1, largest=True)
-    nbd = torch.cat((idx, nbd))
-    outliers_nbd = self.outliers[nbd, :]
+      # lasso nbd select
+      # (D, num_outliers)
+      X = unit_outliers.t()
+      y = X[:, idx].view(-1)
+      X[:, idx] = 0.0
+      X, y = X.cpu().numpy(), y.cpu().numpy()
+
+      # (num_outliers, num_alphas)
+      with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        _, _, coefs = lars_path(X, y, method='lasso')
+      # choose largest alpha with sufficient support
+      sprs = (np.abs(coefs) > 0).sum(axis=0)
+      coef = coefs[:, (sprs == min(self.nbd_size, sprs[-1]))][:, 0]
+
+      coef = torch.from_numpy(coef).to(device=unit_outliers.device)
+      nbd = torch.arange(coef.shape[0])[coef.abs() > 0.0]
+
+    # extract outlier neighborhood
+    # (D, nbd_size)
+    U = self.outliers[nbd, :].t()
+    D, nbd_size = U.shape
+    # add noise columns if neighborhood too small
+    # this can happen if omp/lasso terminates early
+    if nbd_size < self.nbd_size:
+      Unorm = torch.norm(U, p=2, dim=0).min()
+      nbdZ = torch.randn(D, self.nbd_size-nbd_size).mul_(
+          .01*Unorm/np.sqrt(D))
+      U = torch.cat((U, nbdZ), dim=1)
+    if self.svd:
+      U, s, _ = torch.svd(U, some=True)
+      # rescale to match data
+      U.mul_(torch.norm(s)/np.sqrt(U.shape[1]))
 
     # drop nbd from current outliers
     not_nbd_mask = torch.ones_like(self.errors, dtype=torch.uint8)
@@ -591,12 +610,4 @@ class OutlierPool(object):
     self.outliers = self.outliers[not_nbd_mask]
     self.errors = self.errors[not_nbd_mask]
     self.error_avgs = self.error_avgs[not_nbd_mask]
-
-    if self.svd:
-      # outliers_nbd is (m, D)
-      # assume m ~= d <= D, so U is (D, m)
-      _, s, U = torch.svd(outliers_nbd, some=True)
-      U.mul_(torch.norm(s)/np.sqrt(U.shape[1]))
-    else:
-      U = outliers_nbd.t()
     return U

@@ -183,7 +183,22 @@ def coherence(U1, U2, normalize=False):
   """
   d = U1.size(1)
   if normalize:
-    U1 = U1.div(torch.norm(U1, p=2, dim=0, keepdim=True).add(EPS))
-    U2 = U2.div(torch.norm(U2, p=2, dim=0, keepdim=True).add(EPS))
+    U1 = unit_normalize(U1, p=2, dim=0)
+    U2 = unit_normalize(U2, p=2, dim=0)
   coh = torch.matmul(U1.t(), U2).pow(2).sum().div(d)
   return coh
+
+
+def unit_normalize(X, p=2, dim=None):
+  """Normalize X
+
+  Args:
+    X: tensor
+    p: norm order
+    dim: dimension to normalize
+
+  returns:
+    unitX: normalized tensor
+  """
+  unitX = X.div(torch.norm(X, p=p, dim=dim, keepdim=True).add(EPS))
+  return unitX
