@@ -219,15 +219,19 @@ class _KSubspaceBaseModel(nn.Module):
     """
     reset_mask = self.c_mean <= reset_thr/self.k
     reset_ids = reset_mask.nonzero().view(-1)
-    for ii, idx in enumerate(reset_ids):
-      newU = self.olpool.sample()
-      if newU is None:
-        reset_ids = reset_ids[:ii]
-        break
-      self.Us.data[idx, :] = newU
-      if self.affine:
-        self.bs.data[idx, :] = 0.0
-      self.c_mean[idx] = 1.0/self.k
+    if reset_ids.shape[0] > 0:
+      Unorm = self.Us.data.pow(2).sum(dim=(1, 2)).sqrt().max()
+      for ii, idx in enumerate(reset_ids):
+        newU = self.olpool.sample()
+        if newU is None:
+          reset_ids = reset_ids[:ii]
+          break
+        # re-scale to match size of current bases
+        newU.mul_(Unorm/torch.norm(newU))
+        self.Us.data[idx, :] = newU
+        if self.affine:
+          self.bs.data[idx, :] = 0.0
+        self.c_mean[idx] = 1.0/self.k
     return reset_ids.cpu().numpy()
 
 
@@ -601,8 +605,6 @@ class OutlierPool(object):
       U = torch.cat((U, nbdZ), dim=1)
     if self.svd:
       U, s, _ = torch.svd(U, some=True)
-      # rescale to match data
-      U.mul_(torch.norm(s)/np.sqrt(U.shape[1]))
 
     # drop nbd from current outliers
     not_nbd_mask = torch.ones_like(self.errors, dtype=torch.uint8)
