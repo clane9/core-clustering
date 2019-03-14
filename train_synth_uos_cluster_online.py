@@ -68,7 +68,7 @@ def main():
     args.model_n = args.n
   olpool = mod.OutlierPool(20*args.model_d, args.model_d, stale_thr=1.0,
       outlier_thr=0.0, cos_thr=None, ema_decay=0.9, sample_p=args.ol_sample_p,
-      nbd_type=args.ol_nbd, svd=args.ol_svd) if args.reset_unused else None
+      nbd_type=args.ol_nbd) if args.reset_unused else None
   if args.proj_form:
     reg_params = {
         'U_frosqr_in': args.U_frosqr_in_lamb,
@@ -175,8 +175,6 @@ if __name__ == '__main__':
   parser.add_argument('--ol-nbd', type=str, default='cos',
                       help=('Outlier neighborhood type (cos, lasso) '
                       '[default: cos]'))
-  parser.add_argument('--ol-svd', action='store_true', default=False,
-                      help='Take svd of outlier neighborhood')
   parser.add_argument('--ol-size-scale', action='store_true', default=False,
                       help='Scale outlier objective by cluster size')
   parser.add_argument('--dist', action='store_true', default=False,

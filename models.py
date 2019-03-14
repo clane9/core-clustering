@@ -5,6 +5,7 @@ import warnings
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from sklearn.linear_model import lars_path
 
 import utils as ut
@@ -166,7 +167,7 @@ class _KSubspaceBaseModel(nn.Module):
       loss: shape (batch_size, k)
     """
     reduce_dim = tuple(range(2, x_.dim()))
-    loss = torch.sum((x.unsqueeze(0) - x_)**2, dim=reduce_dim).t()
+    loss = torch.sum((x.unsqueeze(0) - x_)**2, dim=reduce_dim).mul(0.5).t()
     return loss
 
   def reg(self):
@@ -191,6 +192,28 @@ class _KSubspaceBaseModel(nn.Module):
     self._batch_c_mean = torch.mean(self.c, dim=0)
     self.c_mean.mul_(EMA_DECAY).add_(1-EMA_DECAY, self._batch_c_mean)
     return
+
+  def classify(self, x):
+    """Classify a single sample or a batch of data x."""
+    with torch.no_grad():
+      # reshape if single sample
+      if x.dim() == 1:
+        x = x.view(1, -1)
+
+      x_ = self(x)
+      loss = self.loss(x, x_)
+      reg = self.reg()
+
+      # split regs into assign and outside terms
+      reg_in = torch.zeros(self.k, dtype=loss.dtype, device=loss.device)
+      for key, val in reg.items():
+        if key in self.assign_reg_terms:
+          reg_in = reg_in + val
+
+      # update assignment c
+      assign_obj = loss.data + reg_in.data
+      y = assign_obj.argmin(dim=1)
+    return y
 
   def eval_sprs(self):
     """measure robust sparsity of current assignment subset c"""
@@ -229,19 +252,21 @@ class _KSubspaceBaseModel(nn.Module):
     reset_mask = self.c_mean <= self.unused_thr/self.k
     reset_ids = reset_mask.nonzero().view(-1)
     if reset_ids.shape[0] > 0:
-      Unorm = self.Us.data.pow(2).sum(dim=(1, 2)).sqrt().max()
       for ii, idx in enumerate(reset_ids):
-        newU = self.olpool.sample()
-        if newU is None:
+        _, Xnbd = self.olpool.sample()
+        if Xnbd is None:
           reset_ids = reset_ids[:ii]
           break
-        # re-scale to match size of current bases
-        newU.mul_(Unorm/torch.norm(newU))
+        newU = self._lrmf(Xnbd)
         self.Us.data[idx, :] = newU
         if self.affine:
           self.bs.data[idx, :] = 0.0
         self.c_mean[idx] = 1.0/self.k
     return reset_ids.cpu().numpy()
+
+  def _lrmf(self, X):
+    """Compute low-rank matrix factorization of X"""
+    raise NotImplementedError
 
 
 class KSubspaceModel(_KSubspaceBaseModel):
@@ -331,6 +356,29 @@ class KSubspaceModel(_KSubspaceBaseModel):
       regs['z'] = z_frosqr.mul(self.reg_params['z']*0.5)
     return regs
 
+  def _lrmf(self, X):
+    """Compute low-rank matrix factorization of X"""
+    # find soft-threshold depending on reg parameters
+    # X is (m, D)
+    lamb_U = X.shape[0]*self.reg_params['U_frosqr_in']
+    lamb_V = self.reg_params['z']
+    lamb_st = np.sqrt(lamb_U * lamb_V)
+    _, s, U = torch.svd(X, some=False)
+    if lamb_st > 0:
+      # s shape (min(m, D),)
+      if s.shape[0] < self.D:
+        s_zero = torch.zeros(self.D - s.shape[0],
+            dtype=s.dtype, device=s.device)
+        s = torch.cat((s, s_zero))
+
+      s_st = F.relu(s - lamb_st).sqrt()
+      # don't want exact zeros
+      s_st.add_(1e-6*s_st[0])
+      # rescale to account for imbalanced lamb_U, lamb_V
+      s_st.mul_(np.power(lamb_V/lamb_U, 0.25))
+      U.mul_(s_st)
+    return U[:, :self.d]
+
 
 class KSubspaceProjModel(_KSubspaceBaseModel):
   """K-subspace model where low-dim coefficients are computed by a projection
@@ -407,7 +455,7 @@ class KSubspaceProjModel(_KSubspaceBaseModel):
 class OutlierPool(object):
   """Represent running pool of outier data points."""
   def __init__(self, maxlen, nbd_size, stale_thr=1.0, outlier_thr=0.0,
-        cos_thr=None, ema_decay=0.9, sample_p=2, nbd_type='cos', svd=True):
+        cos_thr=None, ema_decay=0.9, sample_p=2, nbd_type='cos'):
     if stale_thr <= 0:
       raise ValueError("Invalid stale_thr {}".format(stale_thr))
     if cos_thr is not None and (cos_thr <= 0 or cos_thr > 1):
@@ -427,7 +475,6 @@ class OutlierPool(object):
     self.ema_decay = ema_decay
     self.sample_p = sample_p
     self.nbd_type = nbd_type
-    self.svd = svd
     self.reset()
     return
 
@@ -524,11 +571,12 @@ class OutlierPool(object):
   def sample(self):
     """Sample a neighborhood of points from the current pool of outliers."""
     if self.outliers.shape[0] < self.nbd_size+1:
-      return None
+      return None, None
 
     # sample
     sample_prob = self.errors.pow(self.sample_p)
     idx = torch.multinomial(sample_prob, 1)
+    x = self.outliers[idx, :]
 
     # find nbd
     unit_outliers = ut.unit_normalize(self.outliers, p=2, dim=1)
@@ -551,24 +599,15 @@ class OutlierPool(object):
         _, _, coefs = lars_path(X, y, method='lasso')
       # choose largest alpha with sufficient support
       sprs = (np.abs(coefs) > 0).sum(axis=0)
-      coef = coefs[:, (sprs == min(self.nbd_size, sprs[-1]))][:, 0]
+      coef = coefs[:, (sprs == min(self.nbd_size-1, sprs[-1]))][:, 0]
 
       coef = torch.from_numpy(coef).to(device=unit_outliers.device)
       nbd = torch.arange(coef.shape[0])[coef.abs() > 0.0]
+      nbd = torch.cat((idx, nbd))
 
     # extract outlier neighborhood
     # (D, nbd_size)
-    U = self.outliers[nbd, :].t()
-    D, nbd_size = U.shape
-    # add noise columns if neighborhood too small
-    # this can happen if omp/lasso terminates early
-    if nbd_size < self.nbd_size:
-      Unorm = torch.norm(U, p=2, dim=0).min()
-      nbdZ = torch.randn(D, self.nbd_size-nbd_size).mul_(
-          .01*Unorm/np.sqrt(D))
-      U = torch.cat((U, nbdZ), dim=1)
-    if self.svd:
-      U, s, _ = torch.svd(U, some=True)
+    Xnbd = self.outliers[nbd, :]
 
     # drop nbd from current outliers
     not_nbd_mask = torch.ones_like(self.errors, dtype=torch.uint8)
@@ -576,4 +615,4 @@ class OutlierPool(object):
     self.outliers = self.outliers[not_nbd_mask]
     self.errors = self.errors[not_nbd_mask]
     self.error_avgs = self.error_avgs[not_nbd_mask]
-    return U
+    return x, Xnbd
