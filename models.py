@@ -5,7 +5,6 @@ import warnings
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from sklearn.linear_model import lars_path
 
 import utils as ut
@@ -16,21 +15,33 @@ EMA_DECAY = 0.9
 
 class _KSubspaceBaseModel(nn.Module):
   """Base K-subspace class."""
+  default_reg_params = dict()
+  assign_reg_terms = set()
 
-  def __init__(self, k, d, D, affine=False, soft_assign=0.0, olpool=None,
-        ol_size_scale=True):
+  def __init__(self, k, d, D, affine=False, reg_params={}, soft_assign=0.0,
+        olpool=None, ol_size_scale=True, unused_thr=0.01):
+    for key in self.default_reg_params:
+      val = reg_params.get(key, None)
+      if val is None:
+        reg_params[key] = self.default_reg_params[key]
+      elif val < 0:
+        raise ValueError("Invalid {} reg parameter {}".format(k, val))
+    if not set(reg_params).issubset(set(self.default_reg_params)):
+      raise ValueError("Invalid reg parameter keys")
     if soft_assign < 0:
-      raise ValueError("Invalid soft-assign parameter {}".format(soft_assign))
+      raise ValueError("Invalid soft_assign parameter {}".format(soft_assign))
+    if unused_thr < 0:
+      raise ValueError("Invalid unused_thr parameter {}".format(unused_thr))
 
     super(_KSubspaceBaseModel, self).__init__()
     self.k = k  # number of groups
     self.d = d  # dimension of manifold
     self.D = D  # number of data points
     self.affine = affine
+    self.reg_params = reg_params
     self.soft_assign = soft_assign
-    self.assign_reg_terms = None  # assigned in child
-    self.ol_reg_terms = None  # assigned in child
     self.ol_size_scale = ol_size_scale
+    self.unused_thr = unused_thr
 
     # group assignment, ultimate shape (batch_size, k)
     self.c = None
@@ -45,10 +56,8 @@ class _KSubspaceBaseModel(nn.Module):
       self.register_parameter('bs', None)
     self.register_buffer('c_mean', torch.ones(k).div_(k))
 
-    if olpool is None:
-      self.olpool = OutlierPool(20*d, d)
-    else:
-      self.olpool = olpool
+    self.olpool = olpool
+    if olpool is not None:
       self.olpool.reset()
     return
 
@@ -109,42 +118,42 @@ class _KSubspaceBaseModel(nn.Module):
       update_ol: update outlier pool
 
     Returns:
-      obj, scale_obj, loss, reg
+      obj, scale_obj, loss, reg_in, reg_out
       x_: reconstruction, shape (k, batch_size, D)
     """
     x_ = self(x)
-    losses = self.loss(x, x_)
-    regs = self.reg()
+    loss = self.loss(x, x_)
+    reg = self.reg()
+
+    # split regs into assign and outside terms
+    reg_in = torch.zeros(self.k, dtype=loss.dtype, device=loss.device)
+    reg_out = torch.zeros(self.k, dtype=loss.dtype, device=loss.device)
+    for key, val in reg.items():
+      if key in self.assign_reg_terms:
+        reg_in = reg_in + val
+      else:
+        reg_out = reg_out + val
 
     # update assignment c
-    assign_obj = losses.data + sum([regs[k].data for k in regs
-        if k in self.assign_reg_terms])
+    assign_obj = loss.data + reg_in.data
     self.set_assign(assign_obj)
+    loss = self.c * loss
+    reg_in = self.c * reg_in
 
     # update outlier pool
-    if update_ol:
-      ol_obj = losses.data + sum([regs[k].data for k in regs
-          if k in self.ol_reg_terms])
+    if update_ol and self.olpool is not None:
+      ol_obj = loss.data + reg_in.data
       if self.ol_size_scale:
-        ol_obj = ol_obj*self.c_mean
-      ol_obj = (self.c*ol_obj).sum(dim=1)
+        ol_obj = self.c_mean * ol_obj
+      ol_obj = ol_obj.sum(dim=1)
       self.olpool.append(x, ol_obj)
 
-    # weight loss, reg by assignment where needed, and average over batch
-    losses = torch.mean(self.c*losses, dim=0)
-    for k, reg in regs.items():
-      if k in self.assign_reg_terms:
-        reg = self.c*reg if reg.dim() == 2 else self._batch_c_mean*reg
-      if reg.dim() == 2:
-        reg = reg.mean(dim=0)
-      regs[k] = reg
-    # combine reg terms
-    regs = sum(regs.values()) if len(regs) > 0 else torch.zeros_like(losses)
-
-    loss = losses.sum()
-    reg = regs.sum()
-    obj = loss + reg
-    return obj, loss, reg, x_
+    # reduce and compute objective
+    loss = loss.sum(dim=1).mean()
+    reg_in = reg_in.sum(dim=1).mean()
+    reg_out = reg_out.sum()  # always shape (k,)
+    obj = loss + reg_in + reg_out
+    return obj, loss, reg_in, reg_out, x_
 
   def loss(self, x, x_):
     """Evaluate reconstruction loss
@@ -210,14 +219,14 @@ class _KSubspaceBaseModel(nn.Module):
     ranks = (svs > tol*svs[:, 0].median()).sum(dim=1)
     return ranks.cpu().numpy(), svs.cpu().numpy()
 
-  def reset_unused(self, reset_thr=.01):
+  def reset_unused(self):
     """Reset (nearly) unused clusters by sampling neighborhood from pool of
     outliers.
 
     Returns:
       reset_ids: clusters that were reset
     """
-    reset_mask = self.c_mean <= reset_thr/self.k
+    reset_mask = self.c_mean <= self.unused_thr/self.k
     reset_ids = reset_mask.nonzero().view(-1)
     if reset_ids.shape[0] > 0:
       Unorm = self.Us.data.pow(2).sum(dim=(1, 2)).sqrt().max()
@@ -238,32 +247,15 @@ class _KSubspaceBaseModel(nn.Module):
 class KSubspaceModel(_KSubspaceBaseModel):
   """K-subspace model where low-dim coefficients are computed in closed
   form."""
+  default_reg_params = {
+      'U_frosqr_in': 0.01, 'U_frosqr_out': 1e-4, 'U_fro_out': 0.0, 'z': 0.01
+  }
+  assign_reg_terms = {'U_frosqr_in', 'z'}
 
-  def __init__(self, k, d, D, affine=False, U_lamb=0.001, z_lamb=0.1,
-        coh_gamma=0.0, coh_margin=0.75, soft_assign=0.0,
-        assign_reg_terms=('z'), olpool=None, ol_reg_terms=('U', 'z'),
-        ol_size_scale=True):
-    if U_lamb < 0:
-      raise ValueError("Invalid U reg parameter {}".format(U_lamb))
-    if z_lamb < 0:
-      raise ValueError("Invalid z reg parameter {}".format(z_lamb))
-    if coh_gamma < 0:
-      raise ValueError(("Invalid coherence reg "
-          "parameter {}").format(coh_gamma))
-    if coh_gamma > 0 and coh_margin < 0:
-      raise ValueError(("Invalid coherence margin "
-          "parameter {}").format(coh_margin))
-    if not ('z' in assign_reg_terms or z_lamb == 0):
-      raise ValueError("Assignment objective must contain z reg")
-
-    super(KSubspaceModel, self).__init__(k, d, D, affine, soft_assign, olpool,
-        ol_size_scale)
-    self.U_lamb = U_lamb
-    self.z_lamb = z_lamb
-    self.coh_gamma = coh_gamma
-    self.coh_margin = coh_margin
-    self.assign_reg_terms = assign_reg_terms
-    self.ol_reg_terms = ol_reg_terms
+  def __init__(self, k, d, D, affine=False, reg_params={}, soft_assign=0.0,
+        olpool=None, ol_size_scale=True):
+    super(KSubspaceModel, self).__init__(k, d, D, affine, reg_params,
+        soft_assign, olpool, ol_size_scale)
     self.reset_parameters()
     return
 
@@ -295,11 +287,11 @@ class KSubspaceModel(_KSubspaceBaseModel):
     Uts = self.Us.data.transpose(1, 2)
     # (k x d x d)
     A = torch.matmul(Uts, self.Us.data)
-    if self.z_lamb > 0:
+    if self.reg_params['z'] > 0:
       # (d x d)
       lambeye = torch.eye(self.d, dtype=A.dtype, device=A.device)
       # (1 x d x d)
-      lambeye.mul_(self.z_lamb).unsqueeze_(0)
+      lambeye.mul_(self.reg_params['z']).unsqueeze_(0)
       # (k x d x d)
       A.add_(lambeye)
 
@@ -320,57 +312,39 @@ class KSubspaceModel(_KSubspaceBaseModel):
   def reg(self):
     """Evaluate subspace regularization."""
     regs = dict()
-    # (k,)
-    if self.U_lamb > 0:
-      regs['U'] = torch.sum(self.Us.pow(2), dim=(1, 2)).mul(self.U_lamb*0.5)
+    # U regularization, each is shape (k,)
+    U_fro_keys = ('U_frosqr_in', 'U_frosqr_out', 'U_fro_out')
+    if max([self.reg_params[key] for key in U_fro_keys]) > 0:
+      U_frosqr = torch.sum(self.Us.pow(2), dim=(1, 2))
+      for key in U_fro_keys[:2]:
+        if self.reg_params[key] > 0:
+          regs[key] = U_frosqr.mul(self.reg_params[key]*0.5)
+      if self.reg_params['U_fro_out'] > 0:
+        U_fro = U_frosqr.sqrt()
+        regs['U_fro_out'] = U_fro.mul(self.reg_params['U_fro_out'])
 
-    # (batch_size, k)
+    # z regularization, shape is (batch_size, k)
     # does not affect gradients, only included to ensure objective value
     # is accurate
-    if self.z_lamb > 0:
-      regs['z'] = torch.sum(self.z.data.pow(2), dim=2).t().mul(self.z_lamb*0.5)
-
-    if self.coh_gamma > 0:
-      unitUs = ut.unit_normalize(self.Us, p=2, dim=1)
-      # coherence (sum of squared cosine angles) between subspace bases,
-      # normalized by "self-coherence".
-      # (k, k)
-      coh = torch.matmul(unitUs.transpose(1, 2).unsqueeze(1),
-          unitUs.unsqueeze(0)).pow(2).sum(dim=(2, 3))
-      coh = coh.div(coh.diag().view(-1, 1))
-      # soft-threshold to incur no penalty if bases sufficiently incoherent
-      if self.coh_margin > 0:
-        coh = F.relu(coh - self.coh_margin)
-      regs['coh'] = coh.sum(dim=1).sub(coh.diag()).mul(
-          self.coh_gamma/(self.k-1))
+    if self.reg_params['z'] > 0:
+      z_frosqr = torch.sum(self.z.data.pow(2), dim=2).t()
+      regs['z'] = z_frosqr.mul(self.reg_params['z']*0.5)
     return regs
 
 
 class KSubspaceProjModel(_KSubspaceBaseModel):
   """K-subspace model where low-dim coefficients are computed by a projection
   matrix."""
+  default_reg_params = {
+      'U_frosqr_in': 0.01, 'U_frosqr_out': 1e-4
+  }
+  assign_reg_terms = {'U_frosqr_in'}
 
-  def __init__(self, k, d, D, affine=False, symmetric=False, U_lamb=0.001,
-        coh_gamma=0.0, coh_margin=0.75, soft_assign=0.0, assign_reg_terms=(),
-        olpool=None, ol_reg_terms=('U',), ol_size_scale=True):
-    if U_lamb < 0:
-      raise ValueError("Invalid reg parameter {}".format(U_lamb))
-    if coh_gamma < 0:
-      raise ValueError(("Invalid coherence reg "
-          "parameter {}").format(coh_gamma))
-    if coh_gamma > 0 and coh_margin < 0:
-      raise ValueError(("Invalid coherence margin "
-          "parameter {}").format(coh_margin))
-
-    super(KSubspaceProjModel, self).__init__(k, d, D, affine, soft_assign,
-        olpool, ol_size_scale)
+  def __init__(self, k, d, D, affine=False, symmetric=False, reg_params={},
+        soft_assign=0.0, olpool=None, ol_size_scale=True):
+    super(KSubspaceProjModel, self).__init__(k, d, D, affine, reg_params,
+        soft_assign, olpool, ol_size_scale)
     self.symmetric = symmetric
-    self.U_lamb = U_lamb
-    self.coh_gamma = coh_gamma
-    self.coh_margin = coh_margin
-    self.assign_reg_terms = assign_reg_terms
-    self.ol_reg_terms = ol_reg_terms
-
     if self.symmetric:
       self.register_parameter('Vs', None)
     else:
@@ -417,26 +391,16 @@ class KSubspaceProjModel(_KSubspaceBaseModel):
   def reg(self):
     """Evaluate subspace regularization."""
     regs = dict()
-    if self.U_lamb > 0:
+    # U regularization, each is shape (k,)
+    U_fro_keys = ('U_frosqr_in', 'U_frosqr_out')
+    if max([self.reg_params[key] for key in U_fro_keys]) > 0:
       if self.symmetric:
-        regs['U'] = torch.sum(self.Us.pow(2), dim=(1, 2)).mul(self.U_lamb)
+        U_frosqr = torch.sum(self.Us.pow(2), dim=(1, 2))
       else:
-        regs['U'] = (torch.sum(self.Us.pow(2), dim=(1, 2)) +
-            torch.sum(self.Vs.pow(2), dim=(1, 2))).mul(self.U_lamb*0.5)
-
-    if self.coh_gamma > 0:
-      unitUs = ut.unit_normalize(self.Us, p=2, dim=1)
-      # coherence (sum of squared cosine angles) between subspace bases,
-      # normalized by "self-coherence".
-      # (k, k)
-      coh = torch.matmul(unitUs.transpose(1, 2).unsqueeze(1),
-          unitUs.unsqueeze(0)).pow(2).sum(dim=(2, 3))
-      coh = coh.div(coh.diag().view(-1, 1))
-      # soft-threshold to incur no penalty if bases sufficiently incoherent
-      if self.coh_margin > 0:
-        coh = F.relu(coh - self.coh_margin)
-      regs['coh'] = coh.sum(dim=1).sub(coh.diag()).mul(
-          self.coh_gamma/(self.k-1))
+        U_frosqr = (torch.sum(self.Us.pow(2), dim=(1, 2)) +
+            torch.sum(self.Vs.pow(2), dim=(1, 2))).mul(0.5)
+      for key in U_fro_keys:
+        regs[key] = U_frosqr.mul(self.reg_params[key])
     return regs
 
 

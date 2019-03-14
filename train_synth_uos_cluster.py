@@ -68,25 +68,28 @@ def main():
     args.model_d = args.d
   if args.model_n is None or args.model_n <= 0:
     args.model_n = args.n
-  args.assign_reg_terms = args.assign_reg_terms.split(',')
-  if 'U' not in args.assign_reg_terms:
-    args.U_lamb /= args.model_n
   olpool = mod.OutlierPool(20*args.model_d, args.model_d, stale_thr=1.0,
-      outlier_thr=0.0, ema_decay=0.9, sample_p=2, coh_super_nbd_size=None,
-      svd=True)
-  ol_reg_terms = ('U', 'z')
+      outlier_thr=0.0, cos_thr=None, ema_decay=0.9, sample_p=args.ol_sample_p,
+      nbd_type=args.ol_nbd, svd=args.ol_svd) if args.reset_unused else None
   if args.proj_form:
+    reg_params = {
+        'U_frosqr_in': args.U_frosqr_in_lamb,
+        'U_frosqr_out': args.U_frosqr_out_lamb,
+    }
     model = mod.KSubspaceProjModel(args.model_n, args.model_d, args.D,
-        args.affine, args.symmetric, U_lamb=args.U_lamb,
-        coh_gamma=args.coh_gamma, coh_margin=0.0, soft_assign=args.soft_assign,
-        c_sigma=args.c_sigma, assign_reg_terms=args.assign_reg_terms,
-        size_scale=args.size_scale, olpool=olpool, ol_reg_terms=ol_reg_terms)
+        args.affine, args.symmetric, reg_params=reg_params,
+        soft_assign=args.soft_assign, olpool=olpool,
+        ol_size_scale=args.ol_size_scale)
   else:
+    reg_params = {
+        'U_frosqr_in': args.U_frosqr_in_lamb,
+        'U_frosqr_out': args.U_frosqr_out_lamb,
+        'U_fro_out': args.U_fro_out_lamb,
+        'z': args.z_lamb
+    }
     model = mod.KSubspaceModel(args.model_n, args.model_d, args.D, args.affine,
-        U_lamb=args.U_lamb, z_lamb=args.z_lamb, coh_gamma=args.coh_gamma,
-        coh_margin=0.0, soft_assign=args.soft_assign, c_sigma=args.c_sigma,
-        assign_reg_terms=args.assign_reg_terms, size_scale=args.size_scale,
-        olpool=olpool, ol_reg_terms=ol_reg_terms)
+        reg_params=reg_params, soft_assign=args.soft_assign, olpool=olpool,
+        ol_size_scale=args.ol_size_scale)
   model = model.to(device)
   if args.dist:
     if use_cuda:
@@ -144,22 +147,19 @@ if __name__ == '__main__':
                       help='Model subspace dimension [default: d]')
   parser.add_argument('--symmetric', action='store_true',
                       help='Projection matrix is U^T')
-  parser.add_argument('--U-lamb', type=float, default=1e-4,
-                      help='Subspace reg parameter [default: 1e-4]')
+  parser.add_argument('--U-frosqr-in-lamb', type=float, default=0.01,
+                      help=('Frobenius squared U reg parameter, '
+                      'inside assignment [default: 0.01]'))
+  parser.add_argument('--U-frosqr-out-lamb', type=float, default=1e-4,
+                      help=('Frobenius squared U reg parameter, '
+                      'outside assignment [default: 1e-4]'))
+  parser.add_argument('--U-fro-out-lamb', type=float, default=0.0,
+                      help=('Frobenius U reg parameter, '
+                      'outside assignment [default: 0.0]'))
   parser.add_argument('--z-lamb', type=float, default=0.1,
                       help='Coefficient reg parameter [default: 0.1]')
-  parser.add_argument('--coh-gamma', type=float, default=0.0,
-                      help='Coherence reg parameter [default: 0.0]')
   parser.add_argument('--soft-assign', type=float, default=0.1,
                       help='Soft assignment parameter [default: 0.1]')
-  parser.add_argument('--c-sigma', type=float, default=0.01,
-                      help='Assignment noise parameter [default: 0.01]')
-  parser.add_argument('--assign-reg-terms', type=str, default='U,z',
-                      help=('Assignment reg terms, subset of U,z,coh '
-                          '[default: U,z]'))
-  parser.add_argument('--size-scale', action='store_true',
-                      help=('Scale gradients to compensate for cluster '
-                          'size imbalance'))
   # training settings
   parser.add_argument('--batch-size', type=int, default=100,
                       help='Input batch size for training [default: 100]')
@@ -171,6 +171,15 @@ if __name__ == '__main__':
                       help='Initial learning rate [default: 0.5]')
   parser.add_argument('--reset-unused', action='store_true', default=False,
                       help='Whether to reset unused clusters')
+  parser.add_argument('--ol-sample-p', type=int, default=2,
+                      help='Outlier sampling power [default: 2]')
+  parser.add_argument('--ol-nbd', type=str, default='cos',
+                      help=('Outlier neighborhood type (cos, lasso) '
+                      '[default: cos]'))
+  parser.add_argument('--ol-svd', action='store_true', default=False,
+                      help='Take svd of outlier neighborhood')
+  parser.add_argument('--ol-size-scale', action='store_true', default=False,
+                      help='Scale outlier objective by cluster size')
   parser.add_argument('--dist', action='store_true', default=False,
                       help='Enables distributed training')
   parser.add_argument('--cuda', action='store_true', default=False,

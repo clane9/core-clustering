@@ -16,7 +16,7 @@ import utils as ut
 
 def train_loop(model, data_loader, device, optimizer, out_dir=None, epochs=200,
       chkp_freq=50, stop_freq=-1, scheduler=None, dist_mode=False,
-      eval_rank=False, reset_unused=False, reset_kwargs={}):
+      eval_rank=False, reset_unused=False):
   """Train k-subspace model for series of epochs.
 
   Args:
@@ -33,10 +33,9 @@ def train_loop(model, data_loader, device, optimizer, out_dir=None, epochs=200,
     eval_rank: evaluate ranks of group models, only implemented for subspace
       models (default: False)
     reset_unused: whether to reset unused clusters (default: False)
-    reset_kwargs: kwargs to pass to reset_unused (default: {})
   """
   printformstr = ('(epoch {:d}/{:d}) lr={:.3e} err={:.4f} obj={:.3e} '
-      'loss={:.3e} reg={:.3e} sprs={:.2f} |x_|={:.3e} ')
+      'loss={:.3e} reg={:.3e},{:.3e} sprs={:.2f} |x_|={:.3e} ')
   if eval_rank:
     printformstr += 'rank(min)(max)={:.0f},{:.0f},{:.0f} '
   printformstr += 'resets={:d} samp/s={:.0f} rtime={:.3f}'
@@ -46,11 +45,13 @@ def train_loop(model, data_loader, device, optimizer, out_dir=None, epochs=200,
   is_logging = (not dist_mode) or (dist.get_rank() == 0)
 
   if is_logging and out_dir is not None:
-    logheader = 'Epoch,LR,Err,Obj,Loss,Reg,Sprs,Norm.x_,'
+    logheader = ('Epoch,LR,Err,Obj,Loss,Reg.assign,Reg.outside,'
+        'Sprs,Norm.x_,')
     if eval_rank:
       logheader += 'Rank.med,Rank.min,Rank.max,'
     logheader += 'Resets,Samp.s,RT'
-    logformstr = '{:d},{:.9e},{:.9f},{:.9e},{:.9e},{:.9e},{:.9e},{:.9e},'
+    logformstr = ('{:d},{:.9e},{:.9f},{:.9e},{:.9e},{:.9e},{:.9e},'
+        '{:.9e},{:.9e},')
     if eval_rank:
       logformstr += '{:.9f},{:.0f},{:.0f},'
     logformstr += '{:d},{:.0f},{:.9f}'
@@ -83,7 +84,7 @@ def train_loop(model, data_loader, device, optimizer, out_dir=None, epochs=200,
 
       (metrics, conf_mats[epoch-1, :], epoch_svs,
           epoch_resets) = train_epoch(model, data_loader, optimizer, device,
-              dist_mode, eval_rank, reset_unused, reset_kwargs)
+              dist_mode, eval_rank, reset_unused)
       lr = ut.get_learning_rate(optimizer)
 
       if eval_rank:
@@ -160,7 +161,7 @@ def train_loop(model, data_loader, device, optimizer, out_dir=None, epochs=200,
 
 
 def train_epoch(model, data_loader, optimizer, device, dist_mode=False,
-      eval_rank=False, reset_unused=False, reset_kwargs={}):
+      eval_rank=False, reset_unused=False):
   """train model for one epoch and record convergence measures."""
   epoch_tic = time.time()
   metrics = None
@@ -172,14 +173,15 @@ def train_epoch(model, data_loader, optimizer, device, dist_mode=False,
 
     # opt step
     optimizer.zero_grad()
-    (batch_obj, batch_loss, batch_reg, x_) = model.objective(x)
+    (batch_obj, batch_loss,
+        batch_reg_in, batch_reg_out, x_) = model.objective(x)
     batch_obj.backward()
     optimizer.step()
 
     batch_sprs = model.eval_sprs()
     batch_norm_x_ = model.eval_shrink(x, x_)
-    batch_metrics = (batch_obj, batch_loss, batch_reg, batch_sprs,
-        batch_norm_x_)
+    batch_metrics = (batch_obj, batch_loss, batch_reg_in, batch_reg_out,
+        batch_sprs, batch_norm_x_)
 
     # eval batch cluster confusion
     batch_conf_mat = ut.eval_confusion(model.groups.data.cpu(), groups,
@@ -206,13 +208,16 @@ def train_epoch(model, data_loader, optimizer, device, dist_mode=False,
     conf_mat.update(batch_conf_mat, 1)
 
     if reset_unused:
-      reset_ids = model.reset_unused(**reset_kwargs)
+      reset_ids = model.reset_unused()
       if reset_ids.size > 0:
         # zero optimizer states
-        for p in [model.Us, model.bs]:
+        for p in model.parameters():
+          if not p.requires_grad:
+            continue
           state = optimizer.state[p]
           for key, val in state.items():
             if isinstance(val, torch.Tensor) and val.shape == p.shape:
+              # assuming all parameters have k as first dim.
               val[reset_ids, :] = 0.0
         resets.append(reset_ids)
 
