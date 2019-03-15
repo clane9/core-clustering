@@ -20,7 +20,7 @@ class _KSubspaceBaseModel(nn.Module):
   assign_reg_terms = set()
 
   def __init__(self, k, d, D, affine=False, reg_params={}, soft_assign=0.0,
-        olpool=None, ol_size_scale=True, unused_thr=0.01):
+        olpool=None, ol_size_scale=True, unused_thr=0.01, reset_lrmf=True):
     for key in self.default_reg_params:
       val = reg_params.get(key, None)
       if val is None:
@@ -43,6 +43,7 @@ class _KSubspaceBaseModel(nn.Module):
     self.soft_assign = soft_assign
     self.ol_size_scale = ol_size_scale
     self.unused_thr = unused_thr
+    self.reset_lrmf = reset_lrmf
 
     # group assignment, ultimate shape (batch_size, k)
     self.c = None
@@ -278,9 +279,9 @@ class KSubspaceModel(_KSubspaceBaseModel):
   assign_reg_terms = {'U_frosqr_in', 'z'}
 
   def __init__(self, k, d, D, affine=False, reg_params={}, soft_assign=0.0,
-        olpool=None, ol_size_scale=True):
+        olpool=None, ol_size_scale=True, unused_thr=0.01, reset_lrmf=True):
     super(KSubspaceModel, self).__init__(k, d, D, affine, reg_params,
-        soft_assign, olpool, ol_size_scale)
+        soft_assign, olpool, ol_size_scale, unused_thr, reset_lrmf)
     self.reset_parameters()
     return
 
@@ -364,20 +365,26 @@ class KSubspaceModel(_KSubspaceBaseModel):
     lamb_V = self.reg_params['z']
     lamb_st = np.sqrt(lamb_U * lamb_V)
     _, s, U = torch.svd(X, some=False)
+    U = U[:, :self.d]
     if lamb_st > 0:
       # s shape (min(m, D),)
-      if s.shape[0] < self.D:
-        s_zero = torch.zeros(self.D - s.shape[0],
+      if s.shape[0] < self.d:
+        s_zero = torch.zeros(self.d - s.shape[0],
             dtype=s.dtype, device=s.device)
         s = torch.cat((s, s_zero))
-
+      else:
+        s = s[:self.d]
       s_st = F.relu(s - lamb_st).sqrt()
       # don't want exact zeros
       s_st.add_(1e-6*s_st[0])
       # rescale to account for imbalanced lamb_U, lamb_V
       s_st.mul_(np.power(lamb_V/lamb_U, 0.25))
-      U.mul_(s_st)
-    return U[:, :self.d]
+      if self.reset_lrmf:
+        U.mul_(s_st)
+      else:
+        # Do not shrink singular values, only use s_st to determine U scale
+        U.mul_(torch.norm(s_st) / np.sqrt(self.d))
+    return U
 
 
 class KSubspaceProjModel(_KSubspaceBaseModel):
@@ -389,9 +396,10 @@ class KSubspaceProjModel(_KSubspaceBaseModel):
   assign_reg_terms = {'U_frosqr_in'}
 
   def __init__(self, k, d, D, affine=False, symmetric=False, reg_params={},
-        soft_assign=0.0, olpool=None, ol_size_scale=True):
+        soft_assign=0.0, olpool=None, ol_size_scale=True, unused_thr=0.01,
+        reset_lrmf=True):
     super(KSubspaceProjModel, self).__init__(k, d, D, affine, reg_params,
-        soft_assign, olpool, ol_size_scale)
+        soft_assign, olpool, ol_size_scale, unused_thr, reset_lrmf)
     self.symmetric = symmetric
     if self.symmetric:
       self.register_parameter('Vs', None)
