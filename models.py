@@ -20,7 +20,8 @@ class _KSubspaceBaseModel(nn.Module):
   assign_reg_terms = set()
 
   def __init__(self, k, d, D, affine=False, reg_params={}, soft_assign=0.0,
-        olpool=None, ol_size_scale=True, unused_thr=0.01, reset_lrmf=True):
+        olpool=None, ol_size_scale=True, unused_thr=0.01, reset_lrmf=True,
+        reset_warmup=0):
     for key in self.default_reg_params:
       val = reg_params.get(key, None)
       if val is None:
@@ -33,6 +34,9 @@ class _KSubspaceBaseModel(nn.Module):
       raise ValueError("Invalid soft_assign parameter {}".format(soft_assign))
     if unused_thr < 0:
       raise ValueError("Invalid unused_thr parameter {}".format(unused_thr))
+    if reset_warmup < 0:
+      raise ValueError("Invalid reset_warmup parameter {}".format(
+          reset_warmup))
 
     super(_KSubspaceBaseModel, self).__init__()
     self.k = k  # number of groups
@@ -44,6 +48,7 @@ class _KSubspaceBaseModel(nn.Module):
     self.ol_size_scale = ol_size_scale
     self.unused_thr = unused_thr
     self.reset_lrmf = reset_lrmf
+    self.reset_warmup = reset_warmup
 
     # group assignment, ultimate shape (batch_size, k)
     self.c = None
@@ -57,6 +62,8 @@ class _KSubspaceBaseModel(nn.Module):
     else:
       self.register_parameter('bs', None)
     self.register_buffer('c_mean', torch.ones(k).div_(k))
+    self.register_buffer('steps_since_reset',
+        torch.full((k,), reset_warmup+1, dtype=torch.int64))
 
     self.olpool = olpool
     if olpool is not None:
@@ -250,7 +257,8 @@ class _KSubspaceBaseModel(nn.Module):
     Returns:
       reset_ids: clusters that were reset
     """
-    reset_mask = self.c_mean <= self.unused_thr/self.k
+    done_warming_up = self.steps_since_reset >= self.reset_warmup
+    reset_mask = done_warming_up * (self.c_mean <= self.unused_thr/self.k)
     reset_ids = reset_mask.nonzero().view(-1)
     if reset_ids.shape[0] > 0:
       for ii, idx in enumerate(reset_ids):
@@ -258,16 +266,23 @@ class _KSubspaceBaseModel(nn.Module):
         if Xnbd is None:
           reset_ids = reset_ids[:ii]
           break
+        if self.affine:
+          self.bs.data[idx, :] = Xnbd.mean(dim=0)
+          Xnbd = Xnbd.sub(self.bs.data[idx, :])
         newU = self._lrmf(Xnbd)
         self.Us.data[idx, :] = newU
-        if self.affine:
-          self.bs.data[idx, :] = 0.0
         self.c_mean[idx] = 1.0/self.k
+        self.steps_since_reset[idx] = 0
     return reset_ids.cpu().numpy()
 
   def _lrmf(self, X):
     """Compute low-rank matrix factorization of X"""
     raise NotImplementedError
+
+  def step(self):
+    """Increment steps since reset counter."""
+    self.steps_since_reset.add_(1)
+    return
 
 
 class KSubspaceModel(_KSubspaceBaseModel):
@@ -279,9 +294,11 @@ class KSubspaceModel(_KSubspaceBaseModel):
   assign_reg_terms = {'U_frosqr_in', 'z'}
 
   def __init__(self, k, d, D, affine=False, reg_params={}, soft_assign=0.0,
-        olpool=None, ol_size_scale=True, unused_thr=0.01, reset_lrmf=True):
+        olpool=None, ol_size_scale=True, unused_thr=0.01, reset_lrmf=True,
+        reset_warmup=0):
     super(KSubspaceModel, self).__init__(k, d, D, affine, reg_params,
-        soft_assign, olpool, ol_size_scale, unused_thr, reset_lrmf)
+        soft_assign, olpool, ol_size_scale, unused_thr, reset_lrmf,
+        reset_warmup)
     self.reset_parameters()
     return
 
@@ -339,15 +356,25 @@ class KSubspaceModel(_KSubspaceBaseModel):
     """Evaluate subspace regularization."""
     regs = dict()
     # U regularization, each is shape (k,)
-    U_fro_keys = ('U_frosqr_in', 'U_frosqr_out', 'U_fro_out')
-    if max([self.reg_params[key] for key in U_fro_keys]) > 0:
+    if max([self.reg_params[key] for key in
+          ('U_frosqr_in', 'U_frosqr_out', 'U_fro_out')]) > 0:
       U_frosqr = torch.sum(self.Us.pow(2), dim=(1, 2))
-      for key in U_fro_keys[:2]:
-        if self.reg_params[key] > 0:
-          regs[key] = U_frosqr.mul(self.reg_params[key]*0.5)
-      if self.reg_params['U_fro_out'] > 0:
-        U_fro = U_frosqr.sqrt()
-        regs['U_fro_out'] = U_fro.mul(self.reg_params['U_fro_out'])
+
+      if self.reg_params['U_frosqr_in'] > 0:
+        regs['U_frosqr_in'] = U_frosqr.mul(self.reg_params['U_frosqr_in']*0.5)
+
+      if max([self.reg_params[key] for key in
+            ('U_frosqr_out', 'U_fro_out')]) > 0:
+        done_warming_up = (self.steps_since_reset >= self.reset_warmup).float()
+
+        if self.reg_params['U_frosqr_out'] > 0:
+          lamb = self.reg_params['U_frosqr_out'] * done_warming_up
+          regs['U_frosqr_out'] = U_frosqr.mul(lamb*0.5)
+
+        if self.reg_params['U_fro_out'] > 0:
+          U_fro = U_frosqr.sqrt()
+          lamb = self.reg_params['U_fro_out'] * done_warming_up
+          regs['U_fro_out'] = U_fro.mul(lamb)
 
     # z regularization, shape is (batch_size, k)
     # does not affect gradients, only included to ensure objective value
@@ -397,9 +424,10 @@ class KSubspaceProjModel(_KSubspaceBaseModel):
 
   def __init__(self, k, d, D, affine=False, symmetric=False, reg_params={},
         soft_assign=0.0, olpool=None, ol_size_scale=True, unused_thr=0.01,
-        reset_lrmf=True):
+        reset_lrmf=True, reset_warmup=0):
     super(KSubspaceProjModel, self).__init__(k, d, D, affine, reg_params,
-        soft_assign, olpool, ol_size_scale, unused_thr, reset_lrmf)
+        soft_assign, olpool, ol_size_scale, unused_thr, reset_lrmf,
+        reset_warmup)
     self.symmetric = symmetric
     if self.symmetric:
       self.register_parameter('Vs', None)
@@ -448,15 +476,21 @@ class KSubspaceProjModel(_KSubspaceBaseModel):
     """Evaluate subspace regularization."""
     regs = dict()
     # U regularization, each is shape (k,)
-    U_fro_keys = ('U_frosqr_in', 'U_frosqr_out')
-    if max([self.reg_params[key] for key in U_fro_keys]) > 0:
+    if max([self.reg_params[key] for key in
+          ('U_frosqr_in', 'U_frosqr_out')]) > 0:
       if self.symmetric:
         U_frosqr = torch.sum(self.Us.pow(2), dim=(1, 2))
       else:
         U_frosqr = (torch.sum(self.Us.pow(2), dim=(1, 2)) +
             torch.sum(self.Vs.pow(2), dim=(1, 2))).mul(0.5)
-      for key in U_fro_keys:
-        regs[key] = U_frosqr.mul(self.reg_params[key])
+
+      if self.reg_params['U_frosqr_in'] > 0:
+        regs['U_frosqr_in'] = U_frosqr.mul(self.reg_params['U_frosqr_in'])
+
+      if self.reg_params['U_frosqr_out'] > 0:
+        done_warming_up = (self.steps_since_reset >= self.reset_warmup).float()
+        lamb = self.reg_params['U_frosqr_out'] * done_warming_up
+        regs['U_frosqr_out'] = U_frosqr.mul(lamb)
     return regs
 
 

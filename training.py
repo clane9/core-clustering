@@ -177,6 +177,7 @@ def train_epoch(model, data_loader, optimizer, device, dist_mode=False,
         batch_reg_in, batch_reg_out, x_) = model.objective(x)
     batch_obj.backward()
     optimizer.step()
+    model.step()  # increment step counter
 
     batch_sprs = model.eval_sprs()
     batch_norm_x_ = model.eval_shrink(x, x_)

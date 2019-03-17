@@ -12,6 +12,7 @@ import pickle
 import torch
 import torch.distributed as dist
 from torch.utils.data import DataLoader
+import numpy as np
 
 import datasets as dat
 import models as mod
@@ -66,7 +67,14 @@ def main():
     args.model_d = args.d
   if args.model_n is None or args.model_n <= 0:
     args.model_n = args.n
-  olpool = mod.OutlierPool(20*args.model_d, args.model_d, stale_thr=1.0,
+  if args.ol_nbd_size is None or args.ol_nbd_size <= 0:
+    args.ol_nbd_size = args.model_d
+  if args.ol_pool_size is None or args.ol_pool_size <= 0:
+    # coupon collector estimate
+    # https://en.wikipedia.org/wiki/Coupon_collector%27s_problem
+    args.ol_pool_size = int(np.ceil(args.model_n*np.log(args.model_n) +
+        (args.ol_nbd_size - 1)*args.model_n*np.log(np.log(args.model_n))))
+  olpool = mod.OutlierPool(args.ol_pool_size, args.ol_nbd_size, stale_thr=1.0,
       outlier_thr=0.0, cos_thr=None, ema_decay=0.9, sample_p=args.ol_sample_p,
       nbd_type=args.ol_nbd) if args.reset_unused else None
   if args.proj_form:
@@ -77,7 +85,8 @@ def main():
     model = mod.KSubspaceProjModel(args.model_n, args.model_d, args.D,
         args.affine, args.symmetric, reg_params=reg_params,
         soft_assign=args.soft_assign, olpool=olpool,
-        ol_size_scale=args.ol_size_scale)
+        ol_size_scale=args.ol_size_scale, reset_lrmf=args.reset_lrmf,
+        reset_warmup=args.reset_warmup)
   else:
     reg_params = {
         'U_frosqr_in': args.U_frosqr_in_lamb,
@@ -87,7 +96,8 @@ def main():
     }
     model = mod.KSubspaceModel(args.model_n, args.model_d, args.D, args.affine,
         reg_params=reg_params, soft_assign=args.soft_assign, olpool=olpool,
-        ol_size_scale=args.ol_size_scale)
+        ol_size_scale=args.ol_size_scale, reset_lrmf=args.reset_lrmf,
+        reset_warmup=args.reset_warmup)
   model = model.to(device)
   if args.dist:
     if use_cuda:
@@ -170,6 +180,12 @@ if __name__ == '__main__':
                       help='Initial learning rate [default: 0.5]')
   parser.add_argument('--reset-unused', action='store_true', default=False,
                       help='Whether to reset unused clusters')
+  parser.add_argument('--ol-pool-size', type=int, default=None,
+                      help=('Outlier pool size '
+                      '[default: coupon collector expectation]'))
+  parser.add_argument('--ol-nbd-size', type=int, default=None,
+                      help=('Outlier sampling neighborhood size '
+                      '[default: model_d]'))
   parser.add_argument('--ol-sample-p', type=int, default=2,
                       help='Outlier sampling power [default: 2]')
   parser.add_argument('--ol-nbd', type=str, default='cos',
@@ -177,6 +193,11 @@ if __name__ == '__main__':
                       '[default: cos]'))
   parser.add_argument('--ol-size-scale', action='store_true', default=False,
                       help='Scale outlier objective by cluster size')
+  parser.add_argument('--reset-lrmf', action='store_true', default=False,
+                      help=('Reset clusters by solving exact LRMF on '
+                      'neighborhood'))
+  parser.add_argument('--reset-warmup', type=int, default=0,
+                      help='Warmup steps after reset [default: 0]')
   parser.add_argument('--dist', action='store_true', default=False,
                       help='Enables distributed training')
   parser.add_argument('--cuda', action='store_true', default=False,
