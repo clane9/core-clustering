@@ -10,9 +10,7 @@ import shutil
 import pickle
 
 import torch
-import torch.distributed as dist
 from torch.utils.data import DataLoader
-import numpy as np
 
 import datasets as dat
 import models as mod
@@ -23,38 +21,20 @@ def main():
   use_cuda = args.cuda and torch.cuda.is_available()
   torch.set_num_threads(args.num_threads)
 
-  if args.dist:
-    if use_cuda:
-      dist.init_process_group(backend="nccl")
-    else:
-      dist.init_process_group(backend="mpi")
-
-  is_logging = (not args.dist) or (dist.get_rank() == 0)
   # create output directory, deleting any existing results.
-  if is_logging:
-    if os.path.exists(args.out_dir):
-      shutil.rmtree(args.out_dir)
-    os.mkdir(args.out_dir)
-    # save args
-    with open('{}/args.pkl'.format(args.out_dir), 'wb') as f:
-      pickle.dump(args, f)
+  if os.path.exists(args.out_dir):
+    shutil.rmtree(args.out_dir)
+  os.mkdir(args.out_dir)
+  # save args
+  with open('{}/args.pkl'.format(args.out_dir), 'wb') as f:
+    pickle.dump(args, f)
 
   device = torch.device('cuda' if use_cuda else 'cpu')
-  if args.dist and use_cuda:
-    cuda_devices = map(int, os.environ['CUDA_VISIBLE_DEVICES'].split(','))
-    if len(cuda_devices) != dist.get_world_size():
-      raise RuntimeError("Visible cuda devices must equal world size")
-    device_id = cuda_devices[dist.get_rank()]
-    torch.cuda.set_device(device_id)
 
   # construct dataset
   synth_dataset = dat.SynthUoSOnlineDataset(args.n, args.d, args.D, args.N,
       args.affine, args.sigma, args.data_seed)
-  if args.dist:
-    # separate online sampling seeds per process
-    torch.manual_seed(args.data_seed + 1957*dist.get_rank())
-  else:
-    torch.manual_seed(args.data_seed)
+  torch.manual_seed(args.data_seed)
   kwargs = {'num_workers': args.num_workers}
   if use_cuda:
     kwargs['pin_memory'] = True
@@ -67,26 +47,15 @@ def main():
     args.model_d = args.d
   if args.model_n is None or args.model_n <= 0:
     args.model_n = args.n
-  if args.ol_nbd_size is None or args.ol_nbd_size <= 0:
-    args.ol_nbd_size = args.model_d
-  if args.ol_pool_size is None or args.ol_pool_size <= 0:
-    # coupon collector estimate
-    # https://en.wikipedia.org/wiki/Coupon_collector%27s_problem
-    args.ol_pool_size = int(np.ceil(args.model_n*np.log(args.model_n) +
-        (args.ol_nbd_size - 1)*args.model_n*np.log(np.log(args.model_n))))
-  olpool = mod.OutlierPool(args.ol_pool_size, args.ol_nbd_size, stale_thr=1.0,
-      outlier_thr=0.0, cos_thr=None, ema_decay=0.9, sample_p=args.ol_sample_p,
-      nbd_type=args.ol_nbd) if args.reset_unused else None
   if args.proj_form:
     reg_params = {
         'U_frosqr_in': args.U_frosqr_in_lamb,
         'U_frosqr_out': args.U_frosqr_out_lamb,
     }
     model = mod.KSubspaceProjModel(args.model_n, args.model_d, args.D,
-        args.affine, args.symmetric, reg_params=reg_params,
-        soft_assign=args.soft_assign, olpool=olpool,
-        ol_size_scale=args.ol_size_scale, reset_lrmf=args.reset_lrmf,
-        reset_warmup=args.reset_warmup)
+        args.affine, args.symmetric, args.reps, reg_params=reg_params,
+        reset_patience=args.reset_patience, reset_decr_tol=args.reset_decr_tol,
+        reset_sigma=args.reset_sigma)
   else:
     reg_params = {
         'U_frosqr_in': args.U_frosqr_in_lamb,
@@ -95,16 +64,9 @@ def main():
         'z': args.z_lamb
     }
     model = mod.KSubspaceModel(args.model_n, args.model_d, args.D, args.affine,
-        reg_params=reg_params, soft_assign=args.soft_assign, olpool=olpool,
-        ol_size_scale=args.ol_size_scale, reset_lrmf=args.reset_lrmf,
-        reset_warmup=args.reset_warmup)
+        args.reps, reg_params=reg_params, reset_patience=args.reset_patience,
+        reset_decr_tol=args.reset_decr_tol, reset_sigma=args.reset_sigma)
   model = model.to(device)
-  if args.dist:
-    if use_cuda:
-      model = torch.nn.parallel.DistributedDataParallel(model,
-          device_ids=[device_id], output_device=device_id)
-    else:
-      model = torch.nn.parallel.DistributedDataParallelCPU(model)
 
   # optimizer
   if args.optim == 'SGD':
@@ -120,10 +82,9 @@ def main():
     args.chkp_freq = args.epochs
   if args.stop_freq is None or args.stop_freq <= 0:
     args.stop_freq = -1
-  tr.train_loop(model, synth_data_loader, device, optimizer,
-      args.out_dir, args.epochs, args.chkp_freq, args.stop_freq,
-      scheduler=None, dist_mode=args.dist, eval_rank=args.eval_rank,
-      reset_unused=args.reset_unused)
+  tr.train_loop(model, synth_data_loader, device, optimizer, args.out_dir,
+      args.epochs, args.chkp_freq, args.stop_freq, scheduler=None,
+      eval_rank=args.eval_rank, reset_unused=args.reset_unused)
   return
 
 
@@ -149,6 +110,8 @@ if __name__ == '__main__':
   # model settings
   parser.add_argument('--proj-form', action='store_true', default=False,
                       help='Use projection matrix formulation')
+  parser.add_argument('--reps', type=int, default=5,
+                      help='Number of model replicates [default: 5]')
   parser.add_argument('--model-n', type=int, default=None,
                       help='Model number of subspaces [default: n]')
   parser.add_argument('--model-d', type=int, default=None,
@@ -167,8 +130,6 @@ if __name__ == '__main__':
   parser.add_argument('--z-lamb', type=float, default=0.01,
                       help=('L2 squared coefficient reg parameter, '
                       'inside assignment [default: 0.01]'))
-  parser.add_argument('--soft-assign', type=float, default=0.0,
-                      help='Soft assignment parameter [default: 0.0]')
   # training settings
   parser.add_argument('--batch-size', type=int, default=100,
                       help='Input batch size for training [default: 100]')
@@ -180,26 +141,14 @@ if __name__ == '__main__':
                       help='Initial learning rate [default: 0.5]')
   parser.add_argument('--reset-unused', action='store_true', default=False,
                       help='Whether to reset unused clusters')
-  parser.add_argument('--ol-pool-size', type=int, default=None,
-                      help=('Outlier pool size '
-                      '[default: coupon collector expectation]'))
-  parser.add_argument('--ol-nbd-size', type=int, default=None,
-                      help=('Outlier sampling neighborhood size '
-                      '[default: model_d]'))
-  parser.add_argument('--ol-sample-p', type=int, default=2,
-                      help='Outlier sampling power [default: 2]')
-  parser.add_argument('--ol-nbd', type=str, default='cos',
-                      help=('Outlier neighborhood type (cos, lasso) '
-                      '[default: cos]'))
-  parser.add_argument('--ol-size-scale', action='store_true', default=False,
-                      help='Scale outlier objective by cluster size')
-  parser.add_argument('--reset-lrmf', action='store_true', default=False,
-                      help=('Reset clusters by solving exact LRMF on '
-                      'neighborhood'))
-  parser.add_argument('--reset-warmup', type=int, default=0,
-                      help='Warmup steps after reset [default: 0]')
-  parser.add_argument('--dist', action='store_true', default=False,
-                      help='Enables distributed training')
+  parser.add_argument('--reset-patience', type=int, default=None,
+                      help='Steps to wait between resets [default: 1 epoch]')
+  parser.add_argument('--reset-decr-tol', type=float, default=1e-4,
+                      help=('Relative objective decrease tolerance to reset '
+                      '[default: 1e-4]'))
+  parser.add_argument('--reset-sigma', type=float, default=0.05,
+                      help=('Scale of perturbation to add after reset '
+                      '[default: 0.05]'))
   parser.add_argument('--cuda', action='store_true', default=False,
                       help='Enables CUDA training')
   parser.add_argument('--num-threads', type=int, default=1,

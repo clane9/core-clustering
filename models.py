@@ -1,14 +1,9 @@
 from __future__ import print_function
 from __future__ import division
 
-import warnings
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from sklearn.linear_model import lars_path
-
-import utils as ut
 
 EPS = 1e-8
 EMA_DECAY = 0.9
@@ -19,9 +14,11 @@ class _KSubspaceBaseModel(nn.Module):
   default_reg_params = dict()
   assign_reg_terms = set()
 
-  def __init__(self, k, d, D, affine=False, reg_params={}, soft_assign=0.0,
-        olpool=None, ol_size_scale=True, unused_thr=0.01, reset_lrmf=True,
-        reset_warmup=0):
+  def __init__(self, k, d, D, affine=False, replicates=5, reg_params={},
+        unused_thr=0.01, reset_patience=100, reset_decr_tol=1e-4,
+        reset_sigma=0.05):
+    if replicates < 1:
+      raise ValueError("Invalid replicates parameter {}".format(replicates))
     for key in self.default_reg_params:
       val = reg_params.get(key, None)
       if val is None:
@@ -30,44 +27,41 @@ class _KSubspaceBaseModel(nn.Module):
         raise ValueError("Invalid {} reg parameter {}".format(k, val))
     if not set(reg_params).issubset(set(self.default_reg_params)):
       raise ValueError("Invalid reg parameter keys")
-    if soft_assign < 0:
-      raise ValueError("Invalid soft_assign parameter {}".format(soft_assign))
     if unused_thr < 0:
       raise ValueError("Invalid unused_thr parameter {}".format(unused_thr))
-    if reset_warmup < 0:
-      raise ValueError("Invalid reset_warmup parameter {}".format(
-          reset_warmup))
+    if reset_patience < 0:
+      raise ValueError("Invalid reset_patience parameter {}".format(
+          reset_patience))
+    if reset_sigma < 0:
+      raise ValueError("Invalid reset_sigma parameter {}".format(
+          reset_sigma))
 
     super(_KSubspaceBaseModel, self).__init__()
     self.k = k  # number of groups
     self.d = d  # dimension of manifold
     self.D = D  # number of data points
     self.affine = affine
+    self.replicates = self.r = replicates
     self.reg_params = reg_params
-    self.soft_assign = soft_assign
-    self.ol_size_scale = ol_size_scale
     self.unused_thr = unused_thr
-    self.reset_lrmf = reset_lrmf
-    self.reset_warmup = reset_warmup
+    self.reset_patience = reset_patience
+    self.reset_decr_tol = (float('-inf') if reset_decr_tol is None
+        else reset_decr_tol)
+    self.reset_sigma = reset_sigma
 
-    # group assignment, ultimate shape (batch_size, k)
+    # group assignment, ultimate shape (batch_size, r, k)
     self.c = None
     self.groups = None
-    # subspace coefficients, ultimte shape (batch_size, k, d)
+    # subspace coefficients, ultimate shape (batch_size, r, k, d)
     self.z = None
 
-    self.Us = nn.Parameter(torch.Tensor(k, D, d))
+    self.Us = nn.Parameter(torch.Tensor(self.r, k, D, d))
     if affine:
-      self.bs = nn.Parameter(torch.Tensor(k, D))
+      self.bs = nn.Parameter(torch.Tensor(self.r, k, D))
     else:
       self.register_parameter('bs', None)
-    self.register_buffer('c_mean', torch.ones(k).div_(k))
-    self.register_buffer('steps_since_reset',
-        torch.full((k,), reset_warmup+1, dtype=torch.int64))
-
-    self.olpool = olpool
-    if olpool is not None:
-      self.olpool.reset()
+    self.register_buffer('c_mean', torch.ones(self.r, k).div_(k))
+    self.register_buffer('steps', torch.zeros(self.r, k, dtype=torch.int64))
     return
 
   def reset_parameters(self):
@@ -79,10 +73,10 @@ class _KSubspaceBaseModel(nn.Module):
     """Compute representation of x wrt each subspace.
 
     Input:
-      x: shape (batch_size, D)
+      x: data, shape (batch_size, D)
 
     Returns:
-      x_: shape (k, batch_size, D)
+      x_: reconstruction, shape (r, k, batch_size, D)
     """
     z = self.encode(x)
     self.z = z.data
@@ -96,7 +90,7 @@ class _KSubspaceBaseModel(nn.Module):
       x: data, shape (batch_size, D)
 
     Returns:
-      z: latent low-dimensional codes, shape (k, batch_size, d)
+      z: latent low-dimensional codes, shape (r, k, batch_size, d)
     """
     raise NotImplementedError("encode not implemented")
     return
@@ -105,38 +99,39 @@ class _KSubspaceBaseModel(nn.Module):
     """Embed low-dim code z into ambient space.
 
     Input:
-      z: shape (k, batch_size, d)
+      z: latent code, shape (r, k, batch_size, d)
 
     Returns:
-      x_: shape (k, batch_size, D)
+      x_: reconstruction, shape (r, k, batch_size, D)
     """
-    assert(z.dim() == 3 and z.size(0) == self.k and z.size(2) == self.d)
+    assert(z.dim() == 4 and
+        (z.size(0), z.size(1), z.size(3)) == (self.r, self.k, self.d))
 
     # x_ = U z + b
-    # shape (k, batch_size, D)
-    x_ = torch.matmul(z, self.Us.transpose(1, 2))
+    # shape (r, k, batch_size, D)
+    x_ = torch.matmul(z, self.Us.transpose(2, 3))
     if self.affine:
-      x_ = x_.add(self.bs.unsqueeze(1))
+      x_ = x_.add(self.bs.unsqueeze(2))
     return x_
 
-  def objective(self, x, update_ol=True):
+  def objective(self, x):
     """Evaluate objective function.
 
     Input:
       x: data, shape (batch_size, D)
-      update_ol: update outlier pool
 
     Returns:
-      obj, scale_obj, loss, reg_in, reg_out
-      x_: reconstruction, shape (k, batch_size, D)
+      obj_mean: average objective across replicates
+      obj, loss, reg_in, reg_out: metrics per replicate, shape (r,)
+      x_: reconstruction, shape (r, k, batch_size, D)
     """
     x_ = self(x)
     loss = self.loss(x, x_)
     reg = self.reg()
 
     # split regs into assign and outside terms
-    reg_in = torch.zeros(self.k, dtype=loss.dtype, device=loss.device)
-    reg_out = torch.zeros(self.k, dtype=loss.dtype, device=loss.device)
+    reg_in = torch.zeros(self.r, self.k, dtype=loss.dtype, device=loss.device)
+    reg_out = torch.zeros(self.r, self.k, dtype=loss.dtype, device=loss.device)
     for key, val in reg.items():
       if key in self.assign_reg_terms:
         reg_in = reg_in + val
@@ -149,33 +144,32 @@ class _KSubspaceBaseModel(nn.Module):
     loss = self.c * loss
     reg_in = self.c * reg_in
 
-    # update outlier pool
-    if update_ol and self.olpool is not None:
-      ol_obj = loss.data + reg_in.data
-      if self.ol_size_scale:
-        ol_obj = self.c_mean * ol_obj
-      ol_obj = ol_obj.sum(dim=1)
-      self.olpool.append(x, ol_obj)
+    # cache assign_obj and outside reg values
+    self._batch_assign_obj = assign_obj
+    self._batch_reg_out = reg_out.data
 
-    # reduce and compute objective
-    loss = loss.sum(dim=1).mean()
-    reg_in = reg_in.sum(dim=1).mean()
-    reg_out = reg_out.sum()  # always shape (k,)
+    # reduce and compute objective, shape (r,)
+    loss = loss.sum(dim=2).mean(dim=0)
+    reg_in = reg_in.sum(dim=2).mean(dim=0)
+    reg_out = reg_out.sum(dim=1)
     obj = loss + reg_in + reg_out
-    return obj, loss, reg_in, reg_out, x_
+    obj_mean = obj.mean()
+
+    # cache per replicate objective
+    self._batch_obj = obj.data
+    return obj_mean, obj.data, loss.data, reg_in.data, reg_out.data, x_.data
 
   def loss(self, x, x_):
     """Evaluate reconstruction loss
 
     Inputs:
-      x: data, shape (batch_size, ...)
-      x_: reconstruction, shape (k, batch_size, ...)
+      x: data, shape (batch_size, D)
+      x_: reconstruction, shape (r, k, batch_size, D)
 
     Returns:
-      loss: shape (batch_size, k)
+      loss: shape (batch_size, r, k)
     """
-    reduce_dim = tuple(range(2, x_.dim()))
-    loss = torch.sum((x.unsqueeze(0) - x_)**2, dim=reduce_dim).mul(0.5).t()
+    loss = torch.sum((x - x_)**2, dim=3).mul(0.5).permute(2, 0, 1)
     return loss
 
   def reg(self):
@@ -184,104 +178,192 @@ class _KSubspaceBaseModel(nn.Module):
     return
 
   def set_assign(self, assign_obj):
-    """Compute soft-assignment.
+    """Compute cluster assignment.
 
     Inputs:
-      assign_obj: shape (batch_size, k)
+      assign_obj: shape (batch_size, r, k)
     """
-    if self.soft_assign <= 0:
-      self.c = torch.zeros_like(assign_obj.data)
-      minidx = assign_obj.data.argmin(dim=1, keepdim=True)
-      self.c.scatter_(1, minidx, 1)
-    else:
-      self.c = ut.find_soft_assign(assign_obj.data, self.soft_assign)
-    self.groups = torch.argmax(self.c, dim=1)
+    self.c = torch.zeros_like(assign_obj.data)
+    minidx = assign_obj.data.argmin(dim=2, keepdim=True)
+    self.c.scatter_(2, minidx, 1)
+    self.groups = minidx.squeeze().cpu()
 
     self._batch_c_mean = torch.mean(self.c, dim=0)
     self.c_mean.mul_(EMA_DECAY).add_(1-EMA_DECAY, self._batch_c_mean)
     return
 
-  def classify(self, x):
-    """Classify a single sample or a batch of data x."""
-    with torch.no_grad():
-      # reshape if single sample
-      if x.dim() == 1:
-        x = x.view(1, -1)
-
-      x_ = self(x)
-      loss = self.loss(x, x_)
-      reg = self.reg()
-
-      # split regs into assign and outside terms
-      reg_in = torch.zeros(self.k, dtype=loss.dtype, device=loss.device)
-      for key, val in reg.items():
-        if key in self.assign_reg_terms:
-          reg_in = reg_in + val
-
-      # update assignment c
-      assign_obj = loss.data + reg_in.data
-      y = assign_obj.argmin(dim=1)
-    return y
-
-  def eval_sprs(self):
-    """measure robust sparsity of current assignment subset c"""
-    cmax, _ = torch.max(self.c.data, dim=1, keepdim=True)
-    sprs = torch.sum(self.c.data / cmax, dim=1)
-    sprs = torch.mean(sprs)
-    return sprs
-
   def eval_shrink(self, x, x_):
-    """measure shrinkage of reconstruction wrt data"""
-    # x_ is size (k, batch_size, ...)
-    norm_x_ = torch.sqrt(torch.sum(x_.data.pow(2),
-        dim=tuple(range(2, x_.data.dim())))).t()
-    norm_x_ = torch.sum(self.c.data*norm_x_, dim=1)
-    # x is size (batch_size, ...)
-    norm_x = torch.sqrt(torch.sum(x.data.pow(2),
-        dim=tuple(range(1, x.data.dim()))))
-    norm_x_ = torch.mean(norm_x_ / (norm_x + 1e-8))
-    return norm_x_
+    """measure shrinkage of reconstruction wrt data.
 
-  def eval_rank(self, tol=.01, cpu=True):
-    """Compute rank and singular values of subspace bases."""
-    # svd is ~1000x faster on cpu for small matrices (100 x 10).
-    Us = self.Us.data.cpu() if cpu else self.Us.data
-    svs = torch.stack([torch.svd(Us[ii, :])[1] for ii in range(self.k)])
-    ranks = (svs > tol*svs[:, 0].median()).sum(dim=1)
-    return ranks.cpu().numpy(), svs.cpu().numpy()
-
-  def reset_unused(self):
-    """Reset (nearly) unused clusters by sampling neighborhood from pool of
-    outliers.
+    Inputs:
+      x: data, shape (batch_size, D)
+      x_: reconstruction, shape (r, k, batch_size, D)
 
     Returns:
-      reset_ids: clusters that were reset
+      norm_x_: average norm of x_ relative to x, shape (r,)
     """
-    done_warming_up = self.steps_since_reset >= self.reset_warmup
-    reset_mask = done_warming_up * (self.c_mean <= self.unused_thr/self.k)
-    reset_ids = reset_mask.nonzero().view(-1)
-    if reset_ids.shape[0] > 0:
-      for ii, idx in enumerate(reset_ids):
-        _, Xnbd = self.olpool.sample()
-        if Xnbd is None:
-          reset_ids = reset_ids[:ii]
-          break
-        if self.affine:
-          self.bs.data[idx, :] = Xnbd.mean(dim=0)
-          Xnbd = Xnbd.sub(self.bs.data[idx, :])
-        newU = self._lrmf(Xnbd)
-        self.Us.data[idx, :] = newU
-        self.c_mean[idx] = 1.0/self.k
-        self.steps_since_reset[idx] = 0
-    return reset_ids.cpu().numpy()
+    # (batch_size, r, k)
+    norm_x_ = x_.data.pow(2).sum(dim=3).sqrt().permute(2, 0, 1)
+    # (batch_size, r)
+    norm_x_ = norm_x_.mul_(self.c.data).sum(dim=2)
+    # (batch_size, 1)
+    norm_x = torch.norm(x.data, dim=1, keepdim=True)
+    # (r,)
+    norm_x_ = norm_x_.div(norm_x.add(EPS)).mean(dim=0)
+    return norm_x_
 
-  def _lrmf(self, X):
-    """Compute low-rank matrix factorization of X"""
-    raise NotImplementedError
+  def eval_rank(self, tol=.01):
+    """Compute rank and singular values of subspace bases.
+
+    Inputs:
+      tol: rank tolerance (default: 0.01)
+
+    Returns:
+      ranks: numerical ranks of each basis (r, k)
+      svs: singular values (r, k, d)
+    """
+    # svd is ~1000x faster on cpu for small matrices, e.g. (100, 10).
+    Us = self.Us.data.cpu() if max(self.D, self.d) <= 1000 else self.Us.data
+    # ideally there would be a batched svd instead of this loop, but at least
+    # k, r should be "small"
+    # (rk, d)
+    svs = torch.stack([torch.svd(Us[ii, jj, :])[1] for ii in range(self.r)
+        for jj in range(self.k)])
+    svs = svs.view(self.r, self.k, self.d)
+    # (r, 1, 1)
+    tol = svs[:, :, 0].max(dim=1)[0].mul(tol).view(self.r, 1, 1)
+    # (r, k)
+    ranks = (svs > tol).sum(dim=2)
+    return ranks, svs
+
+  def reset_unused(self):
+    """Reset (nearly) unused clusters by choosing best replacement candidate
+    from all other replicates.
+
+    Returns:
+      resets: np array log of successful resets, shape (n_resets, 6). Columns
+        are (reset rep idx, reset cluster idx, duplicate rep idx, duplicate
+        cluster idx, obj decrease, new size).
+      reset_attempts: count of attempted resets.
+    """
+    # reset not possible if only one replicate
+    # should probably give warning
+    if self.r == 1:
+      return np.zeros((0, 6), dtype=object)
+
+    # identify clusters to reset
+    reset_mask = self.c_mean <= self.unused_thr/self.k
+    reset_mask.mul_(self.steps >= self.reset_patience)
+    reset_Idx = reset_mask.nonzero().cpu().numpy()
+    reset_attempts = reset_Idx.shape[0]
+    reset_rids = np.unique(reset_Idx[:, 0]) if reset_attempts > 0 else []
+
+    resets = []
+    for ridx in reset_rids:
+      rep_reset_cids = reset_Idx[reset_Idx[:, 0] == ridx, 1]
+      for cidx in rep_reset_cids:
+        # find best reset candidate and substitute if decrease tol satisfied
+        cand_ridx, cand_cidx, cand_obj, cand_c_mean = self._reset_cluster(
+            ridx, cidx)
+        old_obj = self._batch_obj[ridx].item()
+        obj_decr = 1.0 - cand_obj / old_obj
+        cand_size = cand_c_mean[cidx].item()
+        still_unused = cand_size <= self.unused_thr/self.k
+        if obj_decr > self.reset_decr_tol and not still_unused:
+          # reset parameters
+          self.Us.data[ridx, cidx, :] = self.Us.data[cand_ridx, cand_cidx, :]
+          if self.affine:
+            self.bs.data[ridx, cidx, :] = self.bs.data[
+                cand_ridx, cand_cidx, :]
+          # reset batch metrics (matters if there are multiple resets to do)
+          self._batch_assign_obj[:, ridx, cidx] = self._batch_assign_obj[
+              :, cand_ridx, cand_cidx]
+          self._batch_obj[ridx] = cand_obj
+          self._batch_reg_out[ridx, cidx] = self._batch_reg_out[
+              cand_ridx, cand_cidx]
+          # reset size and steps
+          self._batch_c_mean[ridx, :] = cand_c_mean
+          self.c_mean[ridx, :] = cand_c_mean
+          self.steps[ridx, cidx] = 0
+          resets.append([ridx, cidx, cand_ridx, cand_cidx,
+              obj_decr, cand_size])
+        else:
+          # after failing to add a new basis, don't want to reset in this
+          # replicate for a while
+          self.steps[ridx, :] = 0
+          break
+
+    resets = np.array(resets, dtype=object)
+    # perturb all bases slightly in replicates with resets to make sure we
+    # always have some diversity across replicates
+    if self.reset_sigma > 0 and resets.shape[0] > 0:
+      rIdx = np.unique(resets[:, 0].astype(np.int64))
+      reset_r = rIdx.shape[0]
+      # (reset_r, k, 1, 1)
+      Unorms = self.Us.data[rIdx, :].pow(2).sum(
+          dim=(2, 3), keepdim=True).sqrt()
+      # scale of perturbation is relative to each basis' norm
+      reset_Sigma = Unorms.mul(
+          self.reset_sigma / np.sqrt(self.D*self.d))
+      Z = torch.randn(reset_r, self.k, self.D, self.d).mul_(reset_Sigma)
+      self.Us.data[rIdx, :] = self.Us.data[rIdx, :] + Z
+    return resets, reset_attempts
+
+  def _reset_cluster(self, ridx, cidx):
+    """For a given replicate and empty cluster, find the best candidate to copy
+    from the other replicates.
+
+    Inputs:
+      ridx, cidx: replicate and cluster index for empty cluster
+
+    Returns:
+      candridx, candcidx: replicate and cluster index for best reset candidate
+      cand_obj: objective for best candidate replacement.
+      cand_c_mean: fraction of points from last batch assigned to best
+        candidate
+    """
+    assert(self.r > 1)
+
+    # extract indices for reset candidates
+    cand_mask = torch.ones(self.r, self.k, dtype=torch.uint8,
+        device=self._batch_obj.device)
+    cand_mask[ridx, :] = 0
+    cand_Idx = cand_mask.nonzero()
+
+    # organize alternative assignment objectives, one per reset candidate,
+    # where empty cluster objective is replaced by the candidate's
+    # (batch_size, 1, k)
+    alt_assign_obj = self._batch_assign_obj[:, [ridx], :]
+    # (batch_size, (r-1)*k, k)
+    alt_assign_obj = alt_assign_obj.repeat(1, (self.r-1)*self.k, 1)
+    alt_assign_obj[:, :, cidx] = self._batch_assign_obj[:, cand_Idx[:, 0],
+        cand_Idx[:, 1]]
+
+    # find assignments for each alternative
+    # (batch_size, (r-1)*k)
+    alt_obj, assign_Idx = torch.min(alt_assign_obj, dim=2)
+    alt_c = torch.zeros_like(alt_assign_obj)
+    alt_c.scatter_(2, assign_Idx.unsqueeze(2), 1)
+
+    # compute candidate objectives and choose best (ignoring outside reg)
+    # ((r-1)*k,)
+    alt_obj = alt_obj.mean(dim=0)
+    cand_obj, min_idx = torch.min(alt_obj, dim=0)
+    cand_ridx, cand_cidx = cand_Idx[min_idx, 0], cand_Idx[min_idx, 1]
+    cand_c_mean = alt_c[:, min_idx, :].mean(dim=0)
+
+    # But add outside reg after selection
+    # NOTE: remember normal indexing returns a view, whereas fancy indexing
+    # returns a copy. Clone here to avoid modifying original. Should be careful
+    # to account for this elsewhere.
+    rep_reg_out = self._batch_reg_out[ridx, :].clone()
+    rep_reg_out[cidx] = self._batch_reg_out[cand_ridx, cand_cidx]
+    cand_obj.add_(rep_reg_out.sum())
+    return cand_ridx.item(), cand_cidx.item(), cand_obj.item(), cand_c_mean
 
   def step(self):
     """Increment steps since reset counter."""
-    self.steps_since_reset.add_(1)
+    self.steps.add_(1)
     return
 
 
@@ -293,12 +375,11 @@ class KSubspaceModel(_KSubspaceBaseModel):
   }
   assign_reg_terms = {'U_frosqr_in', 'z'}
 
-  def __init__(self, k, d, D, affine=False, reg_params={}, soft_assign=0.0,
-        olpool=None, ol_size_scale=True, unused_thr=0.01, reset_lrmf=True,
-        reset_warmup=0):
-    super(KSubspaceModel, self).__init__(k, d, D, affine, reg_params,
-        soft_assign, olpool, ol_size_scale, unused_thr, reset_lrmf,
-        reset_warmup)
+  def __init__(self, k, d, D, affine=False, replicates=5, reg_params={},
+        unused_thr=0.01, reset_patience=100, reset_decr_tol=1e-4,
+        reset_sigma=0.05):
+    super(KSubspaceModel, self).__init__(k, d, D, affine, replicates,
+        reg_params, unused_thr, reset_patience, reset_decr_tol, reset_sigma)
     self.reset_parameters()
     return
 
@@ -322,96 +403,63 @@ class KSubspaceModel(_KSubspaceBaseModel):
       x: shape (batch_size, D)
 
     Returns:
-      z: latent low-dimensional codes (k, batch_size, d)
+      z: latent low-dimensional codes (r, k, batch_size, d)
     """
     assert(x.dim() == 2 and x.size(1) == self.D)
+    batch_size = x.size(0)
 
-    # shape (k x d x D)
-    Uts = self.Us.data.transpose(1, 2)
-    # (k x d x d)
+    # shape (r, k, d, D)
+    Uts = self.Us.data.transpose(2, 3)
+    # (r, k, d, d)
     A = torch.matmul(Uts, self.Us.data)
     if self.reg_params['z'] > 0:
-      # (d x d)
-      lambeye = torch.eye(self.d, dtype=A.dtype, device=A.device)
-      # (1 x d x d)
-      lambeye.mul_(self.reg_params['z']).unsqueeze_(0)
-      # (k x d x d)
+      # (d, d)
+      lambeye = torch.eye(self.d,
+          dtype=A.dtype, device=A.device).mul_(self.reg_params['z'])
+      # (r, k, d, d)
       A.add_(lambeye)
 
-    # (1 x D x batch_size)
-    B = x.data.t().unsqueeze(0)
+    # (1, 1, D, batch_size)
+    B = x.data.t().view(1, 1, self.D, batch_size)
     if self.affine:
-      # bs shape (k, D)
-      B = B.sub(self.bs.data.unsqueeze(2))
-    # (k x d x batch_size)
+      # bs shape (r, k, D)
+      B = B.sub(self.bs.data.unsqueeze(3))
+    # (r, k, d, batch_size)
     B = torch.matmul(Uts, B)
 
-    # (k x d x batch_size)
+    # (r, k, d, batch_size)
     z, _ = torch.gesv(B, A)
-    # (k x batch_size x d)
-    z = z.transpose(1, 2)
+    # (r, k, batch_size, d)
+    z = z.transpose(2, 3)
     return z
 
   def reg(self):
     """Evaluate subspace regularization."""
     regs = dict()
-    # U regularization, each is shape (k,)
+    # U regularization, each is shape (r, k)
     if max([self.reg_params[key] for key in
           ('U_frosqr_in', 'U_frosqr_out', 'U_fro_out')]) > 0:
-      U_frosqr = torch.sum(self.Us.pow(2), dim=(1, 2))
+      U_frosqr = torch.sum(self.Us.pow(2), dim=(2, 3))
 
       if self.reg_params['U_frosqr_in'] > 0:
-        regs['U_frosqr_in'] = U_frosqr.mul(self.reg_params['U_frosqr_in']*0.5)
+        regs['U_frosqr_in'] = U_frosqr.mul(
+            self.reg_params['U_frosqr_in']*0.5)
 
-      if max([self.reg_params[key] for key in
-            ('U_frosqr_out', 'U_fro_out')]) > 0:
-        done_warming_up = (self.steps_since_reset >= self.reset_warmup).float()
+      if self.reg_params['U_frosqr_out'] > 0:
+        regs['U_frosqr_out'] = U_frosqr.mul(
+            self.reg_params['U_frosqr_out']*0.5)
 
-        if self.reg_params['U_frosqr_out'] > 0:
-          lamb = self.reg_params['U_frosqr_out'] * done_warming_up
-          regs['U_frosqr_out'] = U_frosqr.mul(lamb*0.5)
+      if self.reg_params['U_fro_out'] > 0:
+        U_fro = U_frosqr.sqrt()
+        regs['U_fro_out'] = U_fro.mul(self.reg_params['U_fro_out'])
 
-        if self.reg_params['U_fro_out'] > 0:
-          U_fro = U_frosqr.sqrt()
-          lamb = self.reg_params['U_fro_out'] * done_warming_up
-          regs['U_fro_out'] = U_fro.mul(lamb)
-
-    # z regularization, shape is (batch_size, k)
+    # z regularization, shape is (batch_size, r, k)
     # does not affect gradients, only included to ensure objective value
     # is accurate
     if self.reg_params['z'] > 0:
-      z_frosqr = torch.sum(self.z.data.pow(2), dim=2).t()
+      z_frosqr = torch.sum(self.z.data.pow(2), dim=3).permute(2, 0, 1)
       regs['z'] = z_frosqr.mul(self.reg_params['z']*0.5)
     return regs
-
-  def _lrmf(self, X):
-    """Compute low-rank matrix factorization of X"""
-    # find soft-threshold depending on reg parameters
-    # X is (m, D)
-    lamb_U = X.shape[0]*self.reg_params['U_frosqr_in']
-    lamb_V = self.reg_params['z']
-    lamb_st = np.sqrt(lamb_U * lamb_V)
-    _, s, U = torch.svd(X, some=False)
-    U = U[:, :self.d]
-    if lamb_st > 0:
-      # s shape (min(m, D),)
-      if s.shape[0] < self.d:
-        s_zero = torch.zeros(self.d - s.shape[0],
-            dtype=s.dtype, device=s.device)
-        s = torch.cat((s, s_zero))
-      else:
-        s = s[:self.d]
-      s_st = F.relu(s - lamb_st).sqrt()
-      # don't want exact zeros
-      s_st.add_(1e-6*s_st[0])
-      # rescale to account for imbalanced lamb_U, lamb_V
-      s_st.mul_(np.power(lamb_V/lamb_U, 0.25))
-      if self.reset_lrmf:
-        U.mul_(s_st)
-      else:
-        # Do not shrink singular values, only use s_st to determine U scale
-        U.mul_(torch.norm(s_st) / np.sqrt(self.d))
-    return U
 
 
 class KSubspaceProjModel(_KSubspaceBaseModel):
@@ -422,12 +470,11 @@ class KSubspaceProjModel(_KSubspaceBaseModel):
   }
   assign_reg_terms = {'U_frosqr_in'}
 
-  def __init__(self, k, d, D, affine=False, symmetric=False, reg_params={},
-        soft_assign=0.0, olpool=None, ol_size_scale=True, unused_thr=0.01,
-        reset_lrmf=True, reset_warmup=0):
-    super(KSubspaceProjModel, self).__init__(k, d, D, affine, reg_params,
-        soft_assign, olpool, ol_size_scale, unused_thr, reset_lrmf,
-        reset_warmup)
+  def __init__(self, k, d, D, affine=False, symmetric=False, replicates=5,
+        reg_params={}, unused_thr=0.01, reset_patience=100,
+        reset_decr_tol=1e-4, reset_sigma=0.05):
+    super(KSubspaceModel, self).__init__(k, d, D, affine, replicates,
+        reg_params, unused_thr, reset_patience, reset_decr_tol, reset_sigma)
     self.symmetric = symmetric
     if self.symmetric:
       self.register_parameter('Vs', None)
@@ -457,16 +504,17 @@ class KSubspaceProjModel(_KSubspaceBaseModel):
       z: latent low-dimensional codes (k, batch_size, d)
     """
     assert(x.dim() == 2 and x.size(1) == self.D)
+    batch_size = x.size(0)
 
     # z = U^T (x - b) or z = V (x - b)
     if self.affine:
-      # shape (k, batch_size, D)
-      x = x.sub(self.bs.unsqueeze(1))
+      # (r, k, batch_size, D)
+      x = x.sub(self.bs.unsqueeze(2))
     else:
-      # shape (1, batch_size, D)
-      x = x.unsqueeze(0)
+      x = x.view(1, 1, batch_size, self.D)
+
     if self.symmetric:
-      # shape (k, batch_size, d)
+      # (r, k, batch_size, d)
       z = torch.matmul(x, self.Us)
     else:
       z = torch.matmul(x, self.Vs)
@@ -475,186 +523,18 @@ class KSubspaceProjModel(_KSubspaceBaseModel):
   def reg(self):
     """Evaluate subspace regularization."""
     regs = dict()
-    # U regularization, each is shape (k,)
+    # U regularization, each is shape (r, k)
     if max([self.reg_params[key] for key in
           ('U_frosqr_in', 'U_frosqr_out')]) > 0:
       if self.symmetric:
-        U_frosqr = torch.sum(self.Us.pow(2), dim=(1, 2))
+        U_frosqr = torch.sum(self.Us.pow(2), dim=(2, 3))
       else:
-        U_frosqr = (torch.sum(self.Us.pow(2), dim=(1, 2)) +
-            torch.sum(self.Vs.pow(2), dim=(1, 2))).mul(0.5)
+        U_frosqr = (torch.sum(self.Us.pow(2), dim=(2, 3)) +
+            torch.sum(self.Vs.pow(2), dim=(2, 3))).mul(0.5)
 
       if self.reg_params['U_frosqr_in'] > 0:
         regs['U_frosqr_in'] = U_frosqr.mul(self.reg_params['U_frosqr_in'])
 
       if self.reg_params['U_frosqr_out'] > 0:
-        done_warming_up = (self.steps_since_reset >= self.reset_warmup).float()
-        lamb = self.reg_params['U_frosqr_out'] * done_warming_up
-        regs['U_frosqr_out'] = U_frosqr.mul(lamb)
+        regs['U_frosqr_out'] = U_frosqr.mul(self.reg_params['U_frosqr_out'])
     return regs
-
-
-class OutlierPool(object):
-  """Represent running pool of outier data points."""
-  def __init__(self, maxlen, nbd_size, stale_thr=1.0, outlier_thr=0.0,
-        cos_thr=None, ema_decay=0.9, sample_p=2, nbd_type='cos'):
-    if stale_thr <= 0:
-      raise ValueError("Invalid stale_thr {}".format(stale_thr))
-    if cos_thr is not None and (cos_thr <= 0 or cos_thr > 1):
-      raise ValueError("Invalid cos_thr {}".format(cos_thr))
-    if ema_decay <= 0 or ema_decay >= 1:
-      raise ValueError("Invalid ema_decay {}".format(ema_decay))
-    if sample_p < 0:
-      raise ValueError("Invalid sample_p {}".format(sample_p))
-    if nbd_type not in ('cos', 'lasso'):
-      raise ValueError("Invalid nbd_type {}".format(nbd_type))
-
-    self.maxlen = maxlen
-    self.nbd_size = nbd_size
-    self.outlier_thr = outlier_thr
-    self.stale_thr = stale_thr
-    self.cos_thr = cos_thr
-    self.ema_decay = ema_decay
-    self.sample_p = sample_p
-    self.nbd_type = nbd_type
-    self.reset()
-    return
-
-  def reset(self):
-    self.error_avg = None
-    self.error_var = None
-    self.error_std = None
-    self.errors = None
-    self.error_avgs = None
-    self.outliers = None
-    return
-
-  def append(self, x, errors):
-    """Append outlier points in x to current pool, while clearing stale points
-    and maintaining max size.
-
-    NOTE: possibly naive implementation.
-    """
-    # initialize
-    if self.outliers is None:
-      self.outliers = torch.zeros((0, x.shape[1]),
-          dtype=x.dtype, device=x.device)
-      self.errors = torch.zeros((0,),
-          dtype=errors.dtype, device=errors.device)
-      self.error_avgs = torch.zeros((0,),
-          dtype=errors.dtype, device=errors.device)
-
-    # update error average and var
-    batch_error_avg = errors.mean()
-    batch_error_var = errors.var()
-    if self.error_avg is None:
-      self.error_avg = batch_error_avg
-      self.error_var = batch_error_var
-    else:
-      self.error_avg = (self.ema_decay*self.error_avg +
-          (1-self.ema_decay)*batch_error_avg)
-      self.error_var = (self.ema_decay*self.error_var +
-          (1-self.ema_decay)*batch_error_var)
-    self.error_std = self.error_var.sqrt()
-
-    # check for stale points, i.e. whose error avg at insertion time is
-    # sufficiently large
-    fresh_mask = (self.error_avgs - self.error_avg <
-        self.stale_thr*self.error_std)
-    if fresh_mask.sum() < fresh_mask.shape[0]:
-      self.errors = self.errors[fresh_mask]
-      self.error_avgs = self.error_avgs[fresh_mask]
-      self.outliers = self.outliers[fresh_mask]
-
-    # test for big errors
-    if self.outlier_thr is not None:
-      big_error_mask = (errors - self.error_avg >=
-          self.outlier_thr*self.error_std)
-      x = x[big_error_mask, :]
-      errors = errors[big_error_mask]
-    if x.shape[0] == 0:
-      return 0
-
-    outlier_count = self.outliers.shape[0]
-    if outlier_count == self.maxlen:
-      big_error_mask = errors > self.errors.min()
-      x = x[big_error_mask, :]
-      errors = errors[big_error_mask]
-    if x.shape[0] == 0:
-      return 0
-
-    # test for excessive coherence (e.g. for when data points are repeated
-    # across epochs)
-    if outlier_count > 0 and self.cos_thr is not None and self.cos_thr < 1:
-      unit_x = ut.unit_normalize(x, p=2, dim=1)
-      unit_outliers = ut.unit_normalize(self.outliers, p=2, dim=1)
-      cos = torch.matmul(unit_x, unit_outliers.t()).abs().max(dim=1)[0]
-      cos_mask = cos < self.cos_thr
-      x = x[cos_mask, :]
-      errors = errors[cos_mask]
-    if x.shape[0] == 0:
-      return 0
-
-    # update outliers by choosing worst from x + current pool.
-    self.outliers = torch.cat((self.outliers, x))
-    self.errors = torch.cat((self.errors, errors))
-    self.error_avgs = torch.cat((self.error_avgs,
-        torch.full_like(errors, self.error_avg)))
-    Idx = torch.sort(self.errors, descending=True)[1]
-    Idx = Idx[:self.maxlen]
-
-    self.outliers = self.outliers[Idx]
-    self.errors = self.errors[Idx]
-    self.error_avgs = self.error_avgs[Idx]
-
-    new_outlier_count = (Idx >= outlier_count).sum()
-    return new_outlier_count
-
-  def sample(self):
-    """Sample a neighborhood of points from the current pool of outliers."""
-    if self.outliers.shape[0] < self.nbd_size+1:
-      return None, None
-
-    # sample
-    sample_prob = self.errors.pow(self.sample_p)
-    idx = torch.multinomial(sample_prob, 1)
-    x = self.outliers[idx, :]
-
-    # find nbd
-    unit_outliers = ut.unit_normalize(self.outliers, p=2, dim=1)
-    if self.nbd_type == 'cos':
-      # (num_samples, num_outliers)
-      cos = torch.matmul(unit_outliers[idx, :],
-          unit_outliers.t()).abs().view(-1)
-      _, nbd = torch.topk(cos, self.nbd_size, largest=True)
-    else:
-      # lasso nbd select
-      # (D, num_outliers)
-      X = unit_outliers.t()
-      y = X[:, idx].view(-1)
-      X[:, idx] = 0.0
-      X, y = X.cpu().numpy(), y.cpu().numpy()
-
-      # (num_outliers, num_alphas)
-      with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        _, _, coefs = lars_path(X, y, method='lasso')
-      # choose largest alpha with sufficient support
-      sprs = (np.abs(coefs) > 0).sum(axis=0)
-      coef = coefs[:, (sprs == min(self.nbd_size-1, sprs[-1]))][:, 0]
-
-      coef = torch.from_numpy(coef).to(device=unit_outliers.device)
-      nbd = torch.arange(coef.shape[0])[coef.abs() > 0.0]
-      nbd = torch.cat((idx, nbd))
-
-    # extract outlier neighborhood
-    # (D, nbd_size)
-    Xnbd = self.outliers[nbd, :]
-
-    # drop nbd from current outliers
-    not_nbd_mask = torch.ones_like(self.errors, dtype=torch.uint8)
-    not_nbd_mask[nbd] = 0
-    self.outliers = self.outliers[not_nbd_mask]
-    self.errors = self.errors[not_nbd_mask]
-    self.error_avgs = self.error_avgs[not_nbd_mask]
-    return x, Xnbd

@@ -7,16 +7,13 @@ import ipdb
 import numpy as np
 import torch
 from torch import optim
-import torch.distributed as dist
-from torch.utils.data.distributed import DistributedSampler
-from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
 
 import utils as ut
 
 
 def train_loop(model, data_loader, device, optimizer, out_dir=None, epochs=200,
-      chkp_freq=50, stop_freq=-1, scheduler=None, dist_mode=False,
-      eval_rank=False, reset_unused=False):
+      chkp_freq=50, stop_freq=-1, scheduler=None, eval_rank=False,
+      reset_unused=False):
   """Train k-subspace model for series of epochs.
 
   Args:
@@ -29,41 +26,43 @@ def train_loop(model, data_loader, device, optimizer, out_dir=None, epochs=200,
     chkp_freq: how often to save checkpoint (default: 50)
     stop_freq: how often to stop for debugging (default: -1)
     scheduler: lr scheduler. If None, use reduce on plateau (default: None)
-    dist_mode: whether doing distributed training (default: False)
     eval_rank: evaluate ranks of group models, only implemented for subspace
       models (default: False)
     reset_unused: whether to reset unused clusters (default: False)
   """
-  printformstr = ('(epoch {:d}/{:d}) lr={:.3e} err={:.4f} obj={:.3e} '
-      'loss={:.3e} reg={:.3e},{:.3e} sprs={:.2f} |x_|={:.3e} ')
+  printformstr = ('(epoch {:d}/{:d}) lr={:.1e} '
+      'err={:.3f},{:.3f},{:.3f} obj={:.2e},{:.2e},{:.2e} '
+      'loss={:.1e},{:.1e},{:.1e} reg.in={:.1e},{:.1e},{:.1e} '
+      'reg.out={:.1e},{:.1e},{:.1e} |x_|={:.1e},{:.1e},{:.1e} ')
   if eval_rank:
-    printformstr += 'rank(min)(max)={:.0f},{:.0f},{:.0f} '
-  printformstr += 'resets={:d} samp/s={:.0f} rtime={:.3f}'
+    printformstr += 'rank={:.0f},{:.0f},{:.0f} '
+  printformstr += 'resets={:d}/{:d} samp/s={:.0f} rtime={:.2f}'
 
-  if dist_mode and not (dist.is_initialized()):
-    raise RuntimeError("Distributed package not initialized")
-  is_logging = (not dist_mode) or (dist.get_rank() == 0)
+  if out_dir is not None:
+    logheader = ('Epoch,LR,' + ','.join(['{}.{}'.format(met, meas)
+        for met in ['Err', 'Obj', 'Loss', 'Reg.in', 'Reg.out', 'Norm.x_']
+        for meas in ['min', 'med', 'max']]) + ',')
+    if eval_rank:
+      logheader += 'Rank.min,Rank.med,Rank.max,'
+    logheader += 'Resets,Reset.attempts,Samp.s,RT'
 
-  if is_logging and out_dir is not None:
-    logheader = ('Epoch,LR,Err,Obj,Loss,Reg.assign,Reg.outside,'
-        'Sprs,Norm.x_,')
+    logformstr = ('{:d},{:.9e},{:.9f},{:.9f},{:.9f},'
+        '{:.9e},{:.9e},{:.9e},{:.9e},{:.9e},{:.9e},'
+        '{:.9e},{:.9e},{:.9e},{:.9e},{:.9e},{:.9e},'
+        '{:.9e},{:.9e},{:.9e},')
     if eval_rank:
-      logheader += 'Rank.med,Rank.min,Rank.max,'
-    logheader += 'Resets,Samp.s,RT'
-    logformstr = ('{:d},{:.9e},{:.9f},{:.9e},{:.9e},{:.9e},{:.9e},'
-        '{:.9e},{:.9e},')
-    if eval_rank:
-      logformstr += '{:.9f},{:.0f},{:.0f},'
-    logformstr += '{:d},{:.0f},{:.9f}'
+      logformstr += '{:.0f},{:.9f},{:.0f},'
+    logformstr += '{:d},{:d},{:.0f},{:.9f}'
+
     val_logf = '{}/val_log.csv'.format(out_dir)
     with open(val_logf, 'w') as f:
       print(logheader, file=f)
   else:
     val_logf = None
 
-  conf_mats = np.zeros((epochs, model.k, data_loader.dataset.classes.size),
-      dtype=np.int64)
-  svs = (np.zeros((epochs, model.k, model.d), dtype=np.float32)
+  conf_mats = np.zeros((epochs, model.r, model.k,
+      data_loader.dataset.classes.size), dtype=np.int64)
+  svs = (np.zeros((epochs, model.r, model.k, model.d), dtype=np.float32)
       if eval_rank else None)
   resets = [] if reset_unused else None
 
@@ -78,75 +77,56 @@ def train_loop(model, data_loader, device, optimizer, out_dir=None, epochs=200,
   model.train()
   try:
     for epoch in range(1, epochs+1):
-      # deterministic data shuffling by epoch for this sampler
-      if isinstance(data_loader.sampler, DistributedSampler):
-        data_loader.sampler.set_epoch(epoch)
-
-      (metrics, conf_mats[epoch-1, :], epoch_svs,
-          epoch_resets) = train_epoch(model, data_loader, optimizer, device,
-              dist_mode, eval_rank, reset_unused)
+      (metrics, conf_mats[epoch-1, :],
+          epoch_svs, epoch_resets) = train_epoch(model, data_loader,
+              optimizer, device, eval_rank, reset_unused)
       lr = ut.get_learning_rate(optimizer)
 
       if eval_rank:
         svs[epoch-1, :] = epoch_svs
-      if reset_unused:
-        epoch_resets = np.insert(epoch_resets.reshape(-1, 1), 0, epoch, axis=1)
+      if reset_unused and epoch_resets.shape[0] > 0:
+        epoch_resets = np.insert(epoch_resets, 0, epoch, axis=1)
         resets.append(epoch_resets)
 
-      if is_logging:
-        if val_logf is not None:
-          with open(val_logf, 'a') as f:
-            print(logformstr.format(epoch, lr, *metrics), file=f)
-        print(printformstr.format(epoch, epochs, lr, *metrics))
+      if val_logf is not None:
+        with open(val_logf, 'a') as f:
+          print(logformstr.format(epoch, lr, *metrics), file=f)
+      print(printformstr.format(epoch, epochs, lr, *metrics))
 
-      cluster_error, obj = metrics[:2]
+      cluster_error, min_obj, max_obj = metrics[0], metrics[3], metrics[5]
       is_conv = lr <= min_lr or epoch == epochs
-      # don't decay lr if still resetting clusters
-      if not reset_unused or epoch_resets.shape[0] == 0:
-        scheduler.step(obj)
 
-      save_chkp = (is_logging and out_dir is not None and
-          (epoch % chkp_freq == 0 or is_conv))
+      save_chkp = (out_dir is not None and (epoch % chkp_freq == 0 or is_conv))
       if save_chkp:
         ut.save_checkpoint({
             'epoch': epoch,
             'model': model.state_dict(),
             'optimizer': optimizer.state_dict(),
             'err': cluster_error,
-            'obj': obj},
+            'obj': min_obj},
             is_best=False,
             filename='{}/checkpoint{}.pth.tar'.format(out_dir, epoch))
 
-      if (not dist_mode) and stop_freq > 0 and epoch % stop_freq == 0:
+      scheduler.step(max_obj)
+
+      if stop_freq > 0 and epoch % stop_freq == 0:
         ipdb.set_trace()
 
       if is_conv:
         break
 
-      # test whether all processes are error free and safe to continue. Is
-      # there a better way?
-      if dist_mode:
-        err_count = torch.tensor(0.)
-        dist.all_reduce(err_count, op=dist.reduce_op.SUM)
-        if err_count > 0:
-          raise RuntimeError("dist error")
-
   except Exception as e:
     err = e
-    if str(err) != "dist error":
-      print('{}: {}'.format(type(err), err))
-      if out_dir is not None:
-        with open("{}/error".format(out_dir), "a") as f:
-          print('{}: {}'.format(type(err), err), file=f)
-      if dist_mode:
-        err_count = torch.tensor(1.)
-        dist.all_reduce(err_count, op=dist.reduce_op.SUM)
+    print('{}: {}'.format(type(err), err))
+    if out_dir is not None:
+      with open("{}/error".format(out_dir), "a") as f:
+        print('{}: {}'.format(type(err), err), file=f)
 
   finally:
     if reset_unused:
       resets = (np.concatenate(resets, axis=0) if len(resets) > 0
-          else np.zeros((0, 2), dtype=np.int64))
-    if is_logging and out_dir is not None:
+          else np.zeros((0, 7), dtype=np.int64))
+    if out_dir is not None:
       with open('{}/conf_mats.npz'.format(out_dir), 'wb') as f:
         np.savez(f, conf_mats=conf_mats[:epoch, :])
       if eval_rank:
@@ -160,57 +140,49 @@ def train_loop(model, data_loader, device, optimizer, out_dir=None, epochs=200,
   return conf_mats, svs, resets
 
 
-def train_epoch(model, data_loader, optimizer, device, dist_mode=False,
-      eval_rank=False, reset_unused=False):
+def train_epoch(model, data_loader, optimizer, device, eval_rank=False,
+      reset_unused=False):
   """train model for one epoch and record convergence measures."""
   epoch_tic = time.time()
   metrics = None
-  conf_mat, sampsec = [ut.AverageMeter() for _ in range(2)]
   resets = []
+  conf_mats, sampsec, reset_attempts = [ut.AverageMeter() for _ in range(3)]
   for x, groups in data_loader:
     tic = time.time()
     x = x.to(device)
 
     # opt step
     optimizer.zero_grad()
-    (batch_obj, batch_loss,
+    (batch_obj_mean, batch_obj, batch_loss,
         batch_reg_in, batch_reg_out, x_) = model.objective(x)
-    batch_obj.backward()
+    batch_obj_mean.backward()
     optimizer.step()
     model.step()  # increment step counter
-
-    batch_sprs = model.eval_sprs()
     batch_norm_x_ = model.eval_shrink(x, x_)
-    batch_metrics = (batch_obj, batch_loss, batch_reg_in, batch_reg_out,
-        batch_sprs, batch_norm_x_)
+    batch_metrics = [val for met in
+        [batch_obj, batch_loss, batch_reg_in, batch_reg_out, batch_norm_x_]
+        for val in [met.min(), met.median(), met.max()]]
 
     # eval batch cluster confusion
-    batch_conf_mat = ut.eval_confusion(model.groups.data.cpu(), groups,
-        k=model.k, true_classes=data_loader.dataset.classes)
-
-    if dist_mode:
-      bufs = batch_metrics + (batch_conf_mat,)
-      coalesced = _flatten_dense_tensors(bufs)
-      dist.all_reduce(coalesced, op=dist.reduce_op.SUM)
-      coalesced /= dist.get_world_size()
-      bufs = _unflatten_dense_tensors(coalesced, bufs)
-      batch_metrics, batch_conf_mat = bufs[:-1], bufs[-1]
-      # only conf mat not averaged
-      batch_conf_mat *= dist.get_world_size()
+    batch_conf_mats = torch.stack([
+        ut.eval_confusion(model.groups[:, ii], groups, k=model.k,
+            true_classes=data_loader.dataset.classes)
+        for ii in range(model.replicates)])
 
     batch_size = x.size(0)
-    if dist_mode:
-      batch_size *= dist.get_world_size()
-
     if metrics is None:
       metrics = [ut.AverageMeter() for _ in range(len(batch_metrics))]
     for kk in range(len(batch_metrics)):
       metrics[kk].update(batch_metrics[kk].item(), batch_size)
-    conf_mat.update(batch_conf_mat, 1)
+    conf_mats.update(batch_conf_mats, 1)
 
     if reset_unused:
-      reset_ids = model.reset_unused()
-      if reset_ids.size > 0:
+      # cols (reset_ridx, reset_cidx, dup_ridx, dup_cidx, obj_decr, dup_c_mean)
+      batch_resets, batch_attempts = model.reset_unused()
+      reset_attempts.update(batch_attempts, 1)
+      if batch_resets.shape[0] > 0:
+        rIdx = batch_resets[:, 0].astype(np.int64)
+        cIdx = batch_resets[:, 1].astype(np.int64)
         # zero optimizer states
         for p in model.parameters():
           if not p.requires_grad:
@@ -218,34 +190,35 @@ def train_epoch(model, data_loader, optimizer, device, dist_mode=False,
           state = optimizer.state[p]
           for key, val in state.items():
             if isinstance(val, torch.Tensor) and val.shape == p.shape:
-              # assuming all parameters have k as first dim.
-              val[reset_ids, :] = 0.0
-        resets.append(reset_ids)
+              # assuming all parameters have (r, k) as first dims.
+              val[rIdx, cIdx, :] = 0.0
+        resets.append(batch_resets)
 
     batch_time = time.time() - tic
     sampsec.update(batch_size/batch_time, batch_size)
-
     if torch.isnan(batch_metrics[0]):
       raise RuntimeError('Divergence! NaN objective.')
 
   rtime = time.time() - epoch_tic
-  cluster_error, conf_mat = ut.eval_cluster_error(conf_mat.sum,
-      sort_conf_mat=False)
+
+  errors = torch.tensor([ut.eval_cluster_error(conf_mats.sum[ii, :])[0]
+      for ii in range(model.replicates)])
+  conf_mats = conf_mats.sum.numpy()
 
   if eval_rank:
     ranks, svs = model.eval_rank()
-    rank_stats = [np.median(ranks), ranks.min(), ranks.max()]
+    rank_stats = [ranks.min(), ranks.median(), ranks.max()]
   else:
     rank_stats, svs = [], None
 
   if reset_unused:
     resets = (np.concatenate(resets) if len(resets) > 0
-        else np.zeros((0,), dtype=np.int64))
+        else np.zeros((0, 6), dtype=np.int64))
     reset_count = resets.shape[0]
   else:
     reset_count = 0
 
   metrics = [met.avg for met in metrics]
-  metrics = ([cluster_error] + metrics +
-      rank_stats + [reset_count] + [sampsec.avg, rtime])
-  return metrics, conf_mat, svs, resets
+  metrics = ([errors.min(), errors.median(), errors.max()] + metrics +
+      rank_stats + [reset_count, reset_attempts.sum] + [sampsec.avg, rtime])
+  return metrics, conf_mats, svs, resets
