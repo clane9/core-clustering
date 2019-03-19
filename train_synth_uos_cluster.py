@@ -17,7 +17,7 @@ import models as mod
 import training as tr
 
 
-def main():
+def train_synth_uos_cluster(args):
   use_cuda = args.cuda and torch.cuda.is_available()
   torch.set_num_threads(args.num_threads)
 
@@ -179,4 +179,4 @@ if __name__ == '__main__':
                       help='How often to stop in ipdb [default: None]')
   args = parser.parse_args()
 
-  main()
+  train_synth_uos_cluster(args)
