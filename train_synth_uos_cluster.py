@@ -61,6 +61,7 @@ def train_synth_uos_cluster(args):
     reg_params = {
         'U_frosqr_in': args.U_frosqr_in_lamb,
         'U_frosqr_out': args.U_frosqr_out_lamb,
+        'U_fro_out': args.U_fro_out_lamb,
     }
     model = mod.KSubspaceProjModel(args.model_n, args.model_d, args.D,
         args.affine, args.reps, reg_params=reg_params,
