@@ -305,7 +305,8 @@ class _KSubspaceBaseModel(nn.Module):
       # scale of perturbation is relative to each basis' norm
       reset_Sigma = Unorms.mul(
           self.reset_sigma / np.sqrt(self.D*self.d))
-      Z = torch.randn(reset_r, self.k, self.D, self.d).mul_(reset_Sigma)
+      Z = torch.randn(reset_r, self.k, self.D, self.d,
+          dtype=Unorms.dtype, device=Unorms.device).mul_(reset_Sigma)
       self.Us.data[rIdx, :] = self.Us.data[rIdx, :] + Z
     return resets, reset_attempts
 
@@ -466,20 +467,15 @@ class KSubspaceProjModel(_KSubspaceBaseModel):
   """K-subspace model where low-dim coefficients are computed by a projection
   matrix."""
   default_reg_params = {
-      'U_frosqr_in': 0.01, 'U_frosqr_out': 1e-4
+      'U_frosqr_in': 0.01, 'U_frosqr_out': 1e-4, 'U_fro_out': 0.0,
   }
   assign_reg_terms = {'U_frosqr_in'}
 
-  def __init__(self, k, d, D, affine=False, symmetric=False, replicates=5,
-        reg_params={}, unused_thr=0.01, reset_patience=100,
-        reset_decr_tol=1e-4, reset_sigma=0.05):
-    super(KSubspaceModel, self).__init__(k, d, D, affine, replicates,
+  def __init__(self, k, d, D, affine=False, replicates=5, reg_params={},
+        unused_thr=0.01, reset_patience=100, reset_decr_tol=1e-4,
+        reset_sigma=0.05):
+    super(KSubspaceProjModel, self).__init__(k, d, D, affine, replicates,
         reg_params, unused_thr, reset_patience, reset_decr_tol, reset_sigma)
-    self.symmetric = symmetric
-    if self.symmetric:
-      self.register_parameter('Vs', None)
-    else:
-      self.Vs = nn.Parameter(torch.Tensor(k, D, d))
     self.reset_parameters()
     return
 
@@ -488,8 +484,6 @@ class KSubspaceProjModel(_KSubspaceBaseModel):
     0.1/sqrt(D)."""
     std = .1 / np.sqrt(self.D)
     self.Us.data.normal_(0., std)
-    if not self.symmetric:
-      self.Vs.data.normal_(0., std)
     if self.affine:
       self.bs.data.normal_(0., std)
     return
@@ -513,11 +507,8 @@ class KSubspaceProjModel(_KSubspaceBaseModel):
     else:
       x = x.view(1, 1, batch_size, self.D)
 
-    if self.symmetric:
-      # (r, k, batch_size, d)
-      z = torch.matmul(x, self.Us)
-    else:
-      z = torch.matmul(x, self.Vs)
+    # (r, k, batch_size, d)
+    z = torch.matmul(x, self.Us)
     return z
 
   def reg(self):
@@ -525,16 +516,18 @@ class KSubspaceProjModel(_KSubspaceBaseModel):
     regs = dict()
     # U regularization, each is shape (r, k)
     if max([self.reg_params[key] for key in
-          ('U_frosqr_in', 'U_frosqr_out')]) > 0:
-      if self.symmetric:
-        U_frosqr = torch.sum(self.Us.pow(2), dim=(2, 3))
-      else:
-        U_frosqr = (torch.sum(self.Us.pow(2), dim=(2, 3)) +
-            torch.sum(self.Vs.pow(2), dim=(2, 3))).mul(0.5)
+          ('U_frosqr_in', 'U_frosqr_out', 'U_fro_out')]) > 0:
+      U_frosqr = torch.sum(self.Us.pow(2), dim=(2, 3))
 
       if self.reg_params['U_frosqr_in'] > 0:
-        regs['U_frosqr_in'] = U_frosqr.mul(self.reg_params['U_frosqr_in'])
+        regs['U_frosqr_in'] = U_frosqr.mul(
+            0.5*self.reg_params['U_frosqr_in'])
 
       if self.reg_params['U_frosqr_out'] > 0:
-        regs['U_frosqr_out'] = U_frosqr.mul(self.reg_params['U_frosqr_out'])
+        regs['U_frosqr_out'] = U_frosqr.mul(
+            0.5*self.reg_params['U_frosqr_out'])
+
+      if self.reg_params['U_fro_out'] > 0:
+        regs['U_fro_out'] = U_frosqr.sqrt().mul(
+            self.reg_params['U_fro_out'])
     return regs

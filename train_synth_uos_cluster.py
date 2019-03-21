@@ -63,7 +63,7 @@ def train_synth_uos_cluster(args):
         'U_frosqr_out': args.U_frosqr_out_lamb,
     }
     model = mod.KSubspaceProjModel(args.model_n, args.model_d, args.D,
-        args.affine, args.symmetric, args.reps, reg_params=reg_params,
+        args.affine, args.reps, reg_params=reg_params,
         reset_patience=args.reset_patience, reset_decr_tol=args.reset_decr_tol,
         reset_sigma=args.reset_sigma)
   else:
@@ -130,8 +130,6 @@ if __name__ == '__main__':
                       help='Model number of subspaces [default: n]')
   parser.add_argument('--model-d', type=int, default=None,
                       help='Model subspace dimension [default: d]')
-  parser.add_argument('--symmetric', action='store_true',
-                      help='Projection matrix is U^T')
   parser.add_argument('--U-frosqr-in-lamb', type=float, default=0.01,
                       help=('Frobenius squared U reg parameter, '
                       'inside assignment [default: 0.01]'))
