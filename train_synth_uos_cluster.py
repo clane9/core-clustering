@@ -62,6 +62,7 @@ def train_synth_uos_cluster(args):
         'U_frosqr_in': args.U_frosqr_in_lamb,
         'U_frosqr_out': args.U_frosqr_out_lamb,
         'U_fro_out': args.U_fro_out_lamb,
+        'U_gram_fro_out': args.U_gram_fro_out_lamb
     }
     model = mod.KSubspaceProjModel(args.model_n, args.model_d, args.D,
         args.affine, args.reps, reg_params=reg_params,
@@ -72,6 +73,7 @@ def train_synth_uos_cluster(args):
         'U_frosqr_in': args.U_frosqr_in_lamb,
         'U_frosqr_out': args.U_frosqr_out_lamb,
         'U_fro_out': args.U_fro_out_lamb,
+        'U_gram_fro_out': args.U_gram_fro_out_lamb,
         'z': args.z_lamb
     }
     model = mod.KSubspaceModel(args.model_n, args.model_d, args.D, args.affine,
@@ -139,6 +141,9 @@ if __name__ == '__main__':
                       'outside assignment [default: 1e-4]'))
   parser.add_argument('--U-fro-out-lamb', type=float, default=0.0,
                       help=('Frobenius U reg parameter, '
+                      'outside assignment [default: 0.0]'))
+  parser.add_argument('--U-gram-fro-out-lamb', type=float, default=0.0,
+                      help=('Frobenius U^TU reg parameter, '
                       'outside assignment [default: 0.0]'))
   parser.add_argument('--z-lamb', type=float, default=0.01,
                       help=('L2 squared coefficient reg parameter, '

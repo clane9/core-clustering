@@ -372,7 +372,11 @@ class KSubspaceModel(_KSubspaceBaseModel):
   """K-subspace model where low-dim coefficients are computed in closed
   form."""
   default_reg_params = {
-      'U_frosqr_in': 0.01, 'U_frosqr_out': 1e-4, 'U_fro_out': 0.0, 'z': 0.01
+      'U_frosqr_in': 0.01,
+      'U_frosqr_out': 1e-4,
+      'U_fro_out': 0.0,
+      'U_gram_fro_out': 0.0,
+      'z': 0.01
   }
   assign_reg_terms = {'U_frosqr_in', 'z'}
 
@@ -454,6 +458,12 @@ class KSubspaceModel(_KSubspaceBaseModel):
         U_fro = U_frosqr.sqrt()
         regs['U_fro_out'] = U_fro.mul(self.reg_params['U_fro_out'])
 
+    if self.reg_params['U_gram_fro_out'] > 0:
+      UtUs = torch.matmul(self.Us.transpose(2, 3), self.Us)
+      UtUs_fro = torch.sum(UtUs.pow(2), dim=(2, 3)).sqrt()
+      regs['U_gram_fro_out'] = UtUs_fro.mul(
+          self.reg_params['U_gram_fro_out'])
+
     # z regularization, shape is (batch_size, r, k)
     # does not affect gradients, only included to ensure objective value
     # is accurate
@@ -467,7 +477,10 @@ class KSubspaceProjModel(_KSubspaceBaseModel):
   """K-subspace model where low-dim coefficients are computed by a projection
   matrix."""
   default_reg_params = {
-      'U_frosqr_in': 0.01, 'U_frosqr_out': 1e-4, 'U_fro_out': 0.0,
+      'U_frosqr_in': 0.01,
+      'U_frosqr_out': 1e-4,
+      'U_fro_out': 0.0,
+      'U_gram_fro_out': 0.0
   }
   assign_reg_terms = {'U_frosqr_in'}
 
@@ -530,4 +543,10 @@ class KSubspaceProjModel(_KSubspaceBaseModel):
       if self.reg_params['U_fro_out'] > 0:
         regs['U_fro_out'] = U_frosqr.sqrt().mul(
             self.reg_params['U_fro_out'])
+
+    if self.reg_params['U_gram_fro_out'] > 0:
+      UtUs = torch.matmul(self.Us.transpose(2, 3), self.Us)
+      UtUs_fro = torch.sum(UtUs.pow(2), dim=(2, 3)).sqrt()
+      regs['U_gram_fro_out'] = UtUs_fro.mul(
+          self.reg_params['U_gram_fro_out'])
     return regs
