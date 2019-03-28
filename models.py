@@ -5,6 +5,8 @@ import numpy as np
 import torch
 import torch.nn as nn
 
+import utils as ut
+
 EPS = 1e-8
 EMA_DECAY = 0.9
 
@@ -223,7 +225,7 @@ class _KSubspaceBaseModel(nn.Module):
       svs: singular values (r, k, d)
     """
     # svd is ~1000x faster on cpu for small matrices, e.g. (100, 10).
-    Us = self.Us.data.cpu() if max(self.D, self.d) <= 1000 else self.Us.data
+    Us = self.Us.data.cpu() if self.D <= 1000 else self.Us.data
     # ideally there would be a batched svd instead of this loop, but at least
     # k, r should be "small"
     # (rk, d)
@@ -493,7 +495,7 @@ class KSubspaceProjModel(_KSubspaceBaseModel):
     return
 
   def reset_parameters(self):
-    """Initialize Us, Vs, bs with entries drawn from normal with std
+    """Initialize Us, bs with entries drawn from normal with std
     0.1/sqrt(D)."""
     std = .1 / np.sqrt(self.D)
     self.Us.data.normal_(0., std)
@@ -534,11 +536,11 @@ class KSubspaceProjModel(_KSubspaceBaseModel):
 
       if self.reg_params['U_frosqr_in'] > 0:
         regs['U_frosqr_in'] = U_frosqr.mul(
-            0.5*self.reg_params['U_frosqr_in'])
+            self.reg_params['U_frosqr_in'])
 
       if self.reg_params['U_frosqr_out'] > 0:
         regs['U_frosqr_out'] = U_frosqr.mul(
-            0.5*self.reg_params['U_frosqr_out'])
+            self.reg_params['U_frosqr_out'])
 
       if self.reg_params['U_fro_out'] > 0:
         regs['U_fro_out'] = U_frosqr.sqrt().mul(
@@ -550,3 +552,117 @@ class KSubspaceProjModel(_KSubspaceBaseModel):
       regs['U_gram_fro_out'] = UtUs_fro.mul(
           self.reg_params['U_gram_fro_out'])
     return regs
+
+
+class KSubspaceBatchAltProjModel(KSubspaceProjModel):
+  default_reg_params = {
+      'U_frosqr_in': 0.01,
+      'U_frosqr_out': 1e-4,
+      'U_gram_fro_out': 0.0
+  }
+  assign_reg_terms = {'U_frosqr_in'}
+
+  def __init__(self, k, d, dataset, affine=False, replicates=5, reg_params={},
+        unused_thr=0.01, reset_decr_tol=1e-4, reset_sigma=0.05,
+        svd_solver='randomized'):
+    if svd_solver not in ('randomized', 'svds', 'svd'):
+      raise ValueError("Invalid svd solver {}".format(svd_solver))
+
+    # X assumed to be N x D.
+    D = dataset.X.shape[1]
+    reset_patience = 0
+    super(KSubspaceBatchAltProjModel, self).__init__(k, d, D, affine,
+        replicates, reg_params, unused_thr, reset_patience, reset_decr_tol,
+        reset_sigma)
+
+    self.dataset = dataset
+    self.register_buffer('X', dataset.X)
+    self.true_groups = dataset.groups
+    self.true_classes = dataset.classes
+    self.N = self.X.shape[0]
+    self.svd_solver = svd_solver
+
+    self.Us.requires_grad_(False)
+    if affine:
+      self.bs.requires_grad_(False)
+    self.c = nn.Parameter(torch.Tensor(self.N, self.r, k), requires_grad=False)
+    return
+
+  def objective(self):
+    """Evaluate objective function.
+
+    Returns:
+      obj_mean: average objective across replicates
+      obj, loss, reg_in, reg_out: metrics per replicate, shape (r,)
+      x_: reconstruction, shape (r, k, batch_size, D)
+    """
+    return super(KSubspaceBatchAltProjModel, self).objective(self.X)
+
+  def set_assign(self, assign_obj):
+    """Compute cluster assignment.
+
+    Inputs:
+      assign_obj: shape (N, r, k)
+    """
+    groups_prev = self.groups
+    minidx = torch.argmin(assign_obj, dim=2, keepdim=True)
+    self.c.zero_().scatter_(2, minidx, 1)
+    self.groups = minidx.squeeze().cpu()
+    self.c_mean = self._batch_c_mean = self.c.mean(dim=0)
+    self._updates = ((self.groups != groups_prev).sum()
+        if groups_prev is not None else self.N)
+    return
+
+  def reg(self):
+    """Evaluate subspace regularization."""
+    regs = dict()
+    # U regularization, each is shape (r, k)
+    if max([self.reg_params[key] for key in
+          ('U_frosqr_in', 'U_frosqr_out')]) > 0:
+      U_frosqr = torch.sum(self.Us.pow(2), dim=(2, 3))
+
+      if self.reg_params['U_frosqr_in'] > 0:
+        regs['U_frosqr_in'] = U_frosqr.mul(
+            self.reg_params['U_frosqr_in'])
+
+      if self.reg_params['U_frosqr_out'] > 0:
+        regs['U_frosqr_out'] = U_frosqr.mul(
+            self.reg_params['U_frosqr_out'])
+
+    if self.reg_params['U_gram_fro_out'] > 0:
+      UtUs = torch.matmul(self.Us.transpose(2, 3), self.Us)
+      UtUs_fro = torch.sum(UtUs.pow(2), dim=(2, 3)).sqrt()
+      regs['U_gram_fro_out'] = UtUs_fro.mul(
+          self.reg_params['U_gram_fro_out'])
+    return regs
+
+  def eval_shrink(self, x_):
+    """measure shrinkage of reconstruction wrt data.
+
+    Inputs:
+      x_: reconstruction, shape (r, k, N, D)
+
+    Returns:
+      norm_x_: average norm of x_ relative to x, shape (r,)
+    """
+    return super(KSubspaceBatchAltProjModel, self).eval_shrink(self.X, x_)
+
+  def step(self):
+    """Update subspace bases by regularized pca (and increment step count)."""
+    gamma = self.N*self.reg_params['U_gram_fro_out']
+
+    for ii in range(self.r):
+      for jj in range(self.k):
+        if self.c_mean[ii, jj] > 0:
+          Xj = self.X[self.c[:, ii, jj] == 1, :]
+          Nj = Xj.shape[0]
+          lamb = (Nj*self.reg_params['U_frosqr_in'] +
+              self.N*self.reg_params['U_frosqr_out'])
+          U, b = ut.reg_pca(Xj, self.d, lamb, gamma,
+              affine=self.affine, solver=self.svd_solver)
+
+          self.Us.data[ii, jj, :] = U
+          if self.affine:
+            self.bs.data[ii, jj, :] = b
+    self.steps.add_(1)
+    return

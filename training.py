@@ -9,6 +9,7 @@ import torch
 from torch import optim
 
 import utils as ut
+from models import KSubspaceBatchAltProjModel
 
 
 def train_loop(model, data_loader, device, optimizer, out_dir=None, epochs=200,
@@ -60,13 +61,16 @@ def train_loop(model, data_loader, device, optimizer, out_dir=None, epochs=200,
   else:
     val_logf = None
 
-  conf_mats = np.zeros((epochs, model.r, model.k,
-      data_loader.dataset.classes.size), dtype=np.int64)
+  batch_alt_mode = isinstance(model, KSubspaceBatchAltProjModel)
+
+  true_n = (model.true_classes.size if batch_alt_mode
+      else data_loader.dataset.classes.size)
+  conf_mats = np.zeros((epochs, model.r, model.k, true_n), dtype=np.int64)
   svs = (np.zeros((epochs, model.r, model.k, model.d), dtype=np.float32)
       if eval_rank else None)
   resets = [] if reset_unused else None
 
-  if scheduler is None:
+  if not batch_alt_mode and scheduler is None:
     min_lr = 1e-6*ut.get_learning_rate(optimizer)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer,
         factor=0.5, patience=5, threshold=1e-3, min_lr=min_lr)
@@ -77,10 +81,14 @@ def train_loop(model, data_loader, device, optimizer, out_dir=None, epochs=200,
   model.train()
   try:
     for epoch in range(1, epochs+1):
-      (metrics, conf_mats[epoch-1, :],
-          epoch_svs, epoch_resets) = train_epoch(model, data_loader,
-              optimizer, device, eval_rank, reset_unused)
-      lr = ut.get_learning_rate(optimizer)
+      if batch_alt_mode:
+        (metrics, conf_mats[epoch-1, :], epoch_svs,
+            epoch_resets) = batch_alt_step(model, eval_rank, reset_unused)
+      else:
+        (metrics, conf_mats[epoch-1, :], epoch_svs,
+            epoch_resets) = train_epoch(model, data_loader, optimizer, device,
+                eval_rank, reset_unused)
+        lr = ut.get_learning_rate(optimizer)
 
       if eval_rank:
         svs[epoch-1, :] = epoch_svs
@@ -94,20 +102,25 @@ def train_loop(model, data_loader, device, optimizer, out_dir=None, epochs=200,
       print(printformstr.format(epoch, epochs, lr, *metrics))
 
       cluster_error, min_obj, max_obj = metrics[0], metrics[3], metrics[5]
-      is_conv = lr <= min_lr or epoch == epochs
+      if batch_alt_mode:
+        is_conv = model._updates == 0 or epoch == epochs
+      else:
+        is_conv = lr <= min_lr or epoch == epochs
 
       save_chkp = (out_dir is not None and (epoch % chkp_freq == 0 or is_conv))
       if save_chkp:
         ut.save_checkpoint({
             'epoch': epoch,
             'model': model.state_dict(),
-            'optimizer': optimizer.state_dict(),
+            'optimizer': (optimizer.state_dict()
+                if not batch_alt_mode else None),
             'err': cluster_error,
             'obj': min_obj},
             is_best=False,
             filename='{}/checkpoint{}.pth.tar'.format(out_dir, epoch))
 
-      scheduler.step(max_obj)
+      if not batch_alt_mode:
+        scheduler.step(max_obj)
 
       if stop_freq > 0 and epoch % stop_freq == 0:
         ipdb.set_trace()
@@ -221,4 +234,44 @@ def train_epoch(model, data_loader, optimizer, device, eval_rank=False,
   metrics = [met.avg for met in metrics]
   metrics = ([errors.min(), errors.median(), errors.max()] + metrics +
       rank_stats + [reset_count, reset_attempts.sum] + [sampsec.avg, rtime])
+  return metrics, conf_mats, svs, resets
+
+
+def batch_alt_step(model, eval_rank=False, reset_unused=False):
+  epoch_tic = time.time()
+  _, obj, loss, reg_in, reg_out, x_ = model.objective()
+  model.step()
+
+  norm_x_ = model.eval_shrink(x_)
+  metrics = [val for met in [obj, loss, reg_in, reg_out, norm_x_]
+      for val in [met.min(), met.median(), met.max()]]
+
+  # eval cluster confusion
+  conf_mats = torch.stack([
+      ut.eval_confusion(model.groups[:, ii], model.true_groups, k=model.k,
+          true_classes=model.true_classes)
+      for ii in range(model.replicates)])
+
+  if reset_unused:
+    # cols (reset_ridx, reset_cidx, dup_ridx, dup_cidx, obj_decr, dup_c_mean)
+    resets, reset_attempts = model.reset_unused()
+    reset_count = resets.shape[0]
+  else:
+    reset_count = 0
+
+  rtime = time.time() - epoch_tic
+  sampsec = model.N / rtime
+
+  errors = torch.tensor([ut.eval_cluster_error(conf_mats[ii, :])[0]
+      for ii in range(model.replicates)])
+  conf_mats = conf_mats.numpy()
+
+  if eval_rank:
+    ranks, svs = model.eval_rank()
+    rank_stats = [ranks.min(), ranks.median(), ranks.max()]
+  else:
+    rank_stats, svs = [], None
+
+  metrics = ([errors.min(), errors.median(), errors.max()] + metrics +
+      rank_stats + [reset_count, reset_attempts] + [sampsec, rtime])
   return metrics, conf_mats, svs, resets

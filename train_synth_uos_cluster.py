@@ -9,6 +9,7 @@ import os
 import shutil
 import pickle
 
+import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
@@ -19,7 +20,9 @@ import training as tr
 
 def train_synth_uos_cluster(args):
   use_cuda = args.cuda and torch.cuda.is_available()
+  device = torch.device('cuda' if use_cuda else 'cpu')
   torch.set_num_threads(args.num_threads)
+  batch_alt_mode = args.form == 'batch_alt'
 
   # create output directory, deleting any existing results.
   if os.path.exists(args.out_dir):
@@ -29,8 +32,6 @@ def train_synth_uos_cluster(args):
   with open('{}/args.pkl'.format(args.out_dir), 'wb') as f:
     pickle.dump(args, f)
 
-  device = torch.device('cuda' if use_cuda else 'cpu')
-
   # construct dataset
   torch.manual_seed(args.data_seed)
   if args.N is None:
@@ -38,6 +39,9 @@ def train_synth_uos_cluster(args):
   if args.Ng is None:
     args.Ng = args.N // args.n
   if args.online:
+    if batch_alt_mode:
+      raise ValueError(("Online mode not compatible with "
+          "batch_alt formulation."))
     synth_dataset = dat.SynthUoSOnlineDataset(args.n, args.d, args.D,
         args.N, args.affine, args.sigma, args.data_seed)
     shuffle_data = False
@@ -48,8 +52,11 @@ def train_synth_uos_cluster(args):
   kwargs = {'num_workers': args.num_workers}
   if use_cuda:
     kwargs['pin_memory'] = True
-  synth_data_loader = DataLoader(synth_dataset, batch_size=args.batch_size,
-      shuffle=shuffle_data, drop_last=True, **kwargs)
+  if batch_alt_mode:
+    synth_data_loader = None
+  else:
+    synth_data_loader = DataLoader(synth_dataset, batch_size=args.batch_size,
+        shuffle=shuffle_data, drop_last=True, **kwargs)
 
   # construct model
   torch.manual_seed(args.seed)
@@ -57,18 +64,19 @@ def train_synth_uos_cluster(args):
     args.model_d = args.d
   if args.model_n is None or args.model_n <= 0:
     args.model_n = args.n
-  if args.proj_form:
+  if args.reset_patience is None or args.reset_patience < 0:
+    args.reset_patience = int(np.ceil(len(synth_dataset) / args.batch_size))
+  if args.form == 'batch_alt':
     reg_params = {
         'U_frosqr_in': args.U_frosqr_in_lamb,
         'U_frosqr_out': args.U_frosqr_out_lamb,
-        'U_fro_out': args.U_fro_out_lamb,
         'U_gram_fro_out': args.U_gram_fro_out_lamb
     }
-    model = mod.KSubspaceProjModel(args.model_n, args.model_d, args.D,
-        args.affine, args.reps, reg_params=reg_params,
-        reset_patience=args.reset_patience, reset_decr_tol=args.reset_decr_tol,
-        reset_sigma=args.reset_sigma)
-  else:
+    model = mod.KSubspaceBatchAltProjModel(args.model_n, args.model_d,
+        synth_dataset, args.affine, args.reps, reg_params=reg_params,
+        unused_thr=args.unused_thr, reset_decr_tol=args.reset_decr_tol,
+        reset_sigma=args.reset_sigma, svd_solver='randomized')
+  elif args.form == 'mf':
     reg_params = {
         'U_frosqr_in': args.U_frosqr_in_lamb,
         'U_frosqr_out': args.U_frosqr_out_lamb,
@@ -77,19 +85,34 @@ def train_synth_uos_cluster(args):
         'z': args.z_lamb
     }
     model = mod.KSubspaceModel(args.model_n, args.model_d, args.D, args.affine,
-        args.reps, reg_params=reg_params, reset_patience=args.reset_patience,
+        args.reps, reg_params=reg_params, unused_thr=args.unused_thr,
+        reset_patience=args.reset_patience, reset_decr_tol=args.reset_decr_tol,
+        reset_sigma=args.reset_sigma)
+  else:
+    reg_params = {
+        'U_frosqr_in': args.U_frosqr_in_lamb,
+        'U_frosqr_out': args.U_frosqr_out_lamb,
+        'U_fro_out': args.U_fro_out_lamb,
+        'U_gram_fro_out': args.U_gram_fro_out_lamb
+    }
+    model = mod.KSubspaceProjModel(args.model_n, args.model_d, args.D,
+        args.affine, args.reps, reg_params=reg_params,
+        unused_thr=args.unused_thr, reset_patience=args.reset_patience,
         reset_decr_tol=args.reset_decr_tol, reset_sigma=args.reset_sigma)
   model = model.to(device)
 
   # optimizer
-  if args.optim == 'SGD':
-    optimizer = torch.optim.SGD(model.parameters(), lr=args.init_lr,
-        momentum=0.9, nesterov=True)
-  elif args.optim == 'Adam':
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.init_lr,
-        betas=(0.9, 0.9), amsgrad=True)
+  if batch_alt_mode:
+    optimizer = None
   else:
-    raise ValueError("Invalid optimizer {}.".format(args.optim))
+    if args.optim == 'SGD':
+      optimizer = torch.optim.SGD(model.parameters(), lr=args.init_lr,
+          momentum=0.9, nesterov=True)
+    elif args.optim == 'Adam':
+      optimizer = torch.optim.Adam(model.parameters(), lr=args.init_lr,
+          betas=(0.9, 0.9), amsgrad=True)
+    else:
+      raise ValueError("Invalid optimizer {}.".format(args.optim))
 
   if args.chkp_freq is None or args.chkp_freq <= 0:
     args.chkp_freq = args.epochs
@@ -125,8 +148,9 @@ if __name__ == '__main__':
   parser.add_argument('--online', action='store_true',
                       help='Online data generation')
   # model settings
-  parser.add_argument('--proj-form', action='store_true', default=False,
-                      help='Use projection matrix formulation')
+  parser.add_argument('--form', type=str, default='proj',
+                      help=('Model formulation (proj, mf, batch_alt) '
+                      '[default: proj]'))
   parser.add_argument('--reps', type=int, default=5,
                       help='Number of model replicates [default: 5]')
   parser.add_argument('--model-n', type=int, default=None,
@@ -159,6 +183,9 @@ if __name__ == '__main__':
                       help='Initial learning rate [default: 0.5]')
   parser.add_argument('--reset-unused', action='store_true', default=False,
                       help='Whether to reset unused clusters')
+  parser.add_argument('--unused-thr', type=float, default=0.01,
+                      help=('Threshold for identifying unused clusters, '
+                      'relative to 1/k [default: .01]'))
   parser.add_argument('--reset-patience', type=int, default=None,
                       help='Steps to wait between resets [default: 1 epoch]')
   parser.add_argument('--reset-decr-tol', type=float, default=1e-4,
