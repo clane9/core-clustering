@@ -270,6 +270,7 @@ def batch_alt_step(model, eval_rank=False, reset_unused=False):
     reset_attempts = resets.shape[0]
     reset_count = int(resets[:, 5].sum())
   else:
+    resets = np.zeros((0, 9), dtype=object)
     reset_count, reset_attempts = 0, 0
 
   rtime = time.time() - epoch_tic
