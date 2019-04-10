@@ -142,7 +142,7 @@ def train_loop(model, data_loader, device, optimizer, out_dir=None, epochs=200,
   finally:
     if reset_unused:
       resets = (np.concatenate(resets, axis=0) if len(resets) > 0
-          else np.zeros((0, 7), dtype=np.int64))
+          else np.zeros((0, 10), dtype=object))
     if out_dir is not None:
       with open('{}/metrics.npz'.format(out_dir), 'wb') as f:
         np.savez(f, metrics=metrics[:epoch, :])
@@ -196,9 +196,9 @@ def train_epoch(model, data_loader, optimizer, device, eval_rank=False,
     conf_mats.update(batch_conf_mats, 1)
 
     if reset_unused:
-      # cols (reset_ridx, reset_cidx, dup_ridx, dup_cidx, obj_decr, dup_c_mean)
-      batch_resets, batch_attempts = model.reset_unused()
-      reset_attempts.update(batch_attempts, 1)
+      # cols (reset_ridx, reset_cidx, reset_metric, cand_ridx, cand_cidx,
+      # reset_success, obj_decr, cand_c_mean, cand_value)
+      batch_resets = model.reset_unused()
       if batch_resets.shape[0] > 0:
         rIdx = batch_resets[:, 0].astype(np.int64)
         cIdx = batch_resets[:, 1].astype(np.int64)
@@ -234,10 +234,11 @@ def train_epoch(model, data_loader, optimizer, device, eval_rank=False,
 
   if reset_unused:
     resets = (np.concatenate(resets) if len(resets) > 0
-        else np.zeros((0, 6), dtype=np.int64))
-    reset_count = resets.shape[0]
+        else np.zeros((0, 9), dtype=object))
+    reset_attempts = resets.shape[0]
+    reset_count = int(resets[:, 5].sum())
   else:
-    reset_count = 0
+    reset_attempts, reset_count = 0, 0
 
   metrics = torch.stack([errors] + [met.avg for met in metrics])
   metrics_summary = torch.stack([metrics.min(dim=1)[0],
@@ -245,7 +246,7 @@ def train_epoch(model, data_loader, optimizer, device, eval_rank=False,
   metrics = metrics.cpu().numpy()
   metrics_summary = metrics_summary.view(-1).numpy().tolist()
   metrics_summary = (metrics_summary + rank_stats +
-      [reset_count, reset_attempts.sum] + [sampsec.avg, rtime])
+      [reset_count, reset_attempts] + [sampsec.avg, rtime])
   return metrics_summary, metrics, conf_mats, svs, resets
 
 
@@ -263,9 +264,11 @@ def batch_alt_step(model, eval_rank=False, reset_unused=False):
       for ii in range(model.replicates)])
 
   if reset_unused:
-    # cols (reset_ridx, reset_cidx, dup_ridx, dup_cidx, obj_decr, dup_c_mean)
-    resets, reset_attempts = model.reset_unused()
-    reset_count = resets.shape[0]
+    # cols (reset_ridx, reset_cidx, reset_success, cand_ridx, cand_cidx,
+    # obj_decr, cand_c_mean, cand_value)
+    resets = model.reset_unused()
+    reset_attempts = resets.shape[0]
+    reset_count = int(resets[:, 5].sum())
   else:
     reset_count, reset_attempts = 0, 0
 
