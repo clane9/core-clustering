@@ -17,8 +17,8 @@ class _KSubspaceBaseModel(nn.Module):
   assign_reg_terms = set()
 
   def __init__(self, k, d, D, affine=False, replicates=5, reg_params={},
-        reset_mode='value', unused_thr=0.01, reset_patience=100,
-        reset_decr_tol=1e-4, reset_sigma=0.05):
+        reset_metric='value', unused_thr=0.01, reset_patience=100,
+        reset_obj='assign', reset_decr_tol=1e-4, reset_sigma=0.05):
     if replicates < 1:
       raise ValueError("Invalid replicates parameter {}".format(replicates))
     for key in self.default_reg_params:
@@ -29,13 +29,16 @@ class _KSubspaceBaseModel(nn.Module):
         raise ValueError("Invalid {} reg parameter {}".format(k, val))
     if not set(reg_params).issubset(set(self.default_reg_params)):
       raise ValueError("Invalid reg parameter keys")
-    if reset_mode not in {'value', 'size'}:
-      raise ValueError("Invalid reset_mode parameter {}".format(reset_mode))
+    if reset_metric not in {'value', 'size'}:
+      raise ValueError(
+          "Invalid reset_metric parameter {}".format(reset_metric))
     if unused_thr < 0:
       raise ValueError("Invalid unused_thr parameter {}".format(unused_thr))
     if reset_patience < 0:
       raise ValueError("Invalid reset_patience parameter {}".format(
           reset_patience))
+    if reset_obj not in {'assign', 'full'}:
+      raise ValueError("Invalid reset_obj parameter {}".format(reset_obj))
     if reset_sigma < 0:
       raise ValueError("Invalid reset_sigma parameter {}".format(
           reset_sigma))
@@ -47,9 +50,10 @@ class _KSubspaceBaseModel(nn.Module):
     self.affine = affine
     self.replicates = self.r = replicates
     self.reg_params = reg_params
-    self.reset_mode = reset_mode
+    self.reset_metric = reset_metric
     self.unused_thr = unused_thr
     self.reset_patience = reset_patience
+    self.reset_obj = reset_obj
     self.reset_decr_tol = (float('-inf') if reset_decr_tol is None
         else reset_decr_tol)
     self.reset_sigma = reset_sigma
@@ -67,7 +71,7 @@ class _KSubspaceBaseModel(nn.Module):
       self.register_parameter('bs', None)
     self.register_buffer('c_mean', torch.ones(self.r, k).div_(k))
     self.register_buffer('value', torch.zeros(self.r, k))
-    self.register_buffer('steps', torch.zeros(self.r, dtype=torch.int64))
+    self.register_buffer('steps', torch.zeros(self.r, k, dtype=torch.int64))
     return
 
   def reset_parameters(self):
@@ -253,7 +257,7 @@ class _KSubspaceBaseModel(nn.Module):
     return ranks, svs
 
   def reset_unused(self):
-    """Reset the least used cluster by choosing best replacement candidate
+    """Reset the least used clusters by choosing best replacement candidates
     from all other replicates.
 
     Returns:
@@ -268,51 +272,68 @@ class _KSubspaceBaseModel(nn.Module):
       return np.zeros((0, 9), dtype=object)
 
     # identify clusters to reset
-    reset_metric = self.c_mean if self.reset_mode == 'size' else self.value
+    if self.reset_metric == 'value':
+      reset_metric = self.value
+      if self.reset_obj == 'full':
+        # take outside reg into account
+        reset_metric = reset_metric - self._batch_reg_out
+    else:
+      reset_metric = self.c_mean
+    # clamp to avoid unlikely case where max value is not positive.
     reset_metric = reset_metric / torch.max(reset_metric,
-        dim=1, keepdim=True)[0]
-    min_metric, reset_cids = torch.min(reset_metric, dim=1)
-    reset_mask = self.steps >= self.reset_patience
-    reset_mask.mul_(min_metric <= self.unused_thr)
-    reset_rids = reset_mask.nonzero().view(-1)
-    reset_cids = reset_cids[reset_mask]
+        dim=1, keepdim=True)[0].clamp(min=EPS)
+    reset_mask = reset_metric <= self.unused_thr
+    reset_mask.mul_(self.steps >= self.reset_patience)
+    reset_rids = reset_mask.any(dim=1).nonzero().view(-1)
 
     resets = []
-    for ridx, cidx in zip(reset_rids, reset_cids):
-      # find best reset candidate and substitute if decrease tol satisfied
-      (cand_ridx, cand_cidx, cand_obj,
-          cand_c_mean, cand_c_value) = self._reset_cluster(ridx, cidx)
-      old_obj = self._batch_obj[ridx].item()
-      obj_decr = 1.0 - cand_obj / old_obj
-      cand_size = cand_c_mean[cidx].item()
-      cand_value = cand_c_value[cidx].item()
+    for ridx in reset_rids:
+      rep_reset_cids = reset_mask[ridx, :].nonzero().view(-1)
+      # sort by metric
+      rep_reset_cids = rep_reset_cids[
+          torch.sort(reset_metric[ridx, rep_reset_cids])[1]]
+      for cidx in rep_reset_cids:
+        # find best reset candidate and substitute if decrease tol satisfied
+        (cand_ridx, cand_cidx, cand_obj,
+            cand_c_mean, cand_c_value) = self._reset_cluster(ridx, cidx)
+        old_obj = self._batch_obj[ridx].item()
+        obj_decr = 1.0 - cand_obj / old_obj
+        cand_size = cand_c_mean[cidx].item()
+        cand_value = cand_c_value[cidx].item()
 
-      if self.reset_mode == 'size':
-        still_unused = cand_size <= self.unused_thr * cand_c_mean.max()
-      else:
-        still_unused = cand_value <= self.unused_thr * cand_c_value.max()
+        if self.reset_metric == 'size':
+          still_unused = cand_size <= self.unused_thr * cand_c_mean.max()
+        else:
+          still_unused = cand_value <= self.unused_thr * cand_c_value.max()
 
-      reset_success = obj_decr > self.reset_decr_tol and not still_unused
-      if reset_success:
-        # reset parameters
-        self.Us.data[ridx, cidx, :] = self.Us.data[cand_ridx, cand_cidx, :]
-        if self.affine:
-          self.bs.data[ridx, cidx, :] = self.bs.data[
-              cand_ridx, cand_cidx, :]
-        # reset batch metrics (matters if there are multiple resets to do)
-        self._batch_assign_obj[:, ridx, cidx] = self._batch_assign_obj[
-            :, cand_ridx, cand_cidx]
-        self._batch_obj[ridx] = cand_obj
-        self._batch_reg_out[ridx, cidx] = self._batch_reg_out[
-            cand_ridx, cand_cidx]
-        # reset size, value
-        self._batch_c_mean[ridx, :] = self.c_mean[ridx, :] = cand_c_mean
-        self._batch_value[ridx, :] = self.value[ridx, :] = cand_c_value
+        reset_success = (obj_decr > self.reset_decr_tol and
+            (obj_decr > 0 or not still_unused))
+        if reset_success:
+          # reset parameters
+          self.Us.data[ridx, cidx, :] = self.Us.data[cand_ridx, cand_cidx, :]
+          if self.affine:
+            self.bs.data[ridx, cidx, :] = self.bs.data[
+                cand_ridx, cand_cidx, :]
 
-      self.steps[ridx] = 0
-      resets.append([ridx.item(), cidx.item(), min_metric[ridx].item(),
-          cand_ridx, cand_cidx, int(reset_success), obj_decr, cand_size,
-          cand_value])
+          # reset batch metrics (matters if there are multiple resets to do)
+          self._batch_assign_obj[:, ridx, cidx] = self._batch_assign_obj[
+              :, cand_ridx, cand_cidx]
+          self._batch_obj[ridx] = cand_obj
+          self._batch_reg_out[ridx, cidx] = self._batch_reg_out[
+              cand_ridx, cand_cidx]
+
+          # reset size, value, steps
+          self._batch_c_mean[ridx, :] = self.c_mean[ridx, :] = cand_c_mean
+          self._batch_value[ridx, :] = self.value[ridx, :] = cand_c_value
+          self.steps[ridx, cidx] = 0
+        else:
+          # after failing to add a new basis, don't want to reset in this
+          # replicate for a while
+          self.steps[ridx, :] = 0
+
+        resets.append([ridx.item(), cidx.item(),
+            reset_metric[ridx, cidx].item(), cand_ridx, cand_cidx,
+            int(reset_success), obj_decr, cand_size, cand_value])
 
     if len(resets) > 0:
       resets = np.array(resets, dtype=object)
@@ -321,8 +342,8 @@ class _KSubspaceBaseModel(nn.Module):
 
     # perturb all bases slightly in replicates with resets to make sure we
     # always have some diversity across replicates
-    if self.reset_sigma > 0 and resets.shape[0] > 0:
-      rIdx = resets[:, 0].astype(np.int64)
+    if self.reset_sigma > 0 and np.sum(resets[:, 5]) > 0:
+      rIdx = np.unique(resets[resets[:, 5] == 1, 0].astype(np.int64))
       reset_r = rIdx.shape[0]
       # (reset_r, k, 1, 1)
       Unorms = self.Us.data[rIdx, :].pow(2).sum(
@@ -372,9 +393,16 @@ class _KSubspaceBaseModel(nn.Module):
     assign_Idx = top2Idx[:, :, 0]
     alt_obj = top2obj[:, :, 0]
 
-    # compute candidate objectives and choose best (ignoring outside reg)
+    # compute candidate objectives and choose best
+    # (possibly ignoring outside reg)
     # ((r-1)*k,)
     alt_obj = alt_obj.mean(dim=0)
+    alt_reg_out = (self._batch_reg_out[ridx, :].sum() -
+        self._batch_reg_out[ridx, cidx])
+    if self.reset_obj == 'full':
+      alt_reg_out = (self._batch_reg_out[cand_Idx[:, 0], cand_Idx[:, 1]] +
+          alt_reg_out)
+      alt_obj += alt_reg_out
     cand_obj, min_idx = torch.min(alt_obj, dim=0)
     cand_ridx, cand_cidx = cand_Idx[min_idx, 0], cand_Idx[min_idx, 1]
 
@@ -386,13 +414,9 @@ class _KSubspaceBaseModel(nn.Module):
     cand_value = torch.mean(cand_c *
         (top2obj[:, min_idx, [1]] - top2obj[:, min_idx, [0]]), dim=0)
 
-    # But add outside reg after selection
-    # NOTE: remember normal indexing returns a view, whereas fancy indexing
-    # returns a copy. Clone here to avoid modifying original. Should be careful
-    # to account for this elsewhere.
-    rep_reg_out = self._batch_reg_out[ridx, :].clone()
-    rep_reg_out[cidx] = self._batch_reg_out[cand_ridx, cand_cidx]
-    cand_obj.add_(rep_reg_out.sum())
+    # Add outside reg after selection if not included
+    if self.reset_obj != 'full':
+      cand_obj += alt_reg_out + self._batch_reg_out[cand_ridx, cand_cidx]
     return (cand_ridx.item(), cand_cidx.item(), cand_obj.item(),
         cand_c_mean, cand_value)
 
@@ -415,11 +439,11 @@ class KSubspaceModel(_KSubspaceBaseModel):
   assign_reg_terms = {'U_frosqr_in', 'z'}
 
   def __init__(self, k, d, D, affine=False, replicates=5, reg_params={},
-        reset_mode='value', unused_thr=0.01, reset_patience=100,
-        reset_decr_tol=1e-4, reset_sigma=0.05):
+        reset_metric='value', unused_thr=0.01, reset_patience=100,
+        reset_obj='assign', reset_decr_tol=1e-4, reset_sigma=0.05):
     super(KSubspaceModel, self).__init__(k, d, D, affine, replicates,
-        reg_params, reset_mode, unused_thr, reset_patience, reset_decr_tol,
-        reset_sigma)
+        reg_params, reset_metric, unused_thr, reset_patience, reset_obj,
+        reset_decr_tol, reset_sigma)
     self.reset_parameters()
     return
 
@@ -520,11 +544,11 @@ class KSubspaceProjModel(_KSubspaceBaseModel):
   assign_reg_terms = {'U_frosqr_in'}
 
   def __init__(self, k, d, D, affine=False, replicates=5, reg_params={},
-        reset_mode='value', unused_thr=0.01, reset_patience=100,
-        reset_decr_tol=1e-4, reset_sigma=0.05):
+        reset_metric='value', unused_thr=0.01, reset_patience=100,
+        reset_obj='assign', reset_decr_tol=1e-4, reset_sigma=0.05):
     super(KSubspaceProjModel, self).__init__(k, d, D, affine, replicates,
-        reg_params, reset_mode, unused_thr, reset_patience, reset_decr_tol,
-        reset_sigma)
+        reg_params, reset_metric, unused_thr, reset_patience, reset_obj,
+        reset_decr_tol, reset_sigma)
     self.reset_parameters()
     return
 
@@ -597,17 +621,17 @@ class KSubspaceBatchAltProjModel(KSubspaceProjModel):
   assign_reg_terms = {'U_frosqr_in'}
 
   def __init__(self, k, d, dataset, affine=False, replicates=5, reg_params={},
-        reset_mode='value', unused_thr=0.01, reset_decr_tol=1e-4,
-        reset_sigma=0.05, svd_solver='randomized'):
+        reset_metric='value', unused_thr=0.01, reset_obj='assign',
+        reset_decr_tol=1e-4, reset_sigma=0.05, svd_solver='randomized'):
     if svd_solver not in ('randomized', 'svds', 'svd'):
       raise ValueError("Invalid svd solver {}".format(svd_solver))
 
     # X assumed to be N x D.
     D = dataset.X.shape[1]
-    reset_patience = 0
+    reset_patience = 2
     super(KSubspaceBatchAltProjModel, self).__init__(k, d, D, affine,
-        replicates, reg_params, reset_mode, unused_thr, reset_patience,
-        reset_decr_tol, reset_sigma)
+        replicates, reg_params, reset_metric, unused_thr, reset_patience,
+        reset_obj, reset_decr_tol, reset_sigma)
 
     self.dataset = dataset
     self.register_buffer('X', dataset.X)

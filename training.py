@@ -264,8 +264,8 @@ def batch_alt_step(model, eval_rank=False, reset_unused=False):
       for ii in range(model.replicates)])
 
   if reset_unused:
-    # cols (reset_ridx, reset_cidx, reset_success, cand_ridx, cand_cidx,
-    # obj_decr, cand_c_mean, cand_value)
+    # cols (reset_ridx, reset_cidx, reset_metric, cand_ridx, cand_cidx,
+    # reset_success, obj_decr, cand_c_mean, cand_value)
     resets = model.reset_unused()
     reset_attempts = resets.shape[0]
     reset_count = int(resets[:, 5].sum())

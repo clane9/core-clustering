@@ -96,7 +96,7 @@ def eval_cluster_error(*args, **kwargs):
   if col_ind.size < conf_mat.shape[1]:
     col_ind = np.concatenate([col_ind,
       np.setdiff1d(np.arange(conf_mat.shape[1]), col_ind)])
-  map_Idx = np.stack((row_ind, col_ind), axis=1)
+  map_Idx = (row_ind, col_ind)
   return cluster_error, map_Idx
 
 

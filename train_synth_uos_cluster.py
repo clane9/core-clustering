@@ -64,8 +64,8 @@ def train_synth_uos_cluster(args):
     args.model_d = args.d
   if args.model_n is None or args.model_n <= 0:
     args.model_n = args.n
-  args.reset_mode = args.reset_mode.lower()
-  reset_mode = 'value' if args.reset_mode == 'none' else args.reset_mode
+  args.reset_metric = args.reset_metric.lower()
+  reset_metric = 'value' if args.reset_metric == 'none' else args.reset_metric
   if args.reset_patience is None or args.reset_patience < 0:
     args.reset_patience = int(np.ceil(len(synth_dataset) / args.batch_size))
   if args.form == 'batch_alt':
@@ -76,9 +76,9 @@ def train_synth_uos_cluster(args):
     }
     model = mod.KSubspaceBatchAltProjModel(args.model_n, args.model_d,
         synth_dataset, args.affine, args.reps, reg_params=reg_params,
-        reset_mode=reset_mode, unused_thr=args.unused_thr,
-        reset_decr_tol=args.reset_decr_tol, reset_sigma=args.reset_sigma,
-        svd_solver='randomized')
+        reset_metric=reset_metric, unused_thr=args.unused_thr,
+        reset_obj=args.reset_obj, reset_decr_tol=args.reset_decr_tol,
+        reset_sigma=args.reset_sigma, svd_solver='randomized')
   elif args.form == 'mf':
     reg_params = {
         'U_frosqr_in': args.U_frosqr_in_lamb,
@@ -88,9 +88,10 @@ def train_synth_uos_cluster(args):
         'z': args.z_lamb
     }
     model = mod.KSubspaceModel(args.model_n, args.model_d, args.D, args.affine,
-        args.reps, reg_params=reg_params, reset_mode=reset_mode,
+        args.reps, reg_params=reg_params, reset_metric=reset_metric,
         unused_thr=args.unused_thr, reset_patience=args.reset_patience,
-        reset_decr_tol=args.reset_decr_tol, reset_sigma=args.reset_sigma)
+        reset_obj=args.reset_obj, reset_decr_tol=args.reset_decr_tol,
+        reset_sigma=args.reset_sigma)
   else:
     reg_params = {
         'U_frosqr_in': args.U_frosqr_in_lamb,
@@ -99,8 +100,9 @@ def train_synth_uos_cluster(args):
         'U_gram_fro_out': args.U_gram_fro_out_lamb
     }
     model = mod.KSubspaceProjModel(args.model_n, args.model_d, args.D,
-        args.affine, args.reps, reg_params=reg_params, reset_mode=reset_mode,
-        unused_thr=args.unused_thr, reset_patience=args.reset_patience,
+        args.affine, args.reps, reg_params=reg_params,
+        reset_metric=reset_metric, unused_thr=args.unused_thr,
+        reset_patience=args.reset_patience, reset_obj=args.reset_obj,
         reset_decr_tol=args.reset_decr_tol, reset_sigma=args.reset_sigma)
   model = model.to(device)
 
@@ -123,7 +125,7 @@ def train_synth_uos_cluster(args):
     args.stop_freq = -1
   tr.train_loop(model, synth_data_loader, device, optimizer, args.out_dir,
       args.epochs, args.chkp_freq, args.stop_freq, scheduler=None,
-      eval_rank=args.eval_rank, reset_unused=(args.reset_mode != 'none'))
+      eval_rank=args.eval_rank, reset_unused=(args.reset_metric != 'none'))
   return
 
 
@@ -184,8 +186,10 @@ if __name__ == '__main__':
                       help='Optimizer [default: SGD]')
   parser.add_argument('--init-lr', type=float, default=0.5,
                       help='Initial learning rate [default: 0.5]')
-  parser.add_argument('--reset-mode', type=str, default='value',
-                      help='Reset mode (value, size, none) [default: value]')
+  parser.add_argument('--reset-metric', type=str, default='value',
+                      help='Reset metric (value, size, none) [default: value]')
+  parser.add_argument('--reset-obj', type=str, default='assign',
+                      help='Reset objective (assign, full) [default: assign]')
   parser.add_argument('--unused-thr', type=float, default=0.01,
                       help=('Threshold for identifying unused clusters, '
                       'relative to 1/k [default: .01]'))
