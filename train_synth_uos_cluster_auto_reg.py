@@ -46,7 +46,6 @@ def set_args(args):
   args.z_lamb = 0.01
 
   # other fixed args
-  args.reset_metric = 'value'
   args.reset_obj = 'full'
   args.eval_rank = True
   return args
@@ -99,6 +98,8 @@ if __name__ == '__main__':
                       help='Optimizer [default: SGD]')
   parser.add_argument('--init-lr', type=float, default=0.5,
                       help='Initial learning rate [default: 0.5]')
+  parser.add_argument('--reset-metric', type=str, default='value',
+                      help='Reset metric (value, size, none) [default: value]')
   parser.add_argument('--unused-thr', type=float, default=0.1,
                       help=('Threshold for identifying unused clusters, '
                       '[default: 0.1]'))
