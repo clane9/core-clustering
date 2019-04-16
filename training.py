@@ -11,6 +11,8 @@ from torch import optim
 import utils as ut
 from models import KSubspaceBatchAltProjModel
 
+EPS = 1e-8
+
 
 def train_loop(model, data_loader, device, optimizer, out_dir=None, epochs=200,
       chkp_freq=50, stop_freq=-1, scheduler=None, eval_rank=False,
@@ -80,6 +82,7 @@ def train_loop(model, data_loader, device, optimizer, out_dir=None, epochs=200,
   # training loop
   err = None
   lr = float('inf')
+  batch_alt_conv_steps = 0
   model.train()
   try:
     for epoch in range(1, epochs+1):
@@ -107,7 +110,12 @@ def train_loop(model, data_loader, device, optimizer, out_dir=None, epochs=200,
       cluster_error, min_obj, max_obj = [metrics_summary[ii]
           for ii in [0, 3, 5]]
       if batch_alt_mode:
-        is_conv = model._updates == 0 or epoch == epochs
+        if model._updates == 0:
+          batch_alt_conv_steps += 1
+        else:
+          batch_alt_conv_steps = 0
+        is_conv = (batch_alt_conv_steps >= 2*model.reset_patience or
+            epoch == epochs)
       else:
         is_conv = lr <= min_lr or epoch == epochs
 
@@ -177,6 +185,9 @@ def train_epoch(model, data_loader, optimizer, device, eval_rank=False,
     batch_obj_mean.backward()
     optimizer.step()
     model.step()  # increment step counter
+
+    # zero out near zero bases to improve numerical performance
+    model.zero()
 
     batch_norm_x_ = model.eval_shrink(x, x_)
     batch_metrics = [batch_obj, batch_loss, batch_reg_in, batch_reg_out,

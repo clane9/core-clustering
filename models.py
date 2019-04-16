@@ -72,6 +72,9 @@ class _KSubspaceBaseModel(nn.Module):
     self.register_buffer('c_mean', torch.ones(self.r, k).div_(k))
     self.register_buffer('value', torch.zeros(self.r, k))
     self.register_buffer('steps', torch.zeros(self.r, k, dtype=torch.int64))
+    self.register_buffer('jitter',
+        torch.randint(-reset_patience//2, reset_patience//2 + 1,
+            (self.r, 1), dtype=torch.int64))
     return
 
   def reset_parameters(self):
@@ -283,7 +286,7 @@ class _KSubspaceBaseModel(nn.Module):
     reset_metric = reset_metric / torch.max(reset_metric,
         dim=1, keepdim=True)[0].clamp(min=EPS)
     reset_mask = reset_metric <= self.unused_thr
-    reset_mask.mul_(self.steps >= self.reset_patience)
+    reset_mask.mul_((self.steps - self.jitter) >= self.reset_patience)
     reset_rids = reset_mask.any(dim=1).nonzero().view(-1)
 
     resets = []
@@ -334,6 +337,9 @@ class _KSubspaceBaseModel(nn.Module):
         resets.append([ridx.item(), cidx.item(),
             reset_metric[ridx, cidx].item(), cand_ridx, cand_cidx,
             int(reset_success), obj_decr, cand_size, cand_value])
+
+      self.jitter[ridx].random_(-self.reset_patience//2,
+          self.reset_patience//2 + 1)
 
     if len(resets) > 0:
       resets = np.array(resets, dtype=object)
@@ -423,6 +429,15 @@ class _KSubspaceBaseModel(nn.Module):
   def step(self):
     """Increment steps since reset counter."""
     self.steps.add_(1)
+    return
+
+  def zero(self):
+    """Zero out near zero bases.
+
+    Numerically near zero values slows matmul performance up to 6x.
+    """
+    Unorms = self.Us.data.pow(2).sum(dim=(2, 3)).sqrt()
+    self.Us.data[(Unorms < EPS*Unorms.max()), :, :] = 0.0
     return
 
 
@@ -621,14 +636,14 @@ class KSubspaceBatchAltProjModel(KSubspaceProjModel):
   assign_reg_terms = {'U_frosqr_in'}
 
   def __init__(self, k, d, dataset, affine=False, replicates=5, reg_params={},
-        reset_metric='value', unused_thr=0.01, reset_obj='assign',
-        reset_decr_tol=1e-4, reset_sigma=0.05, svd_solver='randomized'):
+        reset_metric='value', unused_thr=0.01, reset_patience=2,
+        reset_obj='assign', reset_decr_tol=1e-4, reset_sigma=0.05,
+        svd_solver='randomized'):
     if svd_solver not in ('randomized', 'svds', 'svd'):
       raise ValueError("Invalid svd solver {}".format(svd_solver))
 
     # X assumed to be N x D.
     D = dataset.X.shape[1]
-    reset_patience = 2
     super(KSubspaceBatchAltProjModel, self).__init__(k, d, D, affine,
         replicates, reg_params, reset_metric, unused_thr, reset_patience,
         reset_obj, reset_decr_tol, reset_sigma)

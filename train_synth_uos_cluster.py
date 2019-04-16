@@ -7,7 +7,7 @@ from __future__ import print_function
 import argparse
 import os
 import shutil
-import pickle
+import json
 
 import numpy as np
 import torch
@@ -28,17 +28,12 @@ def train_synth_uos_cluster(args):
   if os.path.exists(args.out_dir):
     shutil.rmtree(args.out_dir)
   os.mkdir(args.out_dir)
-  # save args
-  with open('{}/args.pkl'.format(args.out_dir), 'wb') as f:
-    pickle.dump(args, f)
 
   # construct dataset
   torch.manual_seed(args.data_seed)
-  if args.N is None:
-    args.N = args.n * args.Ng
-  if args.Ng is None:
-    args.Ng = args.N // args.n
   if args.online:
+    if args.N is None:
+      args.N = args.n * args.Ng
     if batch_alt_mode:
       raise ValueError(("Online mode not compatible with "
           "batch_alt formulation."))
@@ -46,6 +41,9 @@ def train_synth_uos_cluster(args):
         args.N, args.affine, args.sigma, args.data_seed)
     shuffle_data = False
   else:
+    if args.Ng is None:
+      args.Ng = args.N // args.n
+      args.N = args.Ng * args.n
     synth_dataset = dat.SynthUoSDataset(args.n, args.d, args.D, args.Ng,
         args.affine, args.sigma, args.data_seed)
     shuffle_data = True
@@ -67,7 +65,8 @@ def train_synth_uos_cluster(args):
   args.reset_metric = args.reset_metric.lower()
   reset_metric = 'value' if args.reset_metric == 'none' else args.reset_metric
   if args.reset_patience is None or args.reset_patience < 0:
-    args.reset_patience = int(np.ceil(len(synth_dataset) / args.batch_size))
+    args.reset_patience = (2 if args.form == 'batch_alt'
+        else int(np.ceil(len(synth_dataset) / args.batch_size)))
   if args.form == 'batch_alt':
     reg_params = {
         'U_frosqr_in': args.U_frosqr_in_lamb,
@@ -77,12 +76,13 @@ def train_synth_uos_cluster(args):
     model = mod.KSubspaceBatchAltProjModel(args.model_n, args.model_d,
         synth_dataset, args.affine, args.reps, reg_params=reg_params,
         reset_metric=reset_metric, unused_thr=args.unused_thr,
-        reset_obj=args.reset_obj, reset_decr_tol=args.reset_decr_tol,
-        reset_sigma=args.reset_sigma, svd_solver='randomized')
+        reset_patience=args.reset_patience, reset_obj=args.reset_obj,
+        reset_decr_tol=args.reset_decr_tol, reset_sigma=args.reset_sigma,
+        svd_solver='randomized')
   elif args.form == 'mf':
     reg_params = {
-        'U_frosqr_in': args.U_frosqr_in_lamb,
-        'U_frosqr_out': args.U_frosqr_out_lamb,
+        'U_frosqr_in': args.U_frosqr_in_lamb / args.z_lamb,
+        'U_frosqr_out': args.U_frosqr_out_lamb / args.z_lamb,
         'U_fro_out': args.U_fro_out_lamb,
         'U_gram_fro_out': args.U_gram_fro_out_lamb,
         'z': args.z_lamb
@@ -123,6 +123,11 @@ def train_synth_uos_cluster(args):
     args.chkp_freq = args.epochs
   if args.stop_freq is None or args.stop_freq <= 0:
     args.stop_freq = -1
+
+  # save args
+  with open('{}/args.json'.format(args.out_dir), 'w') as f:
+    json.dump(args.__dict__, f, sort_keys=True, indent=4)
+
   tr.train_loop(model, synth_data_loader, device, optimizer, args.out_dir,
       args.epochs, args.chkp_freq, args.stop_freq, scheduler=None,
       eval_rank=args.eval_rank, reset_unused=(args.reset_metric != 'none'))
