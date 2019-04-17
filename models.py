@@ -804,10 +804,11 @@ class KSubspaceBatchAltMFModel(KSubspaceBatchAltBaseModel, KSubspaceMFModel):
               affine=self.affine, solver=self.svd_solver)
 
           # re-scale U
-          alpha = (np.sqrt(self.reg_params['z']) /
-              np.sqrt(Nj*self.reg_params['U_frosqr_in'] +
-              self.N*self.reg_params['U_frosqr_out'])) ** 0.5
-          U.mul_(alpha)
+          if lamb > 0:
+            alpha = (np.sqrt(self.reg_params['z']) /
+                np.sqrt(Nj*self.reg_params['U_frosqr_in'] +
+                self.N*self.reg_params['U_frosqr_out'])) ** 0.5
+            U.mul_(alpha)
 
           self.Us.data[ii, jj, :] = U
           if self.affine:
