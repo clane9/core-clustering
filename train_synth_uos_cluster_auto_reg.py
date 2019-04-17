@@ -76,8 +76,8 @@ if __name__ == '__main__':
                       help='Online data generation')
   # model settings
   parser.add_argument('--form', type=str, default='proj',
-                      help=('Model formulation (proj, mf, batch_alt) '
-                      '[default: proj]'))
+                      help=('Model formulation (proj, mf, batch-alt-proj, '
+                      'batch-alt-mf) [default: proj]'))
   parser.add_argument('--reps', type=int, default=5,
                       help='Number of model replicates [default: 5]')
   parser.add_argument('--model-n', type=int, default=None,

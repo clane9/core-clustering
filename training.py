@@ -9,7 +9,7 @@ import torch
 from torch import optim
 
 import utils as ut
-from models import KSubspaceBatchAltProjModel
+from models import KSubspaceBatchAltBaseModel
 
 EPS = 1e-8
 
@@ -63,7 +63,7 @@ def train_loop(model, data_loader, device, optimizer, out_dir=None, epochs=200,
   else:
     val_logf = None
 
-  batch_alt_mode = isinstance(model, KSubspaceBatchAltProjModel)
+  batch_alt_mode = isinstance(model, KSubspaceBatchAltBaseModel)
 
   # dim 1: err, obj, loss, reg.in, reg.out, |x_|
   metrics = np.zeros((epochs, 6, model.r), dtype=np.float32)
@@ -75,7 +75,7 @@ def train_loop(model, data_loader, device, optimizer, out_dir=None, epochs=200,
   resets = [] if reset_unused else None
 
   if not batch_alt_mode and scheduler is None:
-    min_lr = 1e-6*ut.get_learning_rate(optimizer)
+    min_lr = 1e-5*ut.get_learning_rate(optimizer)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer,
         factor=0.5, patience=5, threshold=1e-3, min_lr=min_lr)
 

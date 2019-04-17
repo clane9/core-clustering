@@ -11,7 +11,7 @@ EPS = 1e-8
 EMA_DECAY = 0.9
 
 
-class _KSubspaceBaseModel(nn.Module):
+class KSubspaceBaseModel(nn.Module):
   """Base K-subspace class."""
   default_reg_params = dict()
   assign_reg_terms = set()
@@ -43,7 +43,7 @@ class _KSubspaceBaseModel(nn.Module):
       raise ValueError("Invalid reset_sigma parameter {}".format(
           reset_sigma))
 
-    super(_KSubspaceBaseModel, self).__init__()
+    super().__init__()
     self.k = k  # number of groups
     self.d = d  # dimension of manifold
     self.D = D  # number of data points
@@ -77,11 +77,6 @@ class _KSubspaceBaseModel(nn.Module):
             (self.r, 1), dtype=torch.int64))
     return
 
-  def reset_parameters(self):
-    """Reset model parameters."""
-    raise NotImplementedError("reset_parameters not implemented")
-    return
-
   def forward(self, x):
     """Compute representation of x wrt each subspace.
 
@@ -95,18 +90,6 @@ class _KSubspaceBaseModel(nn.Module):
     self.z = z.data
     x_ = self.decode(z)
     return x_
-
-  def encode(self, x):
-    """Compute subspace coefficients for x.
-
-    Input:
-      x: data, shape (batch_size, D)
-
-    Returns:
-      z: latent low-dimensional codes, shape (r, k, batch_size, d)
-    """
-    raise NotImplementedError("encode not implemented")
-    return
 
   def decode(self, z):
     """Embed low-dim code z into ambient space.
@@ -184,11 +167,6 @@ class _KSubspaceBaseModel(nn.Module):
     """
     loss = torch.sum((x - x_)**2, dim=3).mul(0.5).permute(2, 0, 1)
     return loss
-
-  def reg(self):
-    """Evaluate subspace regularization."""
-    raise NotImplementedError("reg not implemented")
-    return
 
   def set_assign(self, assign_obj):
     """Compute cluster assignment.
@@ -441,7 +419,7 @@ class _KSubspaceBaseModel(nn.Module):
     return
 
 
-class KSubspaceModel(_KSubspaceBaseModel):
+class KSubspaceMFModel(KSubspaceBaseModel):
   """K-subspace model where low-dim coefficients are computed in closed
   form."""
   default_reg_params = {
@@ -456,9 +434,8 @@ class KSubspaceModel(_KSubspaceBaseModel):
   def __init__(self, k, d, D, affine=False, replicates=5, reg_params={},
         reset_metric='value', unused_thr=0.01, reset_patience=100,
         reset_obj='assign', reset_decr_tol=1e-4, reset_sigma=0.05):
-    super(KSubspaceModel, self).__init__(k, d, D, affine, replicates,
-        reg_params, reset_metric, unused_thr, reset_patience, reset_obj,
-        reset_decr_tol, reset_sigma)
+    super().__init__(k, d, D, affine, replicates, reg_params, reset_metric,
+        unused_thr, reset_patience, reset_obj, reset_decr_tol, reset_sigma)
     self.reset_parameters()
     return
 
@@ -547,7 +524,7 @@ class KSubspaceModel(_KSubspaceBaseModel):
     return regs
 
 
-class KSubspaceProjModel(_KSubspaceBaseModel):
+class KSubspaceProjModel(KSubspaceBaseModel):
   """K-subspace model where low-dim coefficients are computed by a projection
   matrix."""
   default_reg_params = {
@@ -561,9 +538,8 @@ class KSubspaceProjModel(_KSubspaceBaseModel):
   def __init__(self, k, d, D, affine=False, replicates=5, reg_params={},
         reset_metric='value', unused_thr=0.01, reset_patience=100,
         reset_obj='assign', reset_decr_tol=1e-4, reset_sigma=0.05):
-    super(KSubspaceProjModel, self).__init__(k, d, D, affine, replicates,
-        reg_params, reset_metric, unused_thr, reset_patience, reset_obj,
-        reset_decr_tol, reset_sigma)
+    super().__init__(k, d, D, affine, replicates, reg_params, reset_metric,
+        unused_thr, reset_patience, reset_obj, reset_decr_tol, reset_sigma)
     self.reset_parameters()
     return
 
@@ -627,13 +603,9 @@ class KSubspaceProjModel(_KSubspaceBaseModel):
     return regs
 
 
-class KSubspaceBatchAltProjModel(KSubspaceProjModel):
-  default_reg_params = {
-      'U_frosqr_in': 0.01,
-      'U_frosqr_out': 1e-4,
-      'U_gram_fro_out': 0.0
-  }
-  assign_reg_terms = {'U_frosqr_in'}
+class KSubspaceBatchAltBaseModel(KSubspaceBaseModel):
+  default_reg_params = dict()
+  assign_reg_terms = dict()
 
   def __init__(self, k, d, dataset, affine=False, replicates=5, reg_params={},
         reset_metric='value', unused_thr=0.01, reset_patience=2,
@@ -644,9 +616,8 @@ class KSubspaceBatchAltProjModel(KSubspaceProjModel):
 
     # X assumed to be N x D.
     D = dataset.X.shape[1]
-    super(KSubspaceBatchAltProjModel, self).__init__(k, d, D, affine,
-        replicates, reg_params, reset_metric, unused_thr, reset_patience,
-        reset_obj, reset_decr_tol, reset_sigma)
+    super().__init__(k, d, D, affine, replicates, reg_params, reset_metric,
+        unused_thr, reset_patience, reset_obj, reset_decr_tol, reset_sigma)
 
     self.dataset = dataset
     self.register_buffer('X', dataset.X)
@@ -669,7 +640,7 @@ class KSubspaceBatchAltProjModel(KSubspaceProjModel):
       obj, loss, reg_in, reg_out: metrics per replicate, shape (r,)
       x_: reconstruction, shape (r, k, batch_size, D)
     """
-    return super(KSubspaceBatchAltProjModel, self).objective(self.X)
+    return super().objective(self.X)
 
   def set_assign(self, assign_obj):
     """Compute cluster assignment.
@@ -692,29 +663,6 @@ class KSubspaceBatchAltProjModel(KSubspaceProjModel):
     self.groups = self.groups.cpu()
     return
 
-  def reg(self):
-    """Evaluate subspace regularization."""
-    regs = dict()
-    # U regularization, each is shape (r, k)
-    if max([self.reg_params[key] for key in
-          ('U_frosqr_in', 'U_frosqr_out')]) > 0:
-      U_frosqr = torch.sum(self.Us.pow(2), dim=(2, 3))
-
-      if self.reg_params['U_frosqr_in'] > 0:
-        regs['U_frosqr_in'] = U_frosqr.mul(
-            self.reg_params['U_frosqr_in'])
-
-      if self.reg_params['U_frosqr_out'] > 0:
-        regs['U_frosqr_out'] = U_frosqr.mul(
-            self.reg_params['U_frosqr_out'])
-
-    if self.reg_params['U_gram_fro_out'] > 0:
-      UtUs = torch.matmul(self.Us.transpose(2, 3), self.Us)
-      UtUs_fro = torch.sum(UtUs.pow(2), dim=(2, 3)).sqrt()
-      regs['U_gram_fro_out'] = UtUs_fro.mul(
-          self.reg_params['U_gram_fro_out'])
-    return regs
-
   def eval_shrink(self, x_):
     """measure shrinkage of reconstruction wrt data.
 
@@ -724,7 +672,31 @@ class KSubspaceBatchAltProjModel(KSubspaceProjModel):
     Returns:
       norm_x_: average norm of x_ relative to x, shape (r,)
     """
-    return super(KSubspaceBatchAltProjModel, self).eval_shrink(self.X, x_)
+    return super().eval_shrink(self.X, x_)
+
+
+class KSubspaceBatchAltProjModel(KSubspaceBatchAltBaseModel,
+      KSubspaceProjModel):
+  default_reg_params = {
+      'U_frosqr_in': 0.01,
+      'U_frosqr_out': 1e-4,
+      'U_fro_out': 0.0,
+      'U_gram_fro_out': 0.0
+  }
+  assign_reg_terms = {'U_frosqr_in'}
+
+  def __init__(self, k, d, dataset, affine=False, replicates=5, reg_params={},
+        reset_metric='value', unused_thr=0.01, reset_patience=2,
+        reset_obj='assign', reset_decr_tol=1e-4, reset_sigma=0.05,
+        svd_solver='randomized'):
+
+    super().__init__(k, d, dataset, affine, replicates, reg_params,
+        reset_metric, unused_thr, reset_patience, reset_obj, reset_decr_tol,
+        reset_sigma)
+    # must be zero, not supported
+    self.reg_params['U_fro_out'] = 0.0
+    self.reset_parameters()
+    return
 
   def step(self):
     """Update subspace bases by regularized pca (and increment step count)."""
@@ -737,8 +709,105 @@ class KSubspaceBatchAltProjModel(KSubspaceProjModel):
           Nj = Xj.shape[0]
           lamb = (Nj*self.reg_params['U_frosqr_in'] +
               self.N*self.reg_params['U_frosqr_out'])
-          U, b = ut.reg_pca(Xj, self.d, lamb, gamma,
+          U, b = ut.reg_pca(Xj, self.d, form='proj', lamb=lamb, gamma=gamma,
               affine=self.affine, solver=self.svd_solver)
+
+          self.Us.data[ii, jj, :] = U
+          if self.affine:
+            self.bs.data[ii, jj, :] = b
+    self.steps.add_(1)
+    return
+
+
+class KSubspaceBatchAltMFModel(KSubspaceBatchAltBaseModel, KSubspaceMFModel):
+  default_reg_params = {
+      'U_frosqr_in': 0.01,
+      'U_frosqr_out': 1e-4,
+      'U_fro_out': 0.0,
+      'U_gram_fro_out': 0.0,
+      'z': 0.01
+  }
+  assign_reg_terms = {'U_frosqr_in', 'z'}
+
+  def __init__(self, k, d, dataset, affine=False, replicates=5, reg_params={},
+        reset_metric='value', unused_thr=0.01, reset_patience=2,
+        reset_obj='assign', reset_decr_tol=1e-4, reset_sigma=0.05,
+        svd_solver='randomized'):
+
+    super().__init__(k, d, dataset, affine, replicates, reg_params,
+        reset_metric, unused_thr, reset_patience, reset_obj, reset_decr_tol,
+        reset_sigma)
+    # must be zero, not supported
+    self.reg_params['U_fro_out'] = 0.0
+    self.reg_params['U_gram_fro_out'] = 0.0
+    self.reset_parameters()
+    return
+
+  def reset_parameters(self):
+    """Initialize Us, bs with entries drawn from normal with std
+    0.1/sqrt(D)."""
+    std = .1 / np.sqrt(self.D)
+    self.Us.data.normal_(0., std)
+    if self.affine:
+      self.bs.data.normal_(0., std)
+    for ii in range(self.r):
+      for jj in range(self.k):
+        P, S, _ = torch.svd(self.Us.data[ii, jj, :])
+        self.Us.data[ii, jj, :] = P.mul_(S)
+    return
+
+  def encode(self, x):
+    """Compute subspace coefficients for x in closed form, by computing
+    batched solution to normal equations. Use fact that colums of U are
+    orthogonal.
+
+      min_z 1/2 || x - (Uz + b) ||_2^2 + \lambda/2 ||z||_2^2
+      (U^T U + \lambda I) z* = U^T (x - b)
+
+    Input:
+      x: shape (batch_size, D)
+
+    Returns:
+      z: latent low-dimensional codes (r, k, batch_size, d)
+    """
+    assert(x.dim() == 2 and x.size(1) == self.D)
+    batch_size = x.size(0)
+
+    if self.affine:
+      # (r, k, batch_size, D)
+      x = x.sub(self.bs.unsqueeze(2))
+    else:
+      x = x.view(1, 1, batch_size, self.D)
+
+    # (r, k, batch_size, d)
+    b = torch.matmul(x, self.Us.data)
+
+    # (r, k, 1, d)
+    S = torch.norm(self.Us.data, dim=2, keepdim=True)
+    lambeye = torch.ones_like(S).mul_(self.reg_params['z'])
+
+    # (r, k, batch_size, d)
+    z = b.div_(S.pow_(2).add_(lambeye))
+    return z
+
+  def step(self):
+    """Update subspace bases by regularized pca (and increment step count)."""
+    for ii in range(self.r):
+      for jj in range(self.k):
+        if self.c_mean[ii, jj] > 0:
+          Xj = self.X[self.c[:, ii, jj] == 1, :]
+          Nj = Xj.shape[0]
+          lamb = np.sqrt((Nj*self.reg_params['U_frosqr_in'] +
+              self.N*self.reg_params['U_frosqr_out']) *
+              self.reg_params['z'])
+          U, b = ut.reg_pca(Xj, self.d, form='mf', lamb=lamb, gamma=0.0,
+              affine=self.affine, solver=self.svd_solver)
+
+          # re-scale U
+          alpha = (np.sqrt(self.reg_params['z']) /
+              np.sqrt(Nj*self.reg_params['U_frosqr_in'] +
+              self.N*self.reg_params['U_frosqr_out'])) ** 0.5
+          U.mul_(alpha)
 
           self.Us.data[ii, jj, :] = U
           if self.affine:

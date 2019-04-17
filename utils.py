@@ -204,14 +204,23 @@ def unit_normalize(X, p=2, dim=None):
   return unitX
 
 
-def reg_pca(X, d, lamb=0.0, gamma=0.0, affine=False, solver='randomized'):
-  """Solve the regularized PCA problem
+def reg_pca(X, d, form='proj', lamb=0.0, gamma=0.0, affine=False,
+      solver='randomized'):
+  """Solve one of the regularized PCA problems
+
+  (proj):
 
   min_U  1/2 || (X - 1 b^T) -  (X - 1 b^T) U U^T ||_F^2
       + lambda || U ||_F^2 + gamma || U U^T ||_F
 
+  (mf):
+
+  min_{U,V}  1/2 || (X - 1 b^T) -  U V^T ||_F^2
+      + lambda/2 (|| U ||_F^2 + || V ||_F^2)
+
   Args:
     X: dataset (N, D).
+    form: either 'proj' or 'mf' (default: 'proj')
     lamb, gamma: regularization parameters (default: 0.0).
     affine: Use affine PCA model with bias b.
     solver: SVD solver ('randomized', 'svds', 'svd').
@@ -221,6 +230,9 @@ def reg_pca(X, d, lamb=0.0, gamma=0.0, affine=False, solver='randomized'):
       column norm shrinkage if lamb, gamma > 0 (D, d).
     b: subspace bias (d,).
   """
+  if form not in {'proj', 'mf'}:
+    raise ValueError("Invalid form {}".format(form))
+
   if not torch.is_tensor(X):
     X = torch.from_numpy(X)
   device = X.device
@@ -254,28 +266,31 @@ def reg_pca(X, d, lamb=0.0, gamma=0.0, affine=False, solver='randomized'):
     nz_mask = s >= max(s[0], 1)*EPS
     s_nz = s[nz_mask]
 
-    s_sqr = s_nz.pow(2)
-    s_sqr_shrk = F.relu(s_sqr - lamb)
-    if gamma == 0:
-      z = s_sqr_shrk.div(s_sqr)
+    if form == 'mf':
+      z = F.relu(s_nz - lamb).sqrt()
     else:
-      if torch.norm(s_sqr_shrk) <= gamma + EPS:
-        z = torch.zeros_like(s_nz)
+      s_sqr = s_nz.pow(2)
+      s_sqr_shrk = F.relu(s_sqr - lamb)
+      if gamma == 0:
+        z = s_sqr_shrk.div(s_sqr)
       else:
-        # find ||z||_2 by bisection
-        def norm_test(beta):
+        if torch.norm(s_sqr_shrk) <= gamma + EPS:
+          z = torch.zeros_like(s_nz)
+        else:
+          # find ||z||_2 by bisection
+          def norm_test(beta):
+            z = s_sqr_shrk.div(s_sqr + gamma/beta)
+            return torch.norm(z) - beta
+
+          a, b = 1e-4, np.sqrt(s.shape[0])
+          while norm_test(a) < 0:
+            a /= 10
+            if a <= 1e-16:
+              raise RuntimeError("Bisection zero-finding failed.")
+
+          beta = bisect(norm_test, a, b, xtol=EPS, rtol=EPS)
           z = s_sqr_shrk.div(s_sqr + gamma/beta)
-          return torch.norm(z) - beta
-
-        a, b = 1e-4, np.sqrt(s.shape[0])
-        while norm_test(a) < 0:
-          a /= 10
-          if a <= 1e-16:
-            raise RuntimeError("Bisection zero-finding failed.")
-
-        beta = bisect(norm_test, a, b, xtol=EPS, rtol=EPS)
-        z = s_sqr_shrk.div(s_sqr + gamma/beta)
-    z = z.sqrt()
+      z = z.sqrt()
     U[:, nz_mask] *= z
     U[:, nz_mask == 0] = 0.0
   return U, b

@@ -22,7 +22,7 @@ def train_synth_uos_cluster(args):
   use_cuda = args.cuda and torch.cuda.is_available()
   device = torch.device('cuda' if use_cuda else 'cpu')
   torch.set_num_threads(args.num_threads)
-  batch_alt_mode = args.form == 'batch_alt'
+  batch_alt_mode = args.form in {'batch-alt-proj', 'batch-alt-mf'}
 
   # create output directory, deleting any existing results.
   if os.path.exists(args.out_dir):
@@ -65,15 +65,27 @@ def train_synth_uos_cluster(args):
   args.reset_metric = args.reset_metric.lower()
   reset_metric = 'value' if args.reset_metric == 'none' else args.reset_metric
   if args.reset_patience is None or args.reset_patience < 0:
-    args.reset_patience = (2 if args.form == 'batch_alt'
-        else int(np.ceil(len(synth_dataset) / args.batch_size)))
-  if args.form == 'batch_alt':
+    args.reset_patience = (2 if batch_alt_mode else
+        int(np.ceil(len(synth_dataset) / args.batch_size)))
+  if args.form == 'batch-alt-proj':
     reg_params = {
         'U_frosqr_in': args.U_frosqr_in_lamb,
         'U_frosqr_out': args.U_frosqr_out_lamb,
         'U_gram_fro_out': args.U_gram_fro_out_lamb
     }
     model = mod.KSubspaceBatchAltProjModel(args.model_n, args.model_d,
+        synth_dataset, args.affine, args.reps, reg_params=reg_params,
+        reset_metric=reset_metric, unused_thr=args.unused_thr,
+        reset_patience=args.reset_patience, reset_obj=args.reset_obj,
+        reset_decr_tol=args.reset_decr_tol, reset_sigma=args.reset_sigma,
+        svd_solver='randomized')
+  elif args.form == 'batch-alt-mf':
+    reg_params = {
+        'U_frosqr_in': args.U_frosqr_in_lamb / args.z_lamb,
+        'U_frosqr_out': args.U_frosqr_out_lamb / args.z_lamb,
+        'z': args.z_lamb
+    }
+    model = mod.KSubspaceBatchAltMFModel(args.model_n, args.model_d,
         synth_dataset, args.affine, args.reps, reg_params=reg_params,
         reset_metric=reset_metric, unused_thr=args.unused_thr,
         reset_patience=args.reset_patience, reset_obj=args.reset_obj,
@@ -87,11 +99,11 @@ def train_synth_uos_cluster(args):
         'U_gram_fro_out': args.U_gram_fro_out_lamb,
         'z': args.z_lamb
     }
-    model = mod.KSubspaceModel(args.model_n, args.model_d, args.D, args.affine,
-        args.reps, reg_params=reg_params, reset_metric=reset_metric,
-        unused_thr=args.unused_thr, reset_patience=args.reset_patience,
-        reset_obj=args.reset_obj, reset_decr_tol=args.reset_decr_tol,
-        reset_sigma=args.reset_sigma)
+    model = mod.KSubspaceMFModel(args.model_n, args.model_d, args.D,
+        args.affine, args.reps, reg_params=reg_params,
+        reset_metric=reset_metric, unused_thr=args.unused_thr,
+        reset_patience=args.reset_patience, reset_obj=args.reset_obj,
+        reset_decr_tol=args.reset_decr_tol, reset_sigma=args.reset_sigma)
   else:
     reg_params = {
         'U_frosqr_in': args.U_frosqr_in_lamb,
@@ -159,8 +171,8 @@ if __name__ == '__main__':
                       help='Online data generation')
   # model settings
   parser.add_argument('--form', type=str, default='proj',
-                      help=('Model formulation (proj, mf, batch_alt) '
-                      '[default: proj]'))
+                      help=('Model formulation (proj, mf, batch-alt-proj, '
+                      'batch-alt-mf) [default: proj]'))
   parser.add_argument('--reps', type=int, default=5,
                       help='Number of model replicates [default: 5]')
   parser.add_argument('--model-n', type=int, default=None,
