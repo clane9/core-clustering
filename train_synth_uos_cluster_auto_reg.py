@@ -24,21 +24,18 @@ def set_args(args):
     args.N = args.n * args.Ng
   else:
     args.Ng = args.N // args.n
-    args.N = args.n * args.Ng
-  if args.online:
-    args.N *= args.epochs
-    args.Ng *= args.epochs
 
   if args.sigma_hat is None or args.sigma_hat < 0:
     args.sigma_hat = args.sigma
   if args.min_size is None or args.min_size < 0:
-    args.min_size = 0.01 / args.n
+    args.min_size = 0.01
   if args.min_size >= 1:
-    raise ValueError("min size {} must be < 1.".format(args.min_size))
+    raise ValueError("min size {} should be < 1.".format(args.min_size))
 
-  args.U_frosqr_in_lamb = ((1.0 + np.sqrt((args.D - args.d)/args.Ng))**2 *
+  Ng_total = min(10, args.epochs)*args.Ng if args.online else args.Ng
+  args.U_frosqr_in_lamb = ((1.0 + np.sqrt((args.D - args.d)/Ng_total))**2 *
       (args.sigma_hat**2 / args.D))
-  args.U_frosqr_out_lamb = (args.min_size *
+  args.U_frosqr_out_lamb = ((args.min_size / args.n) *
       (1.0 / args.d + args.sigma_hat**2 / args.D))
 
   args.U_fro_out_lamb = 0.0
@@ -87,8 +84,8 @@ if __name__ == '__main__':
   parser.add_argument('--sigma-hat', type=float, default=None,
                       help='Noise estimate [default: sigma]')
   parser.add_argument('--min-size', type=float, default=None,
-                      help=('Minimum cluster size as fraction '
-                      '[default: 0.01/n]'))
+                      help=('Minimum cluster size as fraction relative to 1/n'
+                      '[default: 0.01]'))
   # training settings
   parser.add_argument('--batch-size', type=int, default=100,
                       help='Input batch size for training [default: 100]')
