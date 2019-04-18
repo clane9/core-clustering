@@ -105,6 +105,8 @@ if __name__ == '__main__':
                       '[default: 0.1]'))
   parser.add_argument('--reset-patience', type=int, default=None,
                       help='Steps to wait between resets [default: 1 epoch]')
+  parser.add_argument('--reset-warmup', type=int, default=0,
+                      help='Extra steps to wait at start [default: 0]')
   parser.add_argument('--reset-decr-tol', type=float, default=1e-4,
                       help=('Relative objective decrease tolerance to reset '
                       '[default: 1e-4]'))

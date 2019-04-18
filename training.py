@@ -75,14 +75,13 @@ def train_loop(model, data_loader, device, optimizer, out_dir=None, epochs=200,
   resets = [] if reset_unused else None
 
   if not batch_alt_mode and scheduler is None:
-    min_lr = 1e-5*ut.get_learning_rate(optimizer)
+    min_lr = 0.5**5 * ut.get_learning_rate(optimizer)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer,
         factor=0.5, patience=5, threshold=1e-3, min_lr=min_lr)
 
   # training loop
   err = None
   lr = float('inf')
-  batch_alt_conv_steps = 0
   model.train()
   try:
     for epoch in range(1, epochs+1):
@@ -109,15 +108,11 @@ def train_loop(model, data_loader, device, optimizer, out_dir=None, epochs=200,
 
       cluster_error, min_obj, max_obj = [metrics_summary[ii]
           for ii in [0, 3, 5]]
-      if batch_alt_mode:
-        if model._updates == 0:
-          batch_alt_conv_steps += 1
-        else:
-          batch_alt_conv_steps = 0
-        is_conv = (batch_alt_conv_steps >= 2*model.reset_patience or
-            epoch == epochs)
-      else:
-        is_conv = lr <= min_lr or epoch == epochs
+
+      last_reset_success = model.last_reset_success.max().item()
+      is_conv = (((model._updates == 0 if batch_alt_mode else lr <= min_lr) and
+          last_reset_success + model.reset_patience < model.steps) or
+          epoch == epochs)
 
       save_chkp = (out_dir is not None and (epoch % chkp_freq == 0 or is_conv))
       if save_chkp:

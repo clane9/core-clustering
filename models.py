@@ -18,7 +18,8 @@ class KSubspaceBaseModel(nn.Module):
 
   def __init__(self, k, d, D, affine=False, replicates=5, reg_params={},
         reset_metric='value', unused_thr=0.01, reset_patience=100,
-        reset_obj='assign', reset_decr_tol=1e-4, reset_sigma=0.05):
+        reset_warmup=500, reset_obj='assign', reset_decr_tol=1e-4,
+        reset_sigma=0.05):
     if replicates < 1:
       raise ValueError("Invalid replicates parameter {}".format(replicates))
     for key in self.default_reg_params:
@@ -37,6 +38,9 @@ class KSubspaceBaseModel(nn.Module):
     if reset_patience < 0:
       raise ValueError("Invalid reset_patience parameter {}".format(
           reset_patience))
+    if reset_warmup < 0:
+      raise ValueError("Invalid reset_warmup parameter {}".format(
+          reset_warmup))
     if reset_obj not in {'assign', 'full'}:
       raise ValueError("Invalid reset_obj parameter {}".format(reset_obj))
     if reset_sigma < 0:
@@ -53,6 +57,7 @@ class KSubspaceBaseModel(nn.Module):
     self.reset_metric = reset_metric
     self.unused_thr = unused_thr
     self.reset_patience = reset_patience
+    self.reset_warmup = reset_warmup
     self.reset_obj = reset_obj
     self.reset_decr_tol = (float('-inf') if reset_decr_tol is None
         else reset_decr_tol)
@@ -71,10 +76,14 @@ class KSubspaceBaseModel(nn.Module):
       self.register_parameter('bs', None)
     self.register_buffer('c_mean', torch.ones(self.r, k).div_(k))
     self.register_buffer('value', torch.zeros(self.r, k))
-    self.register_buffer('steps', torch.zeros(self.r, k, dtype=torch.int64))
+    self.steps = 0
+    self.register_buffer('last_reset',
+        torch.zeros((self.r,), dtype=torch.int64))
+    self.register_buffer('last_reset_success',
+        torch.zeros((self.r, k), dtype=torch.int64))
     self.register_buffer('jitter',
         torch.randint(-reset_patience//2, reset_patience//2 + 1,
-            (self.r, 1), dtype=torch.int64))
+            (self.r,), dtype=torch.int64).add_(reset_warmup))
     return
 
   def forward(self, x):
@@ -263,8 +272,9 @@ class KSubspaceBaseModel(nn.Module):
     # clamp to avoid unlikely case where max value is not positive.
     reset_metric = reset_metric / torch.max(reset_metric,
         dim=1, keepdim=True)[0].clamp(min=EPS)
-    reset_mask = reset_metric <= self.unused_thr
-    reset_mask.mul_((self.steps - self.jitter) >= self.reset_patience)
+    reset_mask = (self.last_reset + self.jitter +
+        self.reset_patience <= self.steps).view(-1, 1)
+    reset_mask = reset_mask * (reset_metric <= self.unused_thr)
     reset_rids = reset_mask.any(dim=1).nonzero().view(-1)
 
     resets = []
@@ -303,19 +313,16 @@ class KSubspaceBaseModel(nn.Module):
           self._batch_reg_out[ridx, cidx] = self._batch_reg_out[
               cand_ridx, cand_cidx]
 
-          # reset size, value, steps
+          # reset size, value, success step
           self._batch_c_mean[ridx, :] = self.c_mean[ridx, :] = cand_c_mean
           self._batch_value[ridx, :] = self.value[ridx, :] = cand_c_value
-          self.steps[ridx, cidx] = 0
-        else:
-          # after failing to add a new basis, don't want to reset in this
-          # replicate for a while
-          self.steps[ridx, :] = 0
+          self.last_reset_success[ridx, cidx] = self.steps
 
         resets.append([ridx.item(), cidx.item(),
             reset_metric[ridx, cidx].item(), cand_ridx, cand_cidx,
             int(reset_success), obj_decr, cand_size, cand_value])
 
+      self.last_reset[ridx] = self.steps
       self.jitter[ridx].random_(-self.reset_patience//2,
           self.reset_patience//2 + 1)
 
@@ -406,7 +413,7 @@ class KSubspaceBaseModel(nn.Module):
 
   def step(self):
     """Increment steps since reset counter."""
-    self.steps.add_(1)
+    self.steps += 1
     return
 
   def zero(self):
@@ -433,9 +440,11 @@ class KSubspaceMFModel(KSubspaceBaseModel):
 
   def __init__(self, k, d, D, affine=False, replicates=5, reg_params={},
         reset_metric='value', unused_thr=0.01, reset_patience=100,
-        reset_obj='assign', reset_decr_tol=1e-4, reset_sigma=0.05):
+        reset_warmup=500, reset_obj='assign', reset_decr_tol=1e-4,
+        reset_sigma=0.05):
     super().__init__(k, d, D, affine, replicates, reg_params, reset_metric,
-        unused_thr, reset_patience, reset_obj, reset_decr_tol, reset_sigma)
+        unused_thr, reset_patience, reset_warmup, reset_obj, reset_decr_tol,
+        reset_sigma)
     self.reset_parameters()
     return
 
@@ -537,9 +546,11 @@ class KSubspaceProjModel(KSubspaceBaseModel):
 
   def __init__(self, k, d, D, affine=False, replicates=5, reg_params={},
         reset_metric='value', unused_thr=0.01, reset_patience=100,
-        reset_obj='assign', reset_decr_tol=1e-4, reset_sigma=0.05):
+        reset_warmup=500, reset_obj='assign', reset_decr_tol=1e-4,
+        reset_sigma=0.05):
     super().__init__(k, d, D, affine, replicates, reg_params, reset_metric,
-        unused_thr, reset_patience, reset_obj, reset_decr_tol, reset_sigma)
+        unused_thr, reset_patience, reset_warmup, reset_obj, reset_decr_tol,
+        reset_sigma)
     self.reset_parameters()
     return
 
@@ -609,7 +620,8 @@ class KSubspaceBatchAltBaseModel(KSubspaceBaseModel):
 
   def __init__(self, k, d, dataset, affine=False, replicates=5, reg_params={},
         reset_metric='value', unused_thr=0.01, reset_patience=2,
-        reset_obj='assign', reset_decr_tol=1e-4, reset_sigma=0.05,
+        reset_warmup=10, reset_obj='assign', reset_decr_tol=1e-4,
+        reset_sigma=0.05,
         svd_solver='randomized'):
     if svd_solver not in ('randomized', 'svds', 'svd'):
       raise ValueError("Invalid svd solver {}".format(svd_solver))
@@ -617,7 +629,8 @@ class KSubspaceBatchAltBaseModel(KSubspaceBaseModel):
     # X assumed to be N x D.
     D = dataset.X.shape[1]
     super().__init__(k, d, D, affine, replicates, reg_params, reset_metric,
-        unused_thr, reset_patience, reset_obj, reset_decr_tol, reset_sigma)
+        unused_thr, reset_patience, reset_warmup, reset_obj, reset_decr_tol,
+        reset_sigma)
 
     self.dataset = dataset
     self.register_buffer('X', dataset.X)
@@ -687,12 +700,12 @@ class KSubspaceBatchAltProjModel(KSubspaceBatchAltBaseModel,
 
   def __init__(self, k, d, dataset, affine=False, replicates=5, reg_params={},
         reset_metric='value', unused_thr=0.01, reset_patience=2,
-        reset_obj='assign', reset_decr_tol=1e-4, reset_sigma=0.05,
-        svd_solver='randomized'):
+        reset_warmup=10, reset_obj='assign', reset_decr_tol=1e-4,
+        reset_sigma=0.05, svd_solver='randomized'):
 
     super().__init__(k, d, dataset, affine, replicates, reg_params,
-        reset_metric, unused_thr, reset_patience, reset_obj, reset_decr_tol,
-        reset_sigma)
+        reset_metric, unused_thr, reset_patience, reset_warmup, reset_obj,
+        reset_decr_tol, reset_sigma)
     # must be zero, not supported
     self.reg_params['U_fro_out'] = 0.0
     self.reset_parameters()
@@ -715,7 +728,7 @@ class KSubspaceBatchAltProjModel(KSubspaceBatchAltBaseModel,
           self.Us.data[ii, jj, :] = U
           if self.affine:
             self.bs.data[ii, jj, :] = b
-    self.steps.add_(1)
+    self.steps += 1
     return
 
 
@@ -731,12 +744,12 @@ class KSubspaceBatchAltMFModel(KSubspaceBatchAltBaseModel, KSubspaceMFModel):
 
   def __init__(self, k, d, dataset, affine=False, replicates=5, reg_params={},
         reset_metric='value', unused_thr=0.01, reset_patience=2,
-        reset_obj='assign', reset_decr_tol=1e-4, reset_sigma=0.05,
-        svd_solver='randomized'):
+        reset_warmup=10, reset_obj='assign', reset_decr_tol=1e-4,
+        reset_sigma=0.05, svd_solver='randomized'):
 
     super().__init__(k, d, dataset, affine, replicates, reg_params,
-        reset_metric, unused_thr, reset_patience, reset_obj, reset_decr_tol,
-        reset_sigma)
+        reset_metric, unused_thr, reset_patience, reset_warmup, reset_obj,
+        reset_decr_tol, reset_sigma)
     # must be zero, not supported
     self.reg_params['U_fro_out'] = 0.0
     self.reg_params['U_gram_fro_out'] = 0.0
@@ -813,5 +826,5 @@ class KSubspaceBatchAltMFModel(KSubspaceBatchAltBaseModel, KSubspaceMFModel):
           self.Us.data[ii, jj, :] = U
           if self.affine:
             self.bs.data[ii, jj, :] = b
-    self.steps.add_(1)
+    self.steps += 1
     return

@@ -76,9 +76,9 @@ def train_synth_uos_cluster(args):
     model = mod.KSubspaceBatchAltProjModel(args.model_n, args.model_d,
         synth_dataset, args.affine, args.reps, reg_params=reg_params,
         reset_metric=reset_metric, unused_thr=args.unused_thr,
-        reset_patience=args.reset_patience, reset_obj=args.reset_obj,
-        reset_decr_tol=args.reset_decr_tol, reset_sigma=args.reset_sigma,
-        svd_solver='randomized')
+        reset_patience=args.reset_patience, reset_warmup=args.reset_warmup,
+        reset_obj=args.reset_obj, reset_decr_tol=args.reset_decr_tol,
+        reset_sigma=args.reset_sigma, svd_solver='randomized')
   elif args.form == 'batch-alt-mf':
     reg_params = {
         'U_frosqr_in': args.U_frosqr_in_lamb / args.z_lamb,
@@ -90,9 +90,9 @@ def train_synth_uos_cluster(args):
     model = mod.KSubspaceBatchAltMFModel(args.model_n, args.model_d,
         synth_dataset, args.affine, args.reps, reg_params=reg_params,
         reset_metric=reset_metric, unused_thr=args.unused_thr,
-        reset_patience=args.reset_patience, reset_obj=args.reset_obj,
-        reset_decr_tol=args.reset_decr_tol, reset_sigma=args.reset_sigma,
-        svd_solver='randomized')
+        reset_patience=args.reset_patience, reset_warmup=args.reset_warmup,
+        reset_obj=args.reset_obj, reset_decr_tol=args.reset_decr_tol,
+        reset_sigma=args.reset_sigma, svd_solver='randomized')
   elif args.form == 'mf':
     reg_params = {
         'U_frosqr_in': args.U_frosqr_in_lamb / args.z_lamb,
@@ -106,8 +106,9 @@ def train_synth_uos_cluster(args):
     model = mod.KSubspaceMFModel(args.model_n, args.model_d, args.D,
         args.affine, args.reps, reg_params=reg_params,
         reset_metric=reset_metric, unused_thr=args.unused_thr,
-        reset_patience=args.reset_patience, reset_obj=args.reset_obj,
-        reset_decr_tol=args.reset_decr_tol, reset_sigma=args.reset_sigma)
+        reset_patience=args.reset_patience, reset_warmup=args.reset_warmup,
+        reset_obj=args.reset_obj, reset_decr_tol=args.reset_decr_tol,
+        reset_sigma=args.reset_sigma)
   else:
     reg_params = {
         'U_frosqr_in': args.U_frosqr_in_lamb,
@@ -118,8 +119,9 @@ def train_synth_uos_cluster(args):
     model = mod.KSubspaceProjModel(args.model_n, args.model_d, args.D,
         args.affine, args.reps, reg_params=reg_params,
         reset_metric=reset_metric, unused_thr=args.unused_thr,
-        reset_patience=args.reset_patience, reset_obj=args.reset_obj,
-        reset_decr_tol=args.reset_decr_tol, reset_sigma=args.reset_sigma)
+        reset_patience=args.reset_patience, reset_warmup=args.reset_warmup,
+        reset_obj=args.reset_obj, reset_decr_tol=args.reset_decr_tol,
+        reset_sigma=args.reset_sigma)
   model = model.to(device)
 
   # optimizer
@@ -216,6 +218,8 @@ if __name__ == '__main__':
                       'relative to 1/k [default: .01]'))
   parser.add_argument('--reset-patience', type=int, default=None,
                       help='Steps to wait between resets [default: 1 epoch]')
+  parser.add_argument('--reset-warmup', type=int, default=0,
+                      help='Extra steps to wait at start [default: 0]')
   parser.add_argument('--reset-decr-tol', type=float, default=1e-4,
                       help=('Relative objective decrease tolerance to reset '
                       '[default: 1e-4]'))
