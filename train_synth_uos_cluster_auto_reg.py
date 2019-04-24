@@ -67,6 +67,8 @@ if __name__ == '__main__':
                       help='Affine setting')
   parser.add_argument('--sigma', type=float, default=0.01,
                       help='Data noise sigma [default: 0.01]')
+  parser.add_argument('--miss-rate', type=float, default=0.0,
+                      help='Data missing rate [default: 0.0]')
   parser.add_argument('--data-seed', type=int, default=1904,
                       help='Data random seed [default: 1904]')
   parser.add_argument('--online', action='store_true',

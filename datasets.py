@@ -24,7 +24,7 @@ class SynthUoSDataset(Dataset):
     self.sigma = sigma
     self.classes = np.arange(n)
 
-    rng = np.random.RandomState(seed=seed)
+    self.rng = np.random.RandomState(seed=seed)
 
     self.Us = np.zeros([D, d, n])
     self.Vs = np.zeros([d, Ng, n])
@@ -34,14 +34,14 @@ class SynthUoSDataset(Dataset):
 
     # sample data from randomnly generated (linear or affine) subspaces
     for ii in range(n):
-      U, _ = np.linalg.qr(rng.randn(D, d))
-      V = (1./np.sqrt(d))*rng.randn(d, Ng)
+      U, _ = np.linalg.qr(self.rng.randn(D, d))
+      V = (1./np.sqrt(d))*self.rng.randn(d, Ng)
       self.Us[:, :, ii] = U
       self.Vs[:, :, ii] = V
       Xi = np.matmul(U, V)
 
       if affine:
-        b = (1./np.sqrt(D))*rng.randn(D, 1)
+        b = (1./np.sqrt(D))*self.rng.randn(D, 1)
         self.bs[:, ii] = b[:, 0]
         Xi += b
 
@@ -49,11 +49,11 @@ class SynthUoSDataset(Dataset):
       self.groups[ii*Ng:(ii+1)*Ng] = ii
 
     if sigma > 0.:
-      E = (sigma/np.sqrt(D))*rng.randn(self.N, D)
+      E = (sigma/np.sqrt(D))*self.rng.randn(self.N, D)
       self.X += E
 
     # permute order of data
-    self.perm = rng.permutation(self.N)
+    self.perm = self.rng.permutation(self.N)
     self.X = self.X[self.perm, :]
     self.groups = self.groups[self.perm]
 
@@ -66,6 +66,26 @@ class SynthUoSDataset(Dataset):
 
   def __getitem__(self, ii):
     return self.X[ii, :], self.groups[ii]
+
+
+class SynthUoSMissDataset(SynthUoSDataset):
+  """Synthetic union of subspaces dataset with missing data."""
+  def __init__(self, n, d, D, Ng, affine=False, sigma=0., miss_rate=0.0,
+        seed=None):
+    if miss_rate >= 1 or miss_rate < 0:
+      raise ValueError("Invalid miss_rate {}".format(miss_rate))
+
+    super().__init__(n, d, D, Ng, affine, sigma, seed)
+
+    # sample observed entries uniformly
+    self.miss_rate = miss_rate
+    self.Omega = (self.rng.rand(self.N, self.D) >=
+        miss_rate).astype(np.float32)
+    self.Omega = torch.tensor(self.Omega, dtype=torch.float32)
+
+    # NOTE: X is not masked by Omega
+    self.X = torch.stack((self.X, self.Omega), dim=1)
+    return
 
 
 class SynthUoSOnlineDataset(Dataset):
@@ -112,6 +132,26 @@ class SynthUoSOnlineDataset(Dataset):
       x += self.bs[grp, :]
     if self.sigma > 0:
       x += (self.sigma/np.sqrt(self.D))*torch.randn(self.D)
+    return x, grp
+
+
+class SynthUoSMissOnlineDataset(SynthUoSOnlineDataset):
+  """Synthetic union of subspaces dataset with fresh samples."""
+  def __init__(self, n, d, D, N, affine=False, sigma=0., miss_rate=0.0,
+        seed=None):
+    if miss_rate >= 1 or miss_rate < 0:
+      raise ValueError("Invalid miss_rate {}".format(miss_rate))
+
+    super().__init__(n, d, D, N, affine, sigma, seed)
+
+    self.miss_rate = miss_rate
+    return
+
+  def __getitem__(self, ii):
+    x, grp = super().__getitem__(ii)
+    omega = (torch.rand(self.D) >= self.miss_rate).to(torch.float32)
+    # NOTE: X is not masked by Omega
+    x = torch.stack((x, omega), dim=0)
     return x, grp
 
 

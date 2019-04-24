@@ -24,6 +24,9 @@ def train_synth_uos_cluster(args):
   torch.set_num_threads(args.num_threads)
   batch_alt_mode = args.form in {'batch-alt-proj', 'batch-alt-mf'}
 
+  if args.miss_rate > 0 and args.form != 'mf':
+    raise ValueError("Missing data only compatible with mf formulation.")
+
   # create output directory, deleting any existing results.
   if os.path.exists(args.out_dir):
     shutil.rmtree(args.out_dir)
@@ -37,15 +40,23 @@ def train_synth_uos_cluster(args):
     if batch_alt_mode:
       raise ValueError(("Online mode not compatible with "
           "batch_alt formulation."))
-    synth_dataset = dat.SynthUoSOnlineDataset(args.n, args.d, args.D,
-        args.N, args.affine, args.sigma, args.data_seed)
+    if args.miss_rate > 0:
+      synth_dataset = dat.SynthUoSMissOnlineDataset(args.n, args.d, args.D,
+          args.N, args.affine, args.sigma, args.miss_rate, args.data_seed)
+    else:
+      synth_dataset = dat.SynthUoSOnlineDataset(args.n, args.d, args.D,
+          args.N, args.affine, args.sigma, args.data_seed)
     shuffle_data = False
   else:
     if args.Ng is None:
       args.Ng = args.N // args.n
       args.N = args.Ng * args.n
-    synth_dataset = dat.SynthUoSDataset(args.n, args.d, args.D, args.Ng,
-        args.affine, args.sigma, args.data_seed)
+    if args.miss_rate > 0:
+      synth_dataset = dat.SynthUoSMissDataset(args.n, args.d, args.D, args.Ng,
+          args.affine, args.sigma, args.miss_rate, args.data_seed)
+    else:
+      synth_dataset = dat.SynthUoSDataset(args.n, args.d, args.D, args.Ng,
+          args.affine, args.sigma, args.data_seed)
     shuffle_data = True
   kwargs = {'num_workers': args.num_workers}
   if use_cuda:
@@ -94,21 +105,37 @@ def train_synth_uos_cluster(args):
         reset_obj=args.reset_obj, reset_decr_tol=args.reset_decr_tol,
         reset_sigma=args.reset_sigma, svd_solver='randomized')
   elif args.form == 'mf':
-    reg_params = {
-        'U_frosqr_in': args.U_frosqr_in_lamb / args.z_lamb,
-        'U_frosqr_out': args.U_frosqr_out_lamb / args.z_lamb,
-        'U_fro_out': args.U_fro_out_lamb,
-        'U_gram_fro_out': args.U_gram_fro_out_lamb,
-        'z': (args.z_lamb if
-            max(args.U_frosqr_in_lamb, args.U_frosqr_out_lamb) > 0
-            else 0.0)
-    }
-    model = mod.KSubspaceMFModel(args.model_n, args.model_d, args.D,
-        args.affine, args.reps, reg_params=reg_params,
-        reset_metric=reset_metric, unused_thr=args.unused_thr,
-        reset_patience=args.reset_patience, reset_warmup=args.reset_warmup,
-        reset_obj=args.reset_obj, reset_decr_tol=args.reset_decr_tol,
-        reset_sigma=args.reset_sigma)
+    if args.miss_rate > 0:
+      reg_params = {
+          'U_frosqr_in': args.U_frosqr_in_lamb / args.z_lamb,
+          'U_frosqr_out': args.U_frosqr_out_lamb / args.z_lamb,
+          'z': (args.z_lamb if
+              max(args.U_frosqr_in_lamb, args.U_frosqr_out_lamb) > 0
+              else 0.0),
+          'e': 1.0
+      }
+      model = mod.KSubspaceMCModel(args.model_n, args.model_d, args.D,
+          args.affine, args.reps, reg_params=reg_params,
+          reset_metric=reset_metric, unused_thr=args.unused_thr,
+          reset_patience=args.reset_patience, reset_warmup=args.reset_warmup,
+          reset_obj=args.reset_obj, reset_decr_tol=args.reset_decr_tol,
+          reset_sigma=args.reset_sigma)
+    else:
+      reg_params = {
+          'U_frosqr_in': args.U_frosqr_in_lamb / args.z_lamb,
+          'U_frosqr_out': args.U_frosqr_out_lamb / args.z_lamb,
+          # 'U_fro_out': args.U_fro_out_lamb,
+          # 'U_gram_fro_out': args.U_gram_fro_out_lamb,
+          'z': (args.z_lamb if
+              max(args.U_frosqr_in_lamb, args.U_frosqr_out_lamb) > 0
+              else 0.0)
+      }
+      model = mod.KSubspaceMFModel(args.model_n, args.model_d,
+          args.D, args.affine, args.reps, reg_params=reg_params,
+          reset_metric=reset_metric, unused_thr=args.unused_thr,
+          reset_patience=args.reset_patience, reset_warmup=args.reset_warmup,
+          reset_obj=args.reset_obj, reset_decr_tol=args.reset_decr_tol,
+          reset_sigma=args.reset_sigma)
   else:
     reg_params = {
         'U_frosqr_in': args.U_frosqr_in_lamb,
@@ -171,6 +198,8 @@ if __name__ == '__main__':
                       help='Affine setting')
   parser.add_argument('--sigma', type=float, default=0.01,
                       help='Data noise sigma [default: 0.01]')
+  parser.add_argument('--miss-rate', type=float, default=0.0,
+                      help='Data missing rate [default: 0.0]')
   parser.add_argument('--data-seed', type=int, default=1904,
                       help='Data random seed [default: 1904]')
   parser.add_argument('--online', action='store_true',

@@ -204,6 +204,47 @@ def unit_normalize(X, p=2, dim=None):
   return unitX
 
 
+def batch_svd(X, out=None):
+  shape = X.shape
+  if len(shape) < 3:
+    raise ValueError("Invalid X value, should have >= 1 batch dim.")
+
+  X = X.contiguous()  # to ensure viewing works as expected
+  batch_dims = shape[:-2]
+  batch_D = np.prod(batch_dims)
+  m, n = shape[-2:]
+  d = min(m, n)
+  X = X.view(batch_D, m, n)
+
+  if out is not None:
+    U, s, V = out
+    # check strides
+    if U.stride()[-2:] != (1, m):
+      raise ValueError("U has invalid stride, must be stored as transpose")
+    if s.stride()[-1] != 1:
+      raise ValueError("s has invalid stride")
+    if V.stride()[-2:] != (n, 1):
+      raise ValueError("V has invalid stride")
+
+    U = U.view(batch_D, m, d)
+    s = s.view(batch_D, d)
+    V = V.view(batch_D, n, d)
+  else:
+    U = torch.zeros((batch_D, d, m), dtype=X.dtype, device=X.device)
+    # must be stored as transpose
+    U = U.transpose(1, 2)
+    s = torch.zeros((batch_D, d), dtype=X.dtype, device=X.device)
+    V = torch.zeros((batch_D, n, d), dtype=X.dtype, device=X.device)
+
+  for idx in range(batch_D):
+    torch.svd(X[idx, :], some=True, out=(U[idx, :], s[idx, :], V[idx, :]))
+
+  U = U.view(batch_dims + (m, d))
+  s = s.view(batch_dims + (d,))
+  V = V.view(batch_dims + (n, d))
+  return U, s, V
+
+
 def reg_pca(X, d, form='proj', lamb=0.0, gamma=0.0, affine=False,
       solver='randomized'):
   """Solve one of the regularized PCA problems
