@@ -59,7 +59,7 @@ def eval_cluster_error(*args, **kwargs):
 
   Examples:
     cluster_error, conf_mat = eval_cluster_error(conf_mat)
-    cluster_error, conf_mat = eval_cluster_error(groups, true_groups)
+    cluster_error, conf_mat = eval_cluster_error(groups, true_groups, k)
 
   Args:
     conf_mat: (n, n) group confusion matrix
@@ -74,10 +74,8 @@ def eval_cluster_error(*args, **kwargs):
   else:
     groups = args[0]
     true_groups = args[1]
-    # number of groups and labels will be inferred from groups and true_groups.
-    conf_mat = eval_confusion(groups, true_groups,
-        k=kwargs.get('k', None), true_k=kwargs.get('true_k', None),
-        true_classes=kwargs.get('true_classes', None))
+    # number of groups and labels will be inferred from true_groups.
+    conf_mat = eval_confusion(groups, true_groups, k=kwargs.get('k'))
 
   if torch.is_tensor(conf_mat):
     conf_mat = conf_mat.numpy()
@@ -100,38 +98,27 @@ def eval_cluster_error(*args, **kwargs):
   return cluster_error, map_Idx
 
 
-def eval_confusion(groups, true_groups, k=None, true_k=None,
-      true_classes=None):
-  """compute confusion matrix between assigned and true groups"""
-  if isinstance(groups, np.ndarray):
-    groups = torch.from_numpy(groups)
-  if isinstance(true_groups, np.ndarray):
-    true_groups = torch.from_numpy(true_groups)
-  if groups.numel() != true_groups.numel():
+def eval_confusion(groups, true_groups, k):
+  """compute confusion matrix between assigned and true groups
+
+  Note: group labels assumed to be integers (0, ..., k-1).
+  """
+  if torch.is_tensor(groups):
+    groups = groups.cpu().numpy()
+  if torch.is_tensor(true_groups):
+    true_groups = true_groups.cpu().numpy()
+  if groups.size != true_groups.size:
     raise ValueError("groups true_groups must have the same size")
 
-  with torch.no_grad():
-    if k is not None:
-      classes = torch.arange(k).view(1, -1)
-      if true_classes is not None:
-        true_classes = torch.tensor(true_classes).view(1, -1)
-      elif true_k is not None:
-        true_classes = torch.arange(true_k).view(1, -1)
-      else:
-        true_classes = classes
-    else:
-      classes = torch.unique(groups).view(1, -1)
-      true_classes = torch.unique(true_groups).view(1, -1)
+  true_labels, true_groups = np.unique(true_groups, return_inverse=True)
+  true_k = true_labels.shape[0]
+  conf_mat = np.zeros((k, true_k))
 
-    groups = groups.view(-1, 1)
-    true_groups = true_groups.view(-1, 1)
-
-    groups_onehot = (groups == classes).type(torch.int64)
-    true_groups_onehot = (true_groups == true_classes).type(torch.int64)
-    # float32 used here so that single all reduce can be used in distributed
-    # setting. Is there a case where float32 might be inaccurate?
-    conf_mat = torch.matmul(groups_onehot.t(),
-        true_groups_onehot).type(torch.float32)
+  groups = groups.reshape(-1)
+  true_groups = true_groups.reshape(-1)
+  groups_stack = np.stack((groups, true_groups), axis=1)
+  Idx, counts = np.unique(groups_stack, axis=0, return_counts=True)
+  conf_mat[Idx[:, 0], Idx[:, 1]] = counts
   return conf_mat
 
 

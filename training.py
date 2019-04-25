@@ -190,8 +190,8 @@ def train_epoch(model, data_loader, optimizer, device, eval_rank=False,
 
     # eval batch cluster confusion
     batch_conf_mats = torch.stack([
-        ut.eval_confusion(model.groups[:, ii], groups, k=model.k,
-            true_classes=data_loader.dataset.classes)
+        torch.from_numpy(ut.eval_confusion(model.groups[:, ii], groups,
+            model.k))
         for ii in range(model.replicates)])
 
     batch_size = x.size(0)
@@ -265,8 +265,8 @@ def batch_alt_step(model, eval_rank=False, reset_unused=False):
   norm_x_ = model.eval_shrink(x_)
   # eval cluster confusion
   conf_mats = torch.stack([
-      ut.eval_confusion(model.groups[:, ii], model.true_groups, k=model.k,
-          true_classes=model.true_classes)
+      torch.from_numpy(ut.eval_confusion(model.groups[:, ii],
+          model.true_groups, model.k))
       for ii in range(model.replicates)])
 
   if reset_unused:
