@@ -185,3 +185,48 @@ class YouCVPR16ImageUoS(Dataset):
 
   def __getitem__(self, ii):
     return self.X[ii, :], self.groups[ii]
+
+
+class SynthKMeansDataset(Dataset):
+  """Synthetic k means dataset."""
+  def __init__(self, k, D, Ng, separation=2.0, seed=None):
+    super().__init__()
+
+    self.k = k  # number of groups
+    self.D = D  # ambient dimension
+    self.Ng = Ng  # points per group
+    self.N = k*Ng
+    self.classes = np.arange(k)
+
+    # c separation from Dasgupta 1999
+    if separation is None or separation < 0:
+      self.separation = 2.0
+    else:
+      self.separation = separation
+
+    self.rng = np.random.RandomState(seed=seed)
+    self.bs = (self.separation / np.sqrt(2)) * self.rng.randn(k, D)
+
+    dists = np.sqrt(np.sum((np.expand_dims(self.bs, 1) -
+        np.expand_dims(self.bs, 0))**2, axis=2))
+    triuIdx = np.triu_indices(k, k=1)
+    self.dists = dists[triuIdx]
+
+    self.X = self.bs.repeat(Ng, axis=0)
+    self.groups = np.arange(k, dtype=np.int32).repeat(Ng)
+    self.X += self.rng.randn(Ng*k, D)
+
+    # permute order of data
+    self.perm = self.rng.permutation(self.N)
+    self.X = self.X[self.perm, :]
+    self.groups = self.groups[self.perm]
+
+    self.X = torch.tensor(self.X, dtype=torch.float32)
+    self.groups = torch.tensor(self.groups, dtype=torch.int64)
+    return
+
+  def __len__(self):
+    return self.N
+
+  def __getitem__(self, ii):
+    return self.X[ii, :], self.groups[ii]
