@@ -176,7 +176,8 @@ class YouCVPR16ImageUoS(Dataset):
     self.n = self.classes.shape[0]
 
     # normalize data points (rows) of X
-    self.X.div_(torch.norm(self.X, p=2, dim=1).view(-1, 1).add(1e-8))
+    self.X = self.X.contiguous()
+    self.X.div_(torch.norm(self.X, p=2, dim=1, keepdim=True).add(1e-8))
     self.N, self.D = self.X.shape
     return
 

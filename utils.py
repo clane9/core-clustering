@@ -98,7 +98,7 @@ def eval_cluster_error(*args, **kwargs):
   return cluster_error, map_Idx
 
 
-def eval_confusion(groups, true_groups, k):
+def eval_confusion(groups, true_groups, k, true_classes=None):
   """compute confusion matrix between assigned and true groups
 
   Note: group labels assumed to be integers (0, ..., k-1).
@@ -110,8 +110,13 @@ def eval_confusion(groups, true_groups, k):
   if groups.size != true_groups.size:
     raise ValueError("groups true_groups must have the same size")
 
-  true_labels, true_groups = np.unique(true_groups, return_inverse=True)
-  true_k = true_labels.shape[0]
+  if true_classes is not None:
+    true_groups = np.argmax(true_groups.reshape(-1, 1) ==
+        true_classes.reshape(1, -1), axis=1)
+    true_k = true_classes.shape[0]
+  else:
+    true_labels, true_groups = np.unique(true_groups, return_inverse=True)
+    true_k = true_labels.shape[0]
   conf_mat = np.zeros((k, true_k))
 
   groups = groups.reshape(-1)
