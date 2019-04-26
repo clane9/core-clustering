@@ -860,6 +860,12 @@ class KMeansBatchAltModel(KSubspaceBatchAltBaseModel):
         reset_decr_tol, reset_sigma, reset_batch_size)
 
     self.init = init
+    # Number of candidate means to test. Will add the one that reduces the loss
+    # the most. This procedure is described in original paper, and also
+    # implemented in scikit-learn k_means. Although it's not explicit in most
+    # descriptions of the algorithm. It does seem to make a big difference,
+    # helping avoid the likely event that a single sample is bad.
+    self.kpp_n_trials = int(np.ceil(2 * np.log(self.k)))
     self.Xsqrnorms = self.X.pow(2).sum(dim=1).mul(0.5)
     self.XT = self.X.t().contiguous()
 
@@ -871,15 +877,34 @@ class KMeansBatchAltModel(KSubspaceBatchAltBaseModel):
     self.Us.data.zero_()
     self.bs.data.zero_()
     if self.init == 'k-means++':
+      # pick first randomly
       Idx = torch.randint(0, self.N, (self.r,), dtype=torch.int64)
       self.bs.data[:, 0, :] = self.X[Idx, :]
       for ii in range(1, self.k):
+        # evaluate loss for current centers
         # (batch_size, r, ii)
-        loss = self.loss(None, None, self.bs[:, :ii, :])
-        # (r, batch_size)
-        loss = (loss.min(dim=2)[0]).t()
-        # (r,)
-        Idx = torch.multinomial(loss, 1).view(-1)
+        loss = self.loss(None, None, self.bs.data[:, :ii, :])
+        # (batch_size, r)
+        min_loss = loss.min(dim=2)[0]
+
+        # pick candidates by probabilistic farthest selection
+        # (r, 2 * log k)
+        cand_Idx = torch.multinomial(min_loss.t(), self.kpp_n_trials)
+        # (r, 2 * logk, D)
+        cand_bs = self.X[cand_Idx, :]
+
+        # select the best, i.e. the one that will reduce loss the most
+        # (batch_size, r, 2 * logk, 1)
+        cand_loss = self.loss(None, None, cand_bs).unsqueeze(3)
+        rep_min_loss = min_loss.view(min_loss.shape + (1, 1)).repeat(
+            1, 1, self.kpp_n_trials, 1)
+        # (batch_size, r, 2*log k, 2)
+        cand_loss = torch.cat((rep_min_loss, cand_loss), dim=3)
+        # (r, 2*log k)
+        cand_loss = (cand_loss.min(dim=3)[0]).mean(dim=0)
+        Idx = cand_loss.min(dim=1)[1]
+        Idx = cand_Idx[np.arange(self.r), Idx]
+
         self.bs.data[:, ii, :] = self.X[Idx, :]
     else:
       Idx = torch.randint(0, self.N, (self.r, self.k), dtype=torch.int64)
