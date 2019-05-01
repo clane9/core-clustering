@@ -181,6 +181,32 @@ def coherence(U1, U2, normalize=False):
   return coh
 
 
+def cos_knn(y, X, k, normalize=False):
+  """Find knn in absolute cosine distance.
+
+  Args:
+    y: targets, shape (n, D).
+    X: dataset, shape (N, D).
+
+  Returns:
+    y_nn: nearest neighbors, shape (n, k, D)
+  """
+  with torch.no_grad():
+    if y.dim() == 1:
+      y = y.view(1, -1)
+    if normalize:
+      y = unit_normalize(y, dim=1)
+      X = unit_normalize(X, dim=1)
+
+    # (n, N)
+    cos_abs = torch.matmul(y, X.t()).abs()
+    # (n, k)
+    Idx = torch.topk(cos_abs, k, dim=1)[1]
+    # (n, k, D)
+    y_knn = X[Idx, :]
+  return y_knn
+
+
 def unit_normalize(X, p=2, dim=None):
   """Normalize X
 

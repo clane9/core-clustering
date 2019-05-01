@@ -100,6 +100,49 @@ class KSubspaceBaseModel(nn.Module):
       self.bs.data.normal_(0., std)
     return
 
+  def prob_farthest_insert(self, X, nn_q=0):
+    """Initialize Us, bs by probabilistic farthest insertion (single trial)
+
+    Args:
+      X: Data matrix from which to select bases, shape (N, D)
+      nn_q: Extra nearest neighbors (default: 0).
+    """
+    nn_k = self.d + nn_q
+    if self.affine:
+      nn_k += 1
+    N = X.shape[0]
+    X = ut.unit_normalize(X, p=2, dim=1)
+
+    self.Us.data.zero_()
+    if self.affine:
+      self.bs.data.zero_()
+
+    # choose first basis randomly
+    Idx = torch.randint(0, N, (self.r,), dtype=torch.int64)
+    self._insert_next(0, X[Idx, :], X, nn_k)
+
+    for jj in range(1, self.k):
+      with torch.no_grad():
+        X_ = self.forward(X)
+        # (N, r, k)
+        loss = self.loss(X, X_)
+      # (N, r)
+      min_loss = torch.min(loss[:, :, :jj], dim=2)[0]
+      # (r,)
+      Idx = torch.multinomial(min_loss.t(), 1).view(-1)
+      self._insert_next(jj, X[Idx, :], X, nn_k)
+    return
+
+  def _insert_next(self, jj, y, X, nn_k):
+    """Insert next basis (jj) centered on sampled points y from X."""
+    y_knn = ut.cos_knn(y, X, nn_k)
+    for ii in range(self.r):
+      U, b = ut.reg_pca(y_knn[ii, :], self.d, affine=self.affine)
+      self.Us.data[ii, jj, :] = U
+      if self.affine:
+        self.bs.data[ii, jj, :] = b
+    return
+
   def forward(self, x):
     """Compute representation of x wrt each subspace.
 
@@ -463,10 +506,10 @@ class KSubspaceMFModel(KSubspaceBaseModel):
   def __init__(self, k, d, D, affine=False, replicates=5, reg_params={},
         reset_metric='value', unused_thr=0.01, reset_patience=100,
         reset_warmup=500, reset_obj='assign', reset_decr_tol=1e-4,
-        reset_sigma=0.05):
+        reset_sigma=0.05, reset_batch_size=None):
     super().__init__(k, d, D, affine, replicates, reg_params, reset_metric,
         unused_thr, reset_patience, reset_warmup, reset_obj, reset_decr_tol,
-        reset_sigma)
+        reset_sigma, reset_batch_size)
 
     self.reset_parameters()
     return
@@ -561,10 +604,10 @@ class KSubspaceProjModel(KSubspaceBaseModel):
   def __init__(self, k, d, D, affine=False, replicates=5, reg_params={},
         reset_metric='value', unused_thr=0.01, reset_patience=100,
         reset_warmup=500, reset_obj='assign', reset_decr_tol=1e-4,
-        reset_sigma=0.05):
+        reset_sigma=0.05, reset_batch_size=None):
     super().__init__(k, d, D, affine, replicates, reg_params, reset_metric,
         unused_thr, reset_patience, reset_warmup, reset_obj, reset_decr_tol,
-        reset_sigma)
+        reset_sigma, reset_batch_size)
 
     self.reset_parameters()
     return
@@ -712,7 +755,7 @@ class KSubspaceBatchAltProjModel(KSubspaceBatchAltBaseModel,
 
     super().__init__(k, d, dataset, affine, replicates, reg_params,
         reset_metric, unused_thr, reset_patience, reset_warmup, reset_obj,
-        reset_decr_tol, reset_sigma, reset_batch_size)
+        reset_decr_tol, reset_sigma, reset_batch_size, svd_solver)
     # must be zero, not supported
     self.reg_params['U_fro_out'] = 0.0
 
@@ -757,7 +800,7 @@ class KSubspaceBatchAltMFModel(KSubspaceBatchAltBaseModel, KSubspaceMFModel):
 
     super().__init__(k, d, dataset, affine, replicates, reg_params,
         reset_metric, unused_thr, reset_patience, reset_warmup, reset_obj,
-        reset_decr_tol, reset_sigma, reset_batch_size)
+        reset_decr_tol, reset_sigma, reset_batch_size, svd_solver)
     # must be zero, not supported
     self.reg_params['U_fro_out'] = 0.0
     self.reg_params['U_gram_fro_out'] = 0.0

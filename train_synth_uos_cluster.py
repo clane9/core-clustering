@@ -149,6 +149,8 @@ def train_synth_uos_cluster(args):
         reset_patience=args.reset_patience, reset_warmup=args.reset_warmup,
         reset_obj=args.reset_obj, reset_decr_tol=args.reset_decr_tol,
         reset_sigma=args.reset_sigma)
+  if args.prob_farthest_insert:
+    model.prob_farthest_insert(synth_dataset.X, nn_q=0)
   model = model.to(device)
 
   # optimizer
@@ -229,6 +231,9 @@ if __name__ == '__main__':
   parser.add_argument('--z-lamb', type=float, default=0.01,
                       help=('L2 squared coefficient reg parameter, '
                       'inside assignment [default: 0.01]'))
+  parser.add_argument('--prob-farthest-insert', action='store_true',
+                      default=False, help=('Initialize by probabilistic '
+                      'farthest insertion'))
   # training settings
   parser.add_argument('--batch-size', type=int, default=100,
                       help='Input batch size for training [default: 100]')
