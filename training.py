@@ -198,7 +198,7 @@ def train_epoch(model, data_loader, optimizer, device, eval_rank=False,
     if metrics is None:
       metrics = [ut.AverageMeter() for _ in range(len(batch_metrics))]
     for kk in range(len(batch_metrics)):
-      metrics[kk].update(batch_metrics[kk], batch_size)
+      metrics[kk].update(batch_metrics[kk].cpu(), batch_size)
     conf_mats.update(batch_conf_mats, 1)
 
     if reset_unused:
@@ -294,10 +294,11 @@ def batch_alt_step(model, eval_rank=False, reset_unused=False):
   else:
     rank_stats, svs = [], None
 
-  metrics = torch.stack([errors, obj, loss, reg_in, reg_out, norm_x_])
+  metrics = torch.stack([errors, obj.cpu(), loss.cpu(), reg_in.cpu(),
+      reg_out.cpu(), norm_x_.cpu()])
   metrics_summary = torch.stack([metrics.min(dim=1)[0],
       metrics.median(dim=1)[0], metrics.max(dim=1)[0]], dim=1)
-  metrics = metrics.cpu().numpy()
+  metrics = metrics.numpy()
   metrics_summary = metrics_summary.view(-1).numpy().tolist()
   metrics_summary = (metrics_summary + rank_stats +
       [reset_count, reset_attempts] + [sampsec, rtime])

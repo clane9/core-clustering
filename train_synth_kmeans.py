@@ -29,7 +29,7 @@ def train_synth_kmeans_cluster(args):
   # construct dataset
   torch.manual_seed(args.data_seed)
   synth_dataset = dat.SynthKMeansDataset(args.n, args.D, args.Ng,
-      separation=args.sep, seed=args.seed)
+      separation=args.sep, seed=args.data_seed)
   synth_data_loader = None
 
   # construct model

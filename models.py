@@ -405,7 +405,7 @@ class KSubspaceBaseModel(nn.Module):
 
     # organize alternative assignment objectives, one per reset candidate,
     # (batch_size, (r-1)*k, 2)
-    cidx_mask = torch.arange(self.k) != cidx
+    cidx_mask = torch.arange(self.k) != cidx.item()
     self._alt_assign_obj[:, :, 0] = torch.unsqueeze(torch.min(
         self._reset_assign_obj[:, ridx, cidx_mask], dim=1)[0], 1)
     self._alt_assign_obj[:, :, 1] = self._reset_assign_obj[:,
@@ -463,10 +463,10 @@ class KSubspaceMFModel(KSubspaceBaseModel):
   def __init__(self, k, d, D, affine=False, replicates=5, reg_params={},
         reset_metric='value', unused_thr=0.01, reset_patience=100,
         reset_warmup=500, reset_obj='assign', reset_decr_tol=1e-4,
-        reset_sigma=0.05):
+        reset_sigma=0.05, reset_batch_size=None):
     super().__init__(k, d, D, affine, replicates, reg_params, reset_metric,
         unused_thr, reset_patience, reset_warmup, reset_obj, reset_decr_tol,
-        reset_sigma)
+        reset_sigma, reset_batch_size)
 
     self.reset_parameters()
     return
@@ -561,10 +561,10 @@ class KSubspaceProjModel(KSubspaceBaseModel):
   def __init__(self, k, d, D, affine=False, replicates=5, reg_params={},
         reset_metric='value', unused_thr=0.01, reset_patience=100,
         reset_warmup=500, reset_obj='assign', reset_decr_tol=1e-4,
-        reset_sigma=0.05):
+        reset_sigma=0.05, reset_batch_size=None):
     super().__init__(k, d, D, affine, replicates, reg_params, reset_metric,
         unused_thr, reset_patience, reset_warmup, reset_obj, reset_decr_tol,
-        reset_sigma)
+        reset_sigma, reset_batch_size)
 
     self.reset_parameters()
     return
@@ -677,10 +677,10 @@ class KSubspaceBatchAltBaseModel(KSubspaceBaseModel):
     self.c_mean = self._batch_c_mean = self.c.mean(dim=0)
     self.value = self._batch_value = torch.mean(self.c *
         (top2obj[:, :, [1]] - top2obj[:, :, [0]]), dim=0)
-    self._updates = ((self.groups != groups_prev).sum()
-        if groups_prev is not None else self.N)
 
     self.groups = self.groups.cpu()
+    self._updates = ((self.groups != groups_prev).sum()
+        if groups_prev is not None else self.N)
     return
 
   def eval_shrink(self, x_):

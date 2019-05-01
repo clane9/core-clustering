@@ -165,10 +165,15 @@ class YouCVPR16ImageUoS(Dataset):
       self.groups = torch.tensor(data['MNIST_LABEL'].reshape(-1),
           dtype=torch.int64)
     elif dataset == 'coil100':
-      matfile = '{}/datasets/COIL100.mat'.format(CODE_DIR)
+      matfile = '{}/datasets/COIL100_SC_pca.mat'.format(CODE_DIR)
       data = loadmat(matfile)
-      self.X = torch.tensor(data['fea'], dtype=torch.float32)
-      self.groups = torch.tensor(data['gnd'].reshape(-1), dtype=torch.int64)
+      self.X = torch.tensor(data['COIL100_SC_DATA'].T, dtype=torch.float32)
+      self.groups = torch.tensor(data['COIL100_LABEL'].reshape(-1), dtype=torch.int64)
+    elif dataset == 'coil20':
+      matfile = '{}/datasets/COIL20_SC_pca.mat'.format(CODE_DIR)
+      data = loadmat(matfile)
+      self.X = torch.tensor(data['COIL20_SC_DATA'].T, dtype=torch.float32)
+      self.groups = torch.tensor(data['COIL20_LABEL'].reshape(-1), dtype=torch.int64)
     else:
       raise ValueError("Invalid dataset {}".format(dataset))
 
