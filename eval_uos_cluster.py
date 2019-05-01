@@ -24,7 +24,7 @@ def main():
   device = torch.device('cuda' if use_cuda else 'cpu')
   torch.set_num_threads(args.num_threads)
 
-  if args.dataset not in {'mnist_sc_pca', 'coil100'}:
+  if args.dataset not in {'mnist_sc_pca', 'coil100', 'coil20'}:
     raise ValueError("Invalid dataset {}".format(args.dataset))
   if args.form not in {'batch-alt-proj', 'batch-alt-mf', 'proj', 'mf'}:
     raise ValueError("Invalid form {}".format(args.form))
@@ -163,7 +163,7 @@ if __name__ == '__main__':
                       help='Output directory.')
   parser.add_argument('--dataset', type=str, default='mnist_sc_pca',
                       help='Real dataset [default: mnist_sc_pca].',
-                      choices=['mnist_sc_pca', 'coil100'])
+                      choices=['mnist_sc_pca', 'coil100', 'coil20'])
   # model settings
   parser.add_argument('--form', type=str, required=True,
                       help=('Model formulation (proj, mf, batch-alt-proj, '
