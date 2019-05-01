@@ -24,7 +24,7 @@ def main():
   device = torch.device('cuda' if use_cuda else 'cpu')
   torch.set_num_threads(args.num_threads)
 
-  if args.dataset not in {'mnist_sc_pca', 'coil100', 'coil20'}:
+  if args.dataset not in {'mnist', 'coil100', 'coil20', 'yaleb'}:
     raise ValueError("Invalid dataset {}".format(args.dataset))
   if args.form not in {'batch-alt-proj', 'batch-alt-mf', 'proj', 'mf'}:
     raise ValueError("Invalid form {}".format(args.form))
@@ -39,7 +39,7 @@ def main():
   torch.manual_seed(args.seed)
 
   # load dataset
-  dataset = dat.YouCVPR16ImageUoS(args.dataset)
+  dataset = dat.ImageUoSDataset(args.dataset)
   kwargs = {'num_workers': args.num_workers}
   if use_cuda:
     kwargs['pin_memory'] = True
@@ -70,7 +70,7 @@ def main():
   if args.reset_patience is None or args.reset_patience < 0:
     args.reset_patience = (2 if batch_alt_mode else
         int(np.ceil(dataset.N / args.batch_size)))
-  reset_warmup = args.reset_patience
+  reset_warmup = 0
   reset_obj = 'full'
   if args.form == 'batch-alt-proj':
     reg_params = {
@@ -127,6 +127,8 @@ def main():
         reset_patience=args.reset_patience, reset_warmup=reset_warmup,
         reset_obj=reset_obj, reset_decr_tol=args.reset_decr_tol,
         reset_sigma=args.reset_sigma)
+  if args.prob_farthest_insert:
+    model.prob_farthest_insert(dataset.X, nn_q=int(0.5*args.model_d))
   model = model.to(device)
 
   # optimizer
@@ -161,9 +163,11 @@ if __name__ == '__main__':
   parser = argparse.ArgumentParser(description='Cluster real UoS data')
   parser.add_argument('--out-dir', type=str, required=True,
                       help='Output directory.')
-  parser.add_argument('--dataset', type=str, default='mnist_sc_pca',
-                      help='Real dataset [default: mnist_sc_pca].',
-                      choices=['mnist_sc_pca', 'coil100', 'coil20'])
+  parser.add_argument('--dataset', type=str, default='mnist',
+                      help='Real dataset [default: mnist].',
+                      choices=['mnist', 'coil100', 'coil20', 'yaleb'])
+  parser.add_argument('--center', action='store_true', default=False,
+                      help='Center dataset.')
   # model settings
   parser.add_argument('--form', type=str, required=True,
                       help=('Model formulation (proj, mf, batch-alt-proj, '
@@ -181,6 +185,9 @@ if __name__ == '__main__':
   parser.add_argument('--min-size', type=float, default=0.01,
                       help=('Minimum cluster size as fraction relative to 1/n'
                       '[default: 0.01]'))
+  parser.add_argument('--prob-farthest-insert', action='store_true',
+                      default=False, help=('Initialize by probabilistic '
+                      'farthest insertion'))
   # training settings
   parser.add_argument('--batch-size', type=int, default=100,
                       help='Input batch size for training [default: 100]')

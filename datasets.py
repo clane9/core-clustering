@@ -155,10 +155,10 @@ class SynthUoSMissOnlineDataset(SynthUoSOnlineDataset):
     return x, grp
 
 
-class YouCVPR16ImageUoS(Dataset):
-  """Image datasets from (You et al., CVPR 2016)."""
-  def __init__(self, dataset='mnist_sc_pca'):
-    if dataset == 'mnist_sc_pca':
+class ImageUoSDataset(Dataset):
+  """Image datasets, mostly from (You et al., CVPR 2016)."""
+  def __init__(self, dataset='mnist', center=False, normalize=True):
+    if dataset == 'mnist':
       matfile = '{}/datasets/MNIST_SC_pca.mat'.format(CODE_DIR)
       data = loadmat(matfile)
       self.X = torch.tensor(data['MNIST_SC_DATA'].T, dtype=torch.float32)
@@ -168,12 +168,21 @@ class YouCVPR16ImageUoS(Dataset):
       matfile = '{}/datasets/COIL100_SC_pca.mat'.format(CODE_DIR)
       data = loadmat(matfile)
       self.X = torch.tensor(data['COIL100_SC_DATA'].T, dtype=torch.float32)
-      self.groups = torch.tensor(data['COIL100_LABEL'].reshape(-1), dtype=torch.int64)
+      self.groups = torch.tensor(data['COIL100_LABEL'].reshape(-1),
+          dtype=torch.int64)
     elif dataset == 'coil20':
       matfile = '{}/datasets/COIL20_SC_pca.mat'.format(CODE_DIR)
       data = loadmat(matfile)
       self.X = torch.tensor(data['COIL20_SC_DATA'].T, dtype=torch.float32)
-      self.groups = torch.tensor(data['COIL20_LABEL'].reshape(-1), dtype=torch.int64)
+      self.groups = torch.tensor(data['COIL20_LABEL'].reshape(-1),
+          dtype=torch.int64)
+    elif dataset == 'yaleb':
+      matfile = '{}/datasets/small_YaleB_48x42.mat'.format(CODE_DIR)
+      data = loadmat(matfile)
+      # tuple (scale, dim, D, N, images, labels)
+      small_yale = data['small_yale'][0, 0]
+      self.X = torch.tensor(small_yale[4].T, dtype=torch.float32)
+      self.groups = torch.tensor(small_yale[5][0, :], dtype=torch.int64)
     else:
       raise ValueError("Invalid dataset {}".format(dataset))
 
@@ -181,8 +190,10 @@ class YouCVPR16ImageUoS(Dataset):
     self.n = self.classes.shape[0]
 
     # normalize data points (rows) of X
-    self.X = self.X.contiguous()
-    self.X.div_(torch.norm(self.X, p=2, dim=1, keepdim=True).add(1e-8))
+    if center:
+      self.X.sub_(self.X.mean(dim=0))
+    if normalize:
+      self.X.div_(torch.norm(self.X, p=2, dim=1, keepdim=True).add(1e-8))
     self.N, self.D = self.X.shape
     return
 

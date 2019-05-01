@@ -97,7 +97,7 @@ class KSubspaceBaseModel(nn.Module):
     std = .1 / np.sqrt(self.D)
     self.Us.data.normal_(0., std)
     if self.affine:
-      self.bs.data.normal_(0., std)
+      self.bs.data.zero_()
     return
 
   def prob_farthest_insert(self, X, nn_q=0):
