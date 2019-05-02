@@ -157,7 +157,8 @@ class SynthUoSMissOnlineDataset(SynthUoSOnlineDataset):
 
 class ImageUoSDataset(Dataset):
   """Image datasets, mostly from (You et al., CVPR 2016)."""
-  def __init__(self, dataset='mnist', center=False, normalize=True):
+  def __init__(self, dataset='mnist', center=False, sv_range=None,
+        normalize=True):
     if dataset == 'mnist':
       matfile = '{}/datasets/MNIST_SC_pca.mat'.format(CODE_DIR)
       data = loadmat(matfile)
@@ -192,6 +193,15 @@ class ImageUoSDataset(Dataset):
     # normalize data points (rows) of X
     if center:
       self.X.sub_(self.X.mean(dim=0))
+    if sv_range is not None:
+      # "whitening" by removing first few svs following (Zhang, 2012)
+      starti = sv_range[0] if len(sv_range) == 2 else 0
+      stopi = sv_range[1] if len(sv_range) == 2 else sv_range[0]
+      U, s, _ = torch.svd(self.X)
+      if stopi is None or stopi <= 0:
+        stopi = min(U.shape)
+      self.X = U[:, starti:stopi] * s[starti:stopi]
+
     if normalize:
       self.X.div_(torch.norm(self.X, p=2, dim=1, keepdim=True).add(1e-8))
     self.N, self.D = self.X.shape

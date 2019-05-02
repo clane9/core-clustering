@@ -39,7 +39,8 @@ def main():
   torch.manual_seed(args.seed)
 
   # load dataset
-  dataset = dat.ImageUoSDataset(args.dataset)
+  dataset = dat.ImageUoSDataset(args.dataset, center=args.center,
+      sv_range=args.sv_range, normalize=args.normalize)
   kwargs = {'num_workers': args.num_workers}
   if use_cuda:
     kwargs['pin_memory'] = True
@@ -168,6 +169,10 @@ if __name__ == '__main__':
                       choices=['mnist', 'coil100', 'coil20', 'yaleb'])
   parser.add_argument('--center', action='store_true', default=False,
                       help='Center dataset.')
+  parser.add_argument('--sv-range', nargs=2, type=int, default=None,
+                      help='Singular vector range for whitening.')
+  parser.add_argument('--normalize', action='store_true', default=False,
+                      help='Normalize dataset.')
   # model settings
   parser.add_argument('--form', type=str, required=True,
                       help=('Model formulation (proj, mf, batch-alt-proj, '
