@@ -16,7 +16,7 @@ EPS = 1e-8
 
 def train_loop(model, data_loader, device, optimizer, out_dir=None, epochs=200,
       chkp_freq=50, stop_freq=-1, scheduler=None, eval_rank=False,
-      reset_unused=False):
+      reset_unused=False, save_data=True):
   """Train k-subspace model for series of epochs.
 
   Args:
@@ -32,6 +32,7 @@ def train_loop(model, data_loader, device, optimizer, out_dir=None, epochs=200,
     eval_rank: evaluate ranks of group models, only implemented for subspace
       models (default: False)
     reset_unused: whether to reset unused clusters (default: False)
+    save_data: whether to save conf_mats, svs, resets (default: True)
   """
   printformstr = ('(epoch {:d}/{:d}) lr={:.1e} '
       'err={:.3f},{:.3f},{:.3f} obj={:.2e},{:.2e},{:.2e} '
@@ -114,7 +115,8 @@ def train_loop(model, data_loader, device, optimizer, out_dir=None, epochs=200,
           last_reset_success + model.reset_patience < model.steps) or
           epoch == epochs)
 
-      save_chkp = (out_dir is not None and (epoch % chkp_freq == 0 or is_conv))
+      save_chkp = (out_dir is not None and
+          (epoch % chkp_freq == 0 or (is_conv and chkp_freq <= epochs)))
       if save_chkp:
         ut.save_checkpoint({
             'epoch': epoch,
@@ -149,14 +151,15 @@ def train_loop(model, data_loader, device, optimizer, out_dir=None, epochs=200,
     if out_dir is not None:
       with open('{}/metrics.npz'.format(out_dir), 'wb') as f:
         np.savez(f, metrics=metrics[:epoch, :])
-      with open('{}/conf_mats.npz'.format(out_dir), 'wb') as f:
-        np.savez(f, conf_mats=conf_mats[:epoch, :])
-      if eval_rank:
-        with open('{}/svs.npz'.format(out_dir), 'wb') as f:
-          np.savez(f, svs=svs[:epoch, :])
-      if reset_unused:
-        with open('{}/resets.npz'.format(out_dir), 'wb') as f:
-          np.savez(f, resets=resets)
+      if save_data:
+        with open('{}/conf_mats.npz'.format(out_dir), 'wb') as f:
+          np.savez(f, conf_mats=conf_mats[:epoch, :])
+        if eval_rank:
+          with open('{}/svs.npz'.format(out_dir), 'wb') as f:
+            np.savez(f, svs=svs[:epoch, :])
+        if reset_unused:
+          with open('{}/resets.npz'.format(out_dir), 'wb') as f:
+            np.savez(f, resets=resets)
     if err is not None:
       raise err
   return conf_mats, svs, resets

@@ -43,10 +43,11 @@ def train_synth_uos_cluster(args):
     if args.miss_rate > 0:
       synth_dataset = dat.SynthUoSMissOnlineDataset(args.n, args.d, args.D,
           args.N, args.affine, args.sigma, args.theta, args.miss_rate,
-          args.data_seed)
+          args.normalize, args.data_seed)
     else:
       synth_dataset = dat.SynthUoSOnlineDataset(args.n, args.d, args.D,
-          args.N, args.affine, args.sigma, args.theta, args.data_seed)
+          args.N, args.affine, args.sigma, args.theta, args.normalize,
+          args.data_seed)
     shuffle_data = False
   else:
     if args.Ng is None:
@@ -54,10 +55,11 @@ def train_synth_uos_cluster(args):
       args.N = args.Ng * args.n
     if args.miss_rate > 0:
       synth_dataset = dat.SynthUoSMissDataset(args.n, args.d, args.D, args.Ng,
-          args.affine, args.sigma, args.theta, args.miss_rate, args.data_seed)
+          args.affine, args.sigma, args.theta, args.miss_rate, args.normalize,
+          args.data_seed)
     else:
       synth_dataset = dat.SynthUoSDataset(args.n, args.d, args.D, args.Ng,
-          args.affine, args.sigma, args.theta, args.data_seed)
+          args.affine, args.sigma, args.theta, args.normalize, args.data_seed)
     shuffle_data = True
   kwargs = {'num_workers': args.num_workers}
   if use_cuda:
@@ -168,7 +170,7 @@ def train_synth_uos_cluster(args):
       raise ValueError("Invalid optimizer {}.".format(args.optim))
 
   if args.chkp_freq is None or args.chkp_freq <= 0:
-    args.chkp_freq = args.epochs
+    args.chkp_freq = args.epochs + 2
   if args.stop_freq is None or args.stop_freq <= 0:
     args.stop_freq = -1
 
@@ -178,7 +180,8 @@ def train_synth_uos_cluster(args):
 
   tr.train_loop(model, synth_data_loader, device, optimizer, args.out_dir,
       args.epochs, args.chkp_freq, args.stop_freq, scheduler=None,
-      eval_rank=args.eval_rank, reset_unused=(args.reset_metric != 'none'))
+      eval_rank=args.eval_rank, reset_unused=(args.reset_metric != 'none'),
+      save_data=(not args.no_save_data))
   return
 
 
@@ -206,6 +209,8 @@ if __name__ == '__main__':
                       '[default: None]'))
   parser.add_argument('--miss-rate', type=float, default=0.0,
                       help='Data missing rate [default: 0.0]')
+  parser.add_argument('--normalize', action='store_true',
+                      help='Project data onto sphere')
   parser.add_argument('--data-seed', type=int, default=1904,
                       help='Data random seed [default: 1904]')
   parser.add_argument('--online', action='store_true',
@@ -278,6 +283,8 @@ if __name__ == '__main__':
                       help='How often to save checkpoints [default: None]')
   parser.add_argument('--stop-freq', type=int, default=None,
                       help='How often to stop in ipdb [default: None]')
+  parser.add_argument('--no-save-data', action='store_true', default=False,
+                      help='Don\'t save extra data')
   args = parser.parse_args()
 
   train_synth_uos_cluster(args)

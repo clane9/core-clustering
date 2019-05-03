@@ -72,6 +72,8 @@ if __name__ == '__main__':
                       '[default: None]'))
   parser.add_argument('--miss-rate', type=float, default=0.0,
                       help='Data missing rate [default: 0.0]')
+  parser.add_argument('--normalize', action='store_true',
+                      help='Project data onto sphere')
   parser.add_argument('--data-seed', type=int, default=1904,
                       help='Data random seed [default: 1904]')
   parser.add_argument('--online', action='store_true',
@@ -130,6 +132,8 @@ if __name__ == '__main__':
                       help='How often to save checkpoints [default: None]')
   parser.add_argument('--stop-freq', type=int, default=None,
                       help='How often to stop in ipdb [default: None]')
+  parser.add_argument('--no-save-data', action='store_true', default=False,
+                      help='Don\'t save extra data')
   args = parser.parse_args()
 
   args = set_args(args)

@@ -1235,6 +1235,7 @@ class KSubspaceMCModel(KSubspaceMFCorruptBaseModel):
         reset_sigma, encode_max_iter, encode_tol)
 
     self.omega = None
+    self.reset_parameters()
     return
 
   def objective(self, x_omega):

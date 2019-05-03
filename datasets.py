@@ -13,7 +13,7 @@ CODE_DIR = os.path.dirname(os.path.realpath(__file__))
 class SynthUoSDataset(Dataset):
   """Synthetic union of subspaces dataset."""
   def __init__(self, n, d, D, Ng, affine=False, sigma=0., theta=None,
-        seed=None):
+        normalize=False, seed=None):
     super(SynthUoSDataset).__init__()
 
     if theta is not None:
@@ -30,6 +30,8 @@ class SynthUoSDataset(Dataset):
     self.N = n*Ng
     self.affine = affine
     self.sigma = sigma
+    self.theta = theta
+    self.normalize = normalize
     self.classes = np.arange(n)
 
     self.rng = np.random.RandomState(seed=seed)
@@ -87,6 +89,9 @@ class SynthUoSDataset(Dataset):
 
     self.X = torch.tensor(self.X, dtype=torch.float32)
     self.groups = torch.tensor(self.groups, dtype=torch.int64)
+
+    if normalize:
+      self.X.div_(torch.norm(self.X, dim=1, keepdim=True))
     return
 
   def __len__(self):
@@ -99,11 +104,11 @@ class SynthUoSDataset(Dataset):
 class SynthUoSMissDataset(SynthUoSDataset):
   """Synthetic union of subspaces dataset with missing data."""
   def __init__(self, n, d, D, Ng, affine=False, sigma=0., theta=None,
-        miss_rate=0.0, seed=None):
+        miss_rate=0.0, normalize=False, seed=None):
     if miss_rate >= 1 or miss_rate < 0:
       raise ValueError("Invalid miss_rate {}".format(miss_rate))
 
-    super().__init__(n, d, D, Ng, affine, sigma, theta, seed)
+    super().__init__(n, d, D, Ng, affine, sigma, theta, normalize, seed)
 
     # sample observed entries uniformly
     self.miss_rate = miss_rate
@@ -119,7 +124,7 @@ class SynthUoSMissDataset(SynthUoSDataset):
 class SynthUoSOnlineDataset(SynthUoSDataset):
   """Synthetic union of subspaces dataset with fresh samples."""
   def __init__(self, n, d, D, N, affine=False, sigma=0., theta=None,
-        seed=None):
+        normalize=False, seed=None):
     super().__init__(n, d, D, 10, affine, sigma, theta, seed)
     self.Us = torch.tensor(self.Us, dtype=torch.float32)
     self.N = N
@@ -146,17 +151,19 @@ class SynthUoSOnlineDataset(SynthUoSDataset):
       x += self.bs[grp, :]
     if self.sigma > 0:
       x += (self.sigma/np.sqrt(self.D))*torch.randn(self.D)
+    if self.normalize:
+      x.div_(torch.norm(x))
     return x, grp
 
 
 class SynthUoSMissOnlineDataset(SynthUoSOnlineDataset):
   """Synthetic union of subspaces dataset with fresh samples."""
   def __init__(self, n, d, D, N, affine=False, sigma=0., theta=None,
-        miss_rate=0.0, seed=None):
+        miss_rate=0.0, normalize=False, seed=None):
     if miss_rate >= 1 or miss_rate < 0:
       raise ValueError("Invalid miss_rate {}".format(miss_rate))
 
-    super().__init__(n, d, D, N, affine, sigma, theta, seed)
+    super().__init__(n, d, D, N, affine, sigma, theta, normalize, seed)
 
     self.miss_rate = miss_rate
     return
