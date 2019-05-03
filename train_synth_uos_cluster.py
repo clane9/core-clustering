@@ -42,10 +42,11 @@ def train_synth_uos_cluster(args):
           "batch_alt formulation."))
     if args.miss_rate > 0:
       synth_dataset = dat.SynthUoSMissOnlineDataset(args.n, args.d, args.D,
-          args.N, args.affine, args.sigma, args.miss_rate, args.data_seed)
+          args.N, args.affine, args.sigma, args.theta, args.miss_rate,
+          args.data_seed)
     else:
       synth_dataset = dat.SynthUoSOnlineDataset(args.n, args.d, args.D,
-          args.N, args.affine, args.sigma, args.data_seed)
+          args.N, args.affine, args.sigma, args.theta, args.data_seed)
     shuffle_data = False
   else:
     if args.Ng is None:
@@ -53,10 +54,10 @@ def train_synth_uos_cluster(args):
       args.N = args.Ng * args.n
     if args.miss_rate > 0:
       synth_dataset = dat.SynthUoSMissDataset(args.n, args.d, args.D, args.Ng,
-          args.affine, args.sigma, args.miss_rate, args.data_seed)
+          args.affine, args.sigma, args.theta, args.miss_rate, args.data_seed)
     else:
       synth_dataset = dat.SynthUoSDataset(args.n, args.d, args.D, args.Ng,
-          args.affine, args.sigma, args.data_seed)
+          args.affine, args.sigma, args.theta, args.data_seed)
     shuffle_data = True
   kwargs = {'num_workers': args.num_workers}
   if use_cuda:
@@ -200,6 +201,9 @@ if __name__ == '__main__':
                       help='Affine setting')
   parser.add_argument('--sigma', type=float, default=0.01,
                       help='Data noise sigma [default: 0.01]')
+  parser.add_argument('--theta', type=float, default=None,
+                      help=('Principal angles between subspaces '
+                      '[default: None]'))
   parser.add_argument('--miss-rate', type=float, default=0.0,
                       help='Data missing rate [default: 0.0]')
   parser.add_argument('--data-seed', type=int, default=1904,

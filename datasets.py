@@ -12,8 +12,16 @@ CODE_DIR = os.path.dirname(os.path.realpath(__file__))
 
 class SynthUoSDataset(Dataset):
   """Synthetic union of subspaces dataset."""
-  def __init__(self, n, d, D, Ng, affine=False, sigma=0., seed=None):
+  def __init__(self, n, d, D, Ng, affine=False, sigma=0., theta=None,
+        seed=None):
     super(SynthUoSDataset).__init__()
+
+    if theta is not None:
+      if theta <= 0:
+        raise ValueError("Invalid principal angle {}".format(theta))
+      if n*d > D:
+        raise ValueError("Can only specify principal angle for independent "
+            "subspaces")
 
     self.n = n  # number of subspaces
     self.d = d  # subspace dimension
@@ -26,23 +34,43 @@ class SynthUoSDataset(Dataset):
 
     self.rng = np.random.RandomState(seed=seed)
 
-    self.Us = np.zeros([D, d, n])
-    self.Vs = np.zeros([d, Ng, n])
-    self.bs = np.zeros([D, n]) if affine else None
+    self.Us = np.zeros([n, D, d])
+    self.Vs = np.zeros([n, d, Ng])
+    self.bs = np.zeros([n, D]) if affine else None
     self.X = np.zeros([self.N, D])
     self.groups = np.zeros(self.N, dtype=np.int32)
 
-    # sample data from randomnly generated (linear or affine) subspaces
+    # generate bases
+    if theta is None:
+      # bases sampled uniformly at random
+      for ii in range(n):
+        self.Us[ii, :] = np.linalg.qr(self.rng.randn(D, d))[0]
+    else:
+      # bases sampled with fixed principal angles.
+      alpha = np.sqrt(np.cos(theta))
+      beta = np.sqrt(1.0 - alpha**2)
+
+      # all bases will be a perturbation of U0
+      U0 = np.linalg.qr(self.rng.randn(D, d), mode='complete')[0]
+      U0_comp = U0[:, d:]
+      U0 = U0[:, :d]
+      # apply random rotation to U0 complement
+      Q = np.linalg.qr(self.rng.randn(D-d, D-d))[0]
+      U0_comp = np.matmul(U0_comp, Q)
+      for ii in range(n):
+        P = np.linalg.qr(self.rng.randn(d, d))[0]
+        self.Us[ii, :] = (alpha*np.matmul(U0, P) +
+            beta*U0_comp[:, ii*d:(ii+1)*d])
+
+    # sample coefficients
     for ii in range(n):
-      U, _ = np.linalg.qr(self.rng.randn(D, d))
       V = (1./np.sqrt(d))*self.rng.randn(d, Ng)
-      self.Us[:, :, ii] = U
-      self.Vs[:, :, ii] = V
-      Xi = np.matmul(U, V)
+      self.Vs[ii, :] = V
+      Xi = np.matmul(self.Us[ii, :], V)
 
       if affine:
         b = (1./np.sqrt(D))*self.rng.randn(D, 1)
-        self.bs[:, ii] = b[:, 0]
+        self.bs[ii, :] = b[:, 0]
         Xi += b
 
       self.X[ii*Ng:(ii+1)*Ng, :] = Xi.T
@@ -70,12 +98,12 @@ class SynthUoSDataset(Dataset):
 
 class SynthUoSMissDataset(SynthUoSDataset):
   """Synthetic union of subspaces dataset with missing data."""
-  def __init__(self, n, d, D, Ng, affine=False, sigma=0., miss_rate=0.0,
-        seed=None):
+  def __init__(self, n, d, D, Ng, affine=False, sigma=0., theta=None,
+        miss_rate=0.0, seed=None):
     if miss_rate >= 1 or miss_rate < 0:
       raise ValueError("Invalid miss_rate {}".format(miss_rate))
 
-    super().__init__(n, d, D, Ng, affine, sigma, seed)
+    super().__init__(n, d, D, Ng, affine, sigma, theta, seed)
 
     # sample observed entries uniformly
     self.miss_rate = miss_rate
@@ -88,33 +116,19 @@ class SynthUoSMissDataset(SynthUoSDataset):
     return
 
 
-class SynthUoSOnlineDataset(Dataset):
+class SynthUoSOnlineDataset(SynthUoSDataset):
   """Synthetic union of subspaces dataset with fresh samples."""
-  def __init__(self, n, d, D, N, affine=False, sigma=0., seed=None):
-    super(SynthUoSOnlineDataset).__init__()
+  def __init__(self, n, d, D, N, affine=False, sigma=0., theta=None,
+        seed=None):
+    super().__init__(n, d, D, 10, affine, sigma, theta, seed)
+    self.Us = torch.tensor(self.Us, dtype=torch.float32)
+    self.N = N
 
-    self.n = n  # number of subspaces
-    self.d = d  # subspace dimension
-    self.D = D  # ambient dimension
-    self.N = N  # number of points
-    self.affine = affine
-    self.sigma = sigma
-
-    self.rng = torch.Generator()
-    if seed is not None:
-      self.rng.manual_seed(seed)
-    self.seed = seed
-
-    self.classes = np.arange(n)
-    self.Us = torch.zeros((n, D, d))
-    self.bs = torch.zeros((n, D)) if affine else None
-
-    # sample data from randomnly generated (linear or affine) subspaces
-    for grp in range(n):
-      self.Us[grp, :, :], _ = torch.qr(torch.randn(D, d, generator=self.rng))
-
-      if affine:
-        self.bs[grp, :] = (1./np.sqrt(D))*torch.randn(D, generator=self.rng)
+    # parent constructor called to generate bases, but coefficients and X don't
+    # matter
+    self.Vs = None
+    self.X = None
+    self.groups = None
     return
 
   def __len__(self):
@@ -137,12 +151,12 @@ class SynthUoSOnlineDataset(Dataset):
 
 class SynthUoSMissOnlineDataset(SynthUoSOnlineDataset):
   """Synthetic union of subspaces dataset with fresh samples."""
-  def __init__(self, n, d, D, N, affine=False, sigma=0., miss_rate=0.0,
-        seed=None):
+  def __init__(self, n, d, D, N, affine=False, sigma=0., theta=None,
+        miss_rate=0.0, seed=None):
     if miss_rate >= 1 or miss_rate < 0:
       raise ValueError("Invalid miss_rate {}".format(miss_rate))
 
-    super().__init__(n, d, D, N, affine, sigma, seed)
+    super().__init__(n, d, D, N, affine, sigma, theta, seed)
 
     self.miss_rate = miss_rate
     return
