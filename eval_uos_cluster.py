@@ -18,6 +18,8 @@ import datasets as dat
 import models as mod
 import training as tr
 
+import ipdb
+
 
 def main():
   use_cuda = args.cuda and torch.cuda.is_available()
@@ -35,6 +37,7 @@ def main():
     shutil.rmtree(args.out_dir)
   os.mkdir(args.out_dir)
 
+  ipdb.set_trace()
   # determines data sampling, initialization
   torch.manual_seed(args.seed)
 
@@ -60,31 +63,20 @@ def main():
       (args.sigma_hat**2 / dataset.D))
   args.U_frosqr_out_lamb = ((args.min_size / args.model_n) *
       (1.0 / args.model_d + args.sigma_hat**2 / dataset.D))
-
-  args.U_fro_out_lamb = 0.0
-  args.U_gram_fro_out_lamb = 0.0
   args.z_lamb = 0.01
 
   # construct model
-  args.reset_metric = args.reset_metric.lower()
-  reset_metric = 'value' if args.reset_metric == 'none' else args.reset_metric
-  if args.reset_patience is None or args.reset_patience < 0:
-    args.reset_patience = (2 if batch_alt_mode else
-        int(np.ceil(dataset.N / args.batch_size)))
-  reset_warmup = 0
-  reset_obj = 'full'
   if args.form == 'batch-alt-proj':
     reg_params = {
         'U_frosqr_in': args.U_frosqr_in_lamb,
-        'U_frosqr_out': args.U_frosqr_out_lamb,
-        'U_gram_fro_out': args.U_gram_fro_out_lamb
+        'U_frosqr_out': args.U_frosqr_out_lamb
     }
     model = mod.KSubspaceBatchAltProjModel(args.model_n, args.model_d,
         dataset, args.affine, args.reps, reg_params=reg_params,
-        reset_metric=reset_metric, unused_thr=args.unused_thr,
-        reset_patience=args.reset_patience, reset_warmup=reset_warmup,
-        reset_obj=reset_obj, reset_decr_tol=args.reset_decr_tol,
-        reset_sigma=args.reset_sigma, svd_solver='randomized')
+        reset_value_thr=args.reset_value_thr,
+        reset_patience=args.reset_patience, reset_try_tol=args.reset_try_tol,
+        reset_accept_tol=args.reset_accept_tol, reset_sigma=args.reset_sigma,
+        svd_solver='randomized')
   elif args.form == 'batch-alt-mf':
     reg_params = {
         'U_frosqr_in': args.U_frosqr_in_lamb / args.z_lamb,
@@ -95,39 +87,33 @@ def main():
     }
     model = mod.KSubspaceBatchAltMFModel(args.model_n, args.model_d,
         dataset, args.affine, args.reps, reg_params=reg_params,
-        reset_metric=reset_metric, unused_thr=args.unused_thr,
-        reset_patience=args.reset_patience, reset_warmup=reset_warmup,
-        reset_obj=reset_obj, reset_decr_tol=args.reset_decr_tol,
-        reset_sigma=args.reset_sigma, svd_solver='randomized')
+        reset_value_thr=args.reset_value_thr,
+        reset_patience=args.reset_patience, reset_try_tol=args.reset_try_tol,
+        reset_accept_tol=args.reset_accept_tol, reset_sigma=args.reset_sigma,
+        svd_solver='randomized')
   elif args.form == 'mf':
     reg_params = {
         'U_frosqr_in': args.U_frosqr_in_lamb / args.z_lamb,
         'U_frosqr_out': args.U_frosqr_out_lamb / args.z_lamb,
-        'U_fro_out': args.U_fro_out_lamb,
-        'U_gram_fro_out': args.U_gram_fro_out_lamb,
         'z': (args.z_lamb if
             max(args.U_frosqr_in_lamb, args.U_frosqr_out_lamb) > 0
             else 0.0)
     }
     model = mod.KSubspaceMFModel(args.model_n, args.model_d,
         dataset.D, args.affine, args.reps, reg_params=reg_params,
-        reset_metric=reset_metric, unused_thr=args.unused_thr,
-        reset_patience=args.reset_patience, reset_warmup=reset_warmup,
-        reset_obj=reset_obj, reset_decr_tol=args.reset_decr_tol,
-        reset_sigma=args.reset_sigma)
+        reset_value_thr=args.reset_value_thr,
+        reset_patience=args.reset_patience, reset_try_tol=args.reset_try_tol,
+        reset_accept_tol=args.reset_accept_tol, reset_sigma=args.reset_sigma)
   else:
     reg_params = {
         'U_frosqr_in': args.U_frosqr_in_lamb,
-        'U_frosqr_out': args.U_frosqr_out_lamb,
-        'U_fro_out': args.U_fro_out_lamb,
-        'U_gram_fro_out': args.U_gram_fro_out_lamb
+        'U_frosqr_out': args.U_frosqr_out_lamb
     }
     model = mod.KSubspaceProjModel(args.model_n, args.model_d, dataset.D,
         args.affine, args.reps, reg_params=reg_params,
-        reset_metric=reset_metric, unused_thr=args.unused_thr,
-        reset_patience=args.reset_patience, reset_warmup=reset_warmup,
-        reset_obj=reset_obj, reset_decr_tol=args.reset_decr_tol,
-        reset_sigma=args.reset_sigma)
+        reset_value_thr=args.reset_value_thr,
+        reset_patience=args.reset_patience, reset_try_tol=args.reset_try_tol,
+        reset_accept_tol=args.reset_accept_tol, reset_sigma=args.reset_sigma)
   if args.prob_farthest_insert:
     model.prob_farthest_insert(dataset.X, nn_q=int(0.5*args.model_d))
   model = model.to(device)
@@ -156,7 +142,7 @@ def main():
 
   tr.train_loop(model, data_loader, device, optimizer, args.out_dir,
       args.epochs, args.chkp_freq, args.stop_freq, scheduler=None,
-      eval_rank=args.eval_rank, reset_unused=(args.reset_metric != 'none'))
+      eval_rank=args.eval_rank, reset_unused=args.reset_unused)
   return
 
 
@@ -202,16 +188,20 @@ if __name__ == '__main__':
                       help='Optimizer [default: SGD]')
   parser.add_argument('--init-lr', type=float, default=0.5,
                       help='Initial learning rate [default: 0.5]')
-  parser.add_argument('--reset-metric', type=str, default='value',
-                      help='Reset metric (value, size, none) [default: value]')
-  parser.add_argument('--unused-thr', type=float, default=0.1,
+  parser.add_argument('--reset-unused', action='store_true', default=False,
+                      help='Reset nearly unused clusters')
+  parser.add_argument('--reset-value-thr', type=float, default=0.2,
                       help=('Threshold for identifying unused clusters, '
-                      '[default: 0.1]'))
-  parser.add_argument('--reset-patience', type=int, default=None,
-                      help='Steps to wait between resets [default: 1 epoch]')
-  parser.add_argument('--reset-decr-tol', type=float, default=1e-4,
-                      help=('Relative objective decrease tolerance to reset '
-                      '[default: 1e-4]'))
+                      'relative to max [default: 0.2]'))
+  parser.add_argument('--reset-patience', type=int, default=2,
+                      help=('Epochs to wait without obj decrease '
+                      'before trying to reset [default: 2]'))
+  parser.add_argument('--reset-try-tol', type=float, default=0.01,
+                      help=('Objective decrease tolerance for deciding'
+                      'when to reset [default: 0.01]'))
+  parser.add_argument('--reset-accept-tol', type=float, default=1e-3,
+                      help=('Objective decrease tolerance for accepting'
+                      'a reset [default: 1e-3]'))
   parser.add_argument('--reset-sigma', type=float, default=0.05,
                       help=('Scale of perturbation to add after reset '
                       '[default: 0.05]'))

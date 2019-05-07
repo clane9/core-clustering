@@ -36,21 +36,15 @@ def train_synth_kmeans_cluster(args):
   torch.manual_seed(args.seed)
   if args.model_n is None or args.model_n <= 0:
     args.model_n = args.n
-  args.reset_metric = args.reset_metric.lower()
-  reset_metric = 'value' if args.reset_metric == 'none' else args.reset_metric
-  if args.reset_patience is None or args.reset_patience < 0:
-    args.reset_patience = 2
-  if args.reset_warmup is None or args.reset_warmup < 0:
-    args.reset_warmup = args.reset_patience
   reg_params = {
       'b_frosqr_out': args.b_frosqr_out_lamb
   }
+
   model = mod.KMeansBatchAltModel(args.model_n, synth_dataset, args.init,
-      args.reps, reg_params=reg_params, reset_metric=reset_metric,
-      unused_thr=args.unused_thr, reset_patience=args.reset_patience,
-      reset_warmup=args.reset_warmup, reset_obj=args.reset_obj,
-      reset_decr_tol=args.reset_decr_tol, reset_sigma=0.0,
-      reset_batch_size=args.reset_batch_size)
+      args.reps, reg_params=reg_params, reset_value_thr=args.reset_value_thr,
+      reset_patience=args.reset_patience, reset_try_tol=args.reset_try_tol,
+      reset_accept_tol=args.reset_accept_tol, reset_sigma=args.reset_sigma,
+      reset_batch_size=args.reset_batch_size, kpp_n_trials=args.kpp_n_trials)
   model = model.to(device)
 
   if args.chkp_freq is None or args.chkp_freq <= 0:
@@ -65,7 +59,7 @@ def train_synth_kmeans_cluster(args):
   optimizer = None
   tr.train_loop(model, synth_data_loader, device, optimizer, args.out_dir,
       args.epochs, args.chkp_freq, args.stop_freq, scheduler=None,
-      eval_rank=False, reset_unused=(args.reset_metric != 'none'))
+      eval_rank=False, reset_unused=args.reset_unused)
   return
 
 
@@ -87,7 +81,9 @@ if __name__ == '__main__':
                       help='Data random seed [default: 1904]')
   # model settings
   parser.add_argument('--init', type=str, default='random',
-                      help='Init mode (random, k-means++) [default: random]')
+                      help='Init mode (random, k-means++ [default: random]')
+  parser.add_argument('--kpp-n-trials', type=int, default=None,
+                      help='Number of k-means++ samples [default: 2 log n]')
   parser.add_argument('--reps', type=int, default=5,
                       help='Number of model replicates [default: 5]')
   parser.add_argument('--model-n', type=int, default=None,
@@ -98,20 +94,23 @@ if __name__ == '__main__':
   # training settings
   parser.add_argument('--epochs', type=int, default=50,
                       help='Number of epochs to train [default: 50]')
-  parser.add_argument('--reset-metric', type=str, default='value',
-                      help='Reset metric (value, size, none) [default: value]')
-  parser.add_argument('--reset-obj', type=str, default='full',
-                      help='Reset objective (assign, full) [default: full]')
-  parser.add_argument('--unused-thr', type=float, default=0.25,
-                      help=('Threshold for identifying reinit candidates, '
-                      'relative to observed max [default: .25]'))
-  parser.add_argument('--reset-patience', type=int, default=None,
-                      help='Steps to wait between resets [default: 2 epochs]')
-  parser.add_argument('--reset-warmup', type=int, default=None,
-                      help='Extra steps to wait at start [default: 2 epochs]')
-  parser.add_argument('--reset-decr-tol', type=float, default=1e-4,
-                      help=('Relative objective decrease tolerance to reset '
-                      '[default: 1e-4]'))
+  parser.add_argument('--reset-unused', action='store_true', default=False,
+                      help='Reset nearly unused clusters')
+  parser.add_argument('--reset-value-thr', type=float, default=0.2,
+                      help=('Threshold for identifying unused clusters, '
+                      'relative to max [default: 0.2]'))
+  parser.add_argument('--reset-patience', type=int, default=2,
+                      help=('Epochs to wait without obj decrease '
+                      'before trying to reset [default: 2]'))
+  parser.add_argument('--reset-try-tol', type=float, default=0.01,
+                      help=('Objective decrease tolerance for deciding'
+                      'when to reset [default: 0.01]'))
+  parser.add_argument('--reset-accept-tol', type=float, default=1e-3,
+                      help=('Objective decrease tolerance for accepting'
+                      'a reset [default: 1e-3]'))
+  parser.add_argument('--reset-sigma', type=float, default=0.05,
+                      help=('Scale of perturbation to add after reset '
+                      '[default: 0.05]'))
   parser.add_argument('--reset-batch-size', type=int, default=None,
                       help='Num samples for reset assign obj [default: N]')
   parser.add_argument('--cuda', action='store_true', default=False,

@@ -33,6 +33,20 @@ class AverageMeter(object):
     self.avg = self.sum / self.count
 
 
+def reset_optimizer_state(model, optimizer, reset_rids):
+  """Reset optimizer states to zero for re-initialized replicates &
+  clusters."""
+  for p in model.parameters():
+    if not p.requires_grad:
+      continue
+    state = optimizer.state[p]
+    for key, val in state.items():
+      if isinstance(val, torch.Tensor) and val.shape == p.shape:
+        # assuming all parameters have (r, k) as first dims.
+        val[reset_rids, :, :] = 0.0
+  return
+
+
 def get_learning_rate(optimizer):
   return np.median([param_group['lr']
     for param_group in optimizer.param_groups])

@@ -76,9 +76,9 @@ def train_loop(model, data_loader, device, optimizer, out_dir=None, epochs=200,
   resets = [] if reset_unused else None
 
   if not batch_alt_mode and scheduler is None:
-    min_lr = 0.5**5 * ut.get_learning_rate(optimizer)
+    min_lr = 0.5**3 * ut.get_learning_rate(optimizer)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer,
-        factor=0.5, patience=5, threshold=1e-3, min_lr=min_lr)
+        factor=0.5, patience=10, threshold=1e-3, min_lr=min_lr)
 
   # training loop
   err = None
@@ -88,8 +88,8 @@ def train_loop(model, data_loader, device, optimizer, out_dir=None, epochs=200,
     for epoch in range(1, epochs+1):
       if batch_alt_mode:
         (metrics_summary, metrics[epoch-1, :], conf_mats[epoch-1, :],
-            epoch_svs, epoch_resets) = batch_alt_step(model,
-                eval_rank, reset_unused)
+            epoch_svs, epoch_resets) = batch_alt_step(model, eval_rank,
+                reset_unused)
       else:
         (metrics_summary, metrics[epoch-1, :], conf_mats[epoch-1, :],
             epoch_svs, epoch_resets) = train_epoch(model, data_loader,
@@ -110,10 +110,11 @@ def train_loop(model, data_loader, device, optimizer, out_dir=None, epochs=200,
       cluster_error, min_obj, max_obj = [metrics_summary[ii]
           for ii in [0, 3, 5]]
 
-      last_reset_success = model.last_reset_success.max().item()
+      waiting_to_reset = (reset_unused and
+          (model.num_bad_steps <= model.reset_patience +
+          model.jitter).any().item())
       is_conv = (((model._updates == 0 if batch_alt_mode else lr <= min_lr) and
-          last_reset_success + model.reset_patience < model.steps) or
-          epoch == epochs)
+          (not waiting_to_reset)) or epoch == epochs)
 
       save_chkp = (out_dir is not None and
           (epoch % chkp_freq == 0 or (is_conv and chkp_freq <= epochs)))
@@ -147,7 +148,7 @@ def train_loop(model, data_loader, device, optimizer, out_dir=None, epochs=200,
   finally:
     if reset_unused:
       resets = (np.concatenate(resets, axis=0) if len(resets) > 0
-          else np.zeros((0, 10), dtype=object))
+          else np.zeros((0, 8), dtype=object))
     if out_dir is not None:
       with open('{}/metrics.npz'.format(out_dir), 'wb') as f:
         np.savez(f, metrics=metrics[:epoch, :])
@@ -171,7 +172,7 @@ def train_epoch(model, data_loader, optimizer, device, eval_rank=False,
   epoch_tic = time.time()
   metrics = None
   resets = []
-  conf_mats, sampsec, reset_attempts = [ut.AverageMeter() for _ in range(3)]
+  conf_mats, sampsec = [ut.AverageMeter() for _ in range(2)]
   for x, groups in data_loader:
     tic = time.time()
     x = x.to(device)
@@ -182,7 +183,6 @@ def train_epoch(model, data_loader, optimizer, device, eval_rank=False,
         batch_reg_in, batch_reg_out, x_) = model.objective(x)
     batch_obj_mean.backward()
     optimizer.step()
-    model.step()  # increment step counter
 
     # zero out near zero bases to improve numerical performance
     model.zero()
@@ -205,21 +205,11 @@ def train_epoch(model, data_loader, optimizer, device, eval_rank=False,
     conf_mats.update(batch_conf_mats, 1)
 
     if reset_unused:
-      # cols (reset_ridx, reset_cidx, reset_metric, cand_ridx, cand_cidx,
-      # reset_success, obj_decr, cand_c_mean, cand_value)
       batch_resets = model.reset_unused()
       if batch_resets.shape[0] > 0:
-        rIdx = batch_resets[:, 0].astype(np.int64)
-        cIdx = batch_resets[:, 1].astype(np.int64)
-        # zero optimizer states
-        for p in model.parameters():
-          if not p.requires_grad:
-            continue
-          state = optimizer.state[p]
-          for key, val in state.items():
-            if isinstance(val, torch.Tensor) and val.shape == p.shape:
-              # assuming all parameters have (r, k) as first dims.
-              val[rIdx, cIdx, :] = 0.0
+        reset_rids = np.unique(
+            batch_resets[batch_resets[:, 5] == 1, 0]).astype(np.int64)
+        ut.reset_optimizer_state(model, optimizer, reset_rids)
         resets.append(batch_resets)
 
     batch_time = time.time() - tic
@@ -274,12 +264,12 @@ def batch_alt_step(model, eval_rank=False, reset_unused=False):
 
   if reset_unused:
     # cols (reset_ridx, reset_cidx, reset_metric, cand_ridx, cand_cidx,
-    # reset_success, obj_decr, cand_c_mean, cand_value)
+    # reset_success, obj_decr)
     resets = model.reset_unused()
     reset_attempts = resets.shape[0]
     reset_count = int(resets[:, 5].sum())
   else:
-    resets = np.zeros((0, 9), dtype=object)
+    resets = np.zeros((0, 7), dtype=object)
     reset_count, reset_attempts = 0, 0
 
   rtime = time.time() - epoch_tic

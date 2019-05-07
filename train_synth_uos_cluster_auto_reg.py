@@ -38,12 +38,8 @@ def set_args(args):
   args.U_frosqr_out_lamb = ((args.min_size / args.n) *
       (1.0 / args.d + args.sigma_hat**2 / args.D))
 
-  args.U_fro_out_lamb = 0.0
-  args.U_gram_fro_out_lamb = 0.0
-  args.z_lamb = 0.01
-
   # other fixed args
-  args.reset_obj = 'full'
+  args.z_lamb = 0.01
   args.eval_rank = True
   return args
 
@@ -105,18 +101,20 @@ if __name__ == '__main__':
                       help='Optimizer [default: SGD]')
   parser.add_argument('--init-lr', type=float, default=0.5,
                       help='Initial learning rate [default: 0.5]')
-  parser.add_argument('--reset-metric', type=str, default='value',
-                      help='Reset metric (value, size, none) [default: value]')
-  parser.add_argument('--unused-thr', type=float, default=0.1,
+  parser.add_argument('--reset-unused', action='store_true', default=False,
+                      help='Reset nearly unused clusters')
+  parser.add_argument('--reset-value-thr', type=float, default=0.2,
                       help=('Threshold for identifying unused clusters, '
-                      '[default: 0.1]'))
-  parser.add_argument('--reset-patience', type=int, default=None,
-                      help='Steps to wait between resets [default: 1 epoch]')
-  parser.add_argument('--reset-warmup', type=int, default=0,
-                      help='Extra steps to wait at start [default: 0]')
-  parser.add_argument('--reset-decr-tol', type=float, default=1e-4,
-                      help=('Relative objective decrease tolerance to reset '
-                      '[default: 1e-4]'))
+                      'relative to max [default: 0.2]'))
+  parser.add_argument('--reset-patience', type=int, default=2,
+                      help=('Epochs to wait without obj decrease '
+                      'before trying to reset [default: 2]'))
+  parser.add_argument('--reset-try-tol', type=float, default=0.01,
+                      help=('Objective decrease tolerance for deciding'
+                      'when to reset [default: 0.01]'))
+  parser.add_argument('--reset-accept-tol', type=float, default=1e-3,
+                      help=('Objective decrease tolerance for accepting'
+                      'a reset [default: 1e-3]'))
   parser.add_argument('--reset-sigma', type=float, default=0.05,
                       help=('Scale of perturbation to add after reset '
                       '[default: 0.05]'))
