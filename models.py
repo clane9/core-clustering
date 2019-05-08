@@ -78,9 +78,11 @@ class KSubspaceBaseModel(nn.Module):
     self.register_buffer('value', torch.ones(self.r, k).mul_(np.nan))
     self.register_buffer('jitter', torch.randint(-reset_patience//2,
         reset_patience//2 + 1, (self.r,)))
-    self.obj = None
-    self.best_obj = None
-    self.num_bad_steps = None
+    self.register_buffer('obj', torch.ones(self.r).mul_(np.nan))
+    self.register_buffer('best_obj', torch.ones(self.r).mul_(np.nan))
+    self.register_buffer('num_bad_steps', torch.zeros(self.r))
+    self.register_buffer('cooldown_counter',
+        torch.ones(self.r).mul_(reset_patience//2))
     return
 
   def reset_parameters(self):
@@ -210,11 +212,12 @@ class KSubspaceBaseModel(nn.Module):
 
     # cache per replicate objective, shape (batch_size, r)
     self._batch_obj = self._batch_min_assign_obj + reg_out.data
+
     # ema objective, shape (r,)
-    if self.obj is None:
-      self.obj = obj.data.clone()
-    else:
-      self.obj.mul_(EMA_DECAY).add_(1-EMA_DECAY, obj.data)
+    nan_mask = torch.isnan(self.obj)
+    if nan_mask.sum() > 0:
+      self.obj[nan_mask] = obj.data[nan_mask]
+    self.obj.mul_(EMA_DECAY).add_(1-EMA_DECAY, obj.data)
     return obj_mean, obj.data, loss.data, reg_in.data, reg_out.data, x_.data
 
   def loss(self, x, x_):
@@ -395,11 +398,13 @@ class KSubspaceBaseModel(nn.Module):
             reset_metric[ridx, cidx].item(), cand_ridx, cand_cidx,
             int(reset_success), obj_decr])
 
-      # reset patience counter and jitter
+      # reset patience counter and objectives after successful reset
       if rep_reset_successes > 0:
         self.num_bad_steps[ridx] = 0
-      self.jitter[ridx].random_(-self.reset_patience//2,
-          self.reset_patience//2 + 1)
+        self.cooldown_counter[ridx] = self.reset_patience // 2
+        self.jitter[ridx].random_(-self.reset_patience//2,
+            self.reset_patience//2 + 1)
+        self.obj[ridx] = self.best_obj[ridx] = np.nan
 
     if len(resets) > 0:
       resets = np.array(resets, dtype=object)
@@ -424,14 +429,19 @@ class KSubspaceBaseModel(nn.Module):
 
   def _reset_obj_criterion(self):
     """Identify replicates to reset based on relative objective decrease."""
-    if self.best_obj is None:
-      self.best_obj = self.obj.clone()
-      self.num_bad_steps = torch.zeros_like(self.best_obj)
-    else:
-      is_better = self.obj < (1.0 - self.reset_try_tol)*self.best_obj
-      self.best_obj[is_better] = self.obj[is_better]
-      self.num_bad_steps[is_better] = 0.0
-      self.num_bad_steps[is_better == 0] += 1.0
+    nan_mask = torch.isnan(self.best_obj)
+    if nan_mask.sum() > 0:
+      self.best_obj[nan_mask] = self.obj[nan_mask]
+
+    cooldown_mask = self.cooldown_counter > 0
+    if cooldown_mask.sum() > 0:
+      self.cooldown_counter[cooldown_mask] -= 1.0
+
+    better_or_cooldown = torch.max(cooldown_mask,
+        (self.obj < (1.0 - self.reset_try_tol)*self.best_obj))
+    self.best_obj[better_or_cooldown] = self.obj[better_or_cooldown]
+    self.num_bad_steps[better_or_cooldown] = 0.0
+    self.num_bad_steps[better_or_cooldown == 0] += 1.0
 
     reset_mask = self.num_bad_steps > (self.reset_patience + self.jitter)
     return reset_mask
@@ -703,6 +713,7 @@ class KSubspaceBatchAltBaseModel(KSubspaceBaseModel):
       x_: reconstruction, shape (r, k, batch_size, D)
     """
     ret_vals = super().objective(self.X)
+    # objective is exact for batch algorithm, override ema.
     self.obj = ret_vals[1]
     return ret_vals
 

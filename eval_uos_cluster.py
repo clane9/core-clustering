@@ -18,8 +18,6 @@ import datasets as dat
 import models as mod
 import training as tr
 
-import ipdb
-
 
 def main():
   use_cuda = args.cuda and torch.cuda.is_available()
@@ -37,7 +35,6 @@ def main():
     shutil.rmtree(args.out_dir)
   os.mkdir(args.out_dir)
 
-  ipdb.set_trace()
   # determines data sampling, initialization
   torch.manual_seed(args.seed)
 
@@ -115,7 +112,7 @@ def main():
         reset_patience=args.reset_patience, reset_try_tol=args.reset_try_tol,
         reset_accept_tol=args.reset_accept_tol, reset_sigma=args.reset_sigma)
   if args.prob_farthest_insert:
-    model.prob_farthest_insert(dataset.X, nn_q=int(0.5*args.model_d))
+    model.prob_farthest_insert(dataset.X, nn_q=5)
   model = model.to(device)
 
   # optimizer

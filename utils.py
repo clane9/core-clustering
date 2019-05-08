@@ -33,9 +33,16 @@ class AverageMeter(object):
     self.avg = self.sum / self.count
 
 
-def reset_optimizer_state(model, optimizer, reset_rids):
+def reset_optimizer_state(model, optimizer, reset_ids, copy=False):
   """Reset optimizer states to zero for re-initialized replicates &
-  clusters."""
+  clusters. Or, if copy=True, copy states from duplicated clusters."""
+  if copy:
+    # copy optimizer state from duplicated cluster
+    rIdx, cIdx = reset_ids[:, 0], reset_ids[:, 1]
+    cand_rIdx, cand_cIdx = reset_ids[:, 2], reset_ids[:, 3]
+  else:
+    rIdx = np.unique(reset_ids[:, 0])
+
   for p in model.parameters():
     if not p.requires_grad:
       continue
@@ -43,7 +50,10 @@ def reset_optimizer_state(model, optimizer, reset_rids):
     for key, val in state.items():
       if isinstance(val, torch.Tensor) and val.shape == p.shape:
         # assuming all parameters have (r, k) as first dims.
-        val[reset_rids, :, :] = 0.0
+        if copy:
+          val[rIdx, cIdx, :] = val[cand_rIdx, cand_cIdx, :]
+        else:
+          val[rIdx, :] = 0.0
   return
 
 

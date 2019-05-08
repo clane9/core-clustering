@@ -76,7 +76,7 @@ def train_loop(model, data_loader, device, optimizer, out_dir=None, epochs=200,
   resets = [] if reset_unused else None
 
   if not batch_alt_mode and scheduler is None:
-    min_lr = 0.5**3 * ut.get_learning_rate(optimizer)
+    min_lr = max(EPS, 0.5**10 * ut.get_learning_rate(optimizer))
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer,
         factor=0.5, patience=10, threshold=1e-3, min_lr=min_lr)
 
@@ -207,9 +207,10 @@ def train_epoch(model, data_loader, optimizer, device, eval_rank=False,
     if reset_unused:
       batch_resets = model.reset_unused()
       if batch_resets.shape[0] > 0:
-        reset_rids = np.unique(
-            batch_resets[batch_resets[:, 5] == 1, 0]).astype(np.int64)
-        ut.reset_optimizer_state(model, optimizer, reset_rids)
+        # ridx, cidx, cand_ridx, cand_cidx
+        reset_ids = batch_resets[batch_resets[:, 5] == 1, :][:,
+            [0, 1, 3, 4]].astype(np.int64)
+        ut.reset_optimizer_state(model, optimizer, reset_ids)
         resets.append(batch_resets)
 
     batch_time = time.time() - tic
