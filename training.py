@@ -6,7 +6,7 @@ import time
 import ipdb
 import numpy as np
 import torch
-from torch import optim
+from torch.optim.lr_scheduler import ReduceLROnPlateau
 
 import utils as ut
 from models import KSubspaceBatchAltBaseModel
@@ -76,9 +76,10 @@ def train_loop(model, data_loader, device, optimizer, out_dir=None, epochs=200,
   resets = [] if reset_unused else None
 
   if not batch_alt_mode and scheduler is None:
-    min_lr = max(EPS, 0.5**10 * ut.get_learning_rate(optimizer))
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer,
-        factor=0.5, patience=10, threshold=1e-3, min_lr=min_lr)
+    max_lr = ut.get_learning_rate(optimizer)
+    min_lr = max(EPS, 0.5**10 * max_lr)
+    scheduler = ReduceLROnPlateau(optimizer, factor=0.5, patience=10,
+        threshold=1e-3, min_lr=min_lr)
 
   # training loop
   err = None
@@ -206,11 +207,13 @@ def train_epoch(model, data_loader, optimizer, device, eval_rank=False,
 
     if reset_unused:
       batch_resets = model.reset_unused()
-      if batch_resets.shape[0] > 0:
+      success_mask = batch_resets[:, 5] == 1
+      if success_mask.sum() > 0:
         # ridx, cidx, cand_ridx, cand_cidx
-        reset_ids = batch_resets[batch_resets[:, 5] == 1, :][:,
+        reset_ids = batch_resets[success_mask, :][:,
             [0, 1, 3, 4]].astype(np.int64)
-        ut.reset_optimizer_state(model, optimizer, reset_ids)
+        ut.reset_optimizer_state(model, optimizer, reset_ids, copy=True)
+      if batch_resets.shape[0] > 0:
         resets.append(batch_resets)
 
     batch_time = time.time() - tic
@@ -233,8 +236,10 @@ def train_epoch(model, data_loader, optimizer, device, eval_rank=False,
     rank_stats, svs = [], None
 
   if reset_unused:
+    # cols (reset_ridx, reset_cidx, reset_metric, cand_ridx, cand_cidx,
+    # reset_success, obj_decr)
     resets = (np.concatenate(resets) if len(resets) > 0
-        else np.zeros((0, 9), dtype=object))
+        else np.zeros((0, 7), dtype=object))
     reset_attempts = resets.shape[0]
     reset_count = int(resets[:, 5].sum())
   else:

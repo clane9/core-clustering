@@ -8,7 +8,7 @@ import torch.nn as nn
 import utils as ut
 
 EPS = 1e-8
-EMA_DECAY = 0.9
+EMA_DECAY = 0.99
 
 
 class KSubspaceBaseModel(nn.Module):
@@ -18,7 +18,7 @@ class KSubspaceBaseModel(nn.Module):
 
   def __init__(self, k, d, D, affine=False, replicates=5, reg_params={},
         reset_value_thr=0.2, reset_patience=100, reset_try_tol=0.01,
-        reset_accept_tol=1e-4, reset_sigma=0.05, reset_batch_size=None):
+        reset_accept_tol=1e-4, reset_sigma=0.05, reset_cache_size=None):
 
     if replicates < 1:
       raise ValueError("Invalid replicates parameter {}".format(replicates))
@@ -42,9 +42,6 @@ class KSubspaceBaseModel(nn.Module):
     if reset_sigma < 0:
       raise ValueError("Invalid reset_sigma parameter {}".format(
           reset_sigma))
-    if reset_batch_size is not None and reset_batch_size <= 0:
-      raise ValueError("Invalid reset_batch_size parameter {}".format(
-          reset_batch_size))
 
     super().__init__()
     self.k = k  # number of groups
@@ -60,7 +57,9 @@ class KSubspaceBaseModel(nn.Module):
     self.reset_accept_tol = (float('-inf') if reset_accept_tol is None
         else reset_accept_tol)
     self.reset_sigma = reset_sigma
-    self.reset_batch_size = reset_batch_size
+    if reset_cache_size is None or reset_cache_size <= 0:
+      reset_cache_size = 100 * int(np.ceil(4*k*np.log(k) / 100))
+    self.reset_cache_size = reset_cache_size
 
     # group assignment, ultimate shape (batch_size, r, k)
     self.c = None
@@ -76,13 +75,16 @@ class KSubspaceBaseModel(nn.Module):
 
     self.register_buffer('c_mean', torch.ones(self.r, k).mul_(np.nan))
     self.register_buffer('value', torch.ones(self.r, k).mul_(np.nan))
-    self.register_buffer('jitter', torch.randint(-reset_patience//2,
-        reset_patience//2 + 1, (self.r,)))
     self.register_buffer('obj', torch.ones(self.r).mul_(np.nan))
     self.register_buffer('best_obj', torch.ones(self.r).mul_(np.nan))
+    self.register_buffer('jitter', torch.randint(-reset_patience//2,
+        reset_patience//2 + 1, (self.r,), dtype=torch.float32))
     self.register_buffer('num_bad_steps', torch.zeros(self.r))
     self.register_buffer('cooldown_counter',
         torch.ones(self.r).mul_(reset_patience//2))
+    self.register_buffer('cache_assign_obj',
+        torch.zeros(reset_cache_size, self.r, k))
+    self.cache_assign_obj_head = 0
     return
 
   def reset_parameters(self):
@@ -210,13 +212,9 @@ class KSubspaceBaseModel(nn.Module):
     obj = loss + reg_in + reg_out
     obj_mean = obj.mean()
 
-    # cache per replicate objective, shape (batch_size, r)
-    self._batch_obj = self._batch_min_assign_obj + reg_out.data
-
     # ema objective, shape (r,)
     nan_mask = torch.isnan(self.obj)
-    if nan_mask.sum() > 0:
-      self.obj[nan_mask] = obj.data[nan_mask]
+    self.obj[nan_mask] = obj.data[nan_mask]
     self.obj.mul_(EMA_DECAY).add_(1-EMA_DECAY, obj.data)
     return obj_mean, obj.data, loss.data, reg_in.data, reg_out.data, x_.data
 
@@ -249,8 +247,6 @@ class KSubspaceBaseModel(nn.Module):
     self.groups = top2idx[:, :, 0]
     self.c.scatter_(2, self.groups.unsqueeze(2), 1)
 
-    self._batch_assign_obj = assign_obj
-    self._batch_min_assign_obj = top2obj[:, :, 0]
     self._batch_c_mean = torch.mean(self.c, dim=0)
     self._batch_value = torch.mean(self.c *
         (top2obj[:, :, [1]] - top2obj[:, :, [0]]), dim=0)
@@ -264,6 +260,26 @@ class KSubspaceBaseModel(nn.Module):
     self.value.mul_(EMA_DECAY).add_(1-EMA_DECAY, self._batch_value)
 
     self.groups = self.groups.cpu()
+    self._update_assign_obj_cache(assign_obj, top2obj[:, :, 0])
+    return
+
+  def _update_assign_obj_cache(self, assign_obj, min_assign_obj):
+    """Add batch assign obj to a recent cache. Used when resetting unused
+    clusters."""
+    batch_size = assign_obj.shape[0]
+    if self.reset_cache_size < batch_size:
+      Idx = torch.randperm(batch_size)[:self.reset_cache_size]
+      self.cache_assign_obj.copy_(assign_obj[Idx, :])
+      self.cache_assign_obj_head = 0
+    elif self.reset_cache_size == batch_size:
+      self.cache_assign_obj.copy_(assign_obj)
+      self.cache_assign_obj_head = 0
+    else:
+      Idx = (torch.arange(self.cache_assign_obj_head,
+          self.cache_assign_obj_head + batch_size) % self.reset_cache_size)
+      self.cache_assign_obj[Idx, :] = assign_obj
+      self.cache_assign_obj_head = ((Idx[-1] + 1) %
+          self.reset_cache_size).item()
     return
 
   def eval_shrink(self, x, x_):
@@ -338,18 +354,15 @@ class KSubspaceBaseModel(nn.Module):
 
     # allocate alternate objectives
     if reset_rids.shape[0] > 0:
-      batch_size = self._batch_obj.shape[0]
-      if self.reset_batch_size is not None:
-        reset_batch_size = min(self.reset_batch_size, batch_size)
-      else:
-        reset_batch_size = batch_size
-
-      self._alt_assign_obj = torch.zeros((reset_batch_size,
-          (self.r-1)*self.k, 2), dtype=self._batch_obj.dtype,
-          device=self._batch_obj.device)
-      if reset_batch_size == batch_size:
-        self._reset_assign_obj = self._batch_assign_obj.clone()
-        self._reset_obj = self._batch_obj.mean(dim=0)
+      # possible but unlikely that elements of the cache will be empty
+      cache_min_assign_obj = self.cache_assign_obj.min(dim=2)[0]
+      real_cache_size = torch.sum(
+          torch.any(cache_min_assign_obj != 0, dim=1)).float()
+      cache_obj = (cache_min_assign_obj.sum(dim=0) /
+          real_cache_size + self._batch_reg_out.sum(dim=1))
+      self._alt_assign_obj = torch.zeros((self.reset_cache_size,
+          (self.r-1)*self.k, 2), dtype=self.cache_assign_obj.dtype,
+          device=self.cache_assign_obj.device)
 
     resets = []
     for ridx in reset_rids:
@@ -358,23 +371,17 @@ class KSubspaceBaseModel(nn.Module):
       rep_reset_cids = rep_reset_cids[
           torch.sort(reset_metric[ridx, rep_reset_cids])[1]]
 
-      # subset batch by "probabilistic farthest selection"
-      if reset_batch_size < batch_size:
-        Idx = torch.multinomial(self._batch_obj[:, ridx],
-            reset_batch_size).view(-1)
-        self._reset_assign_obj = self._batch_assign_obj[Idx, :].clone()
-        self._reset_obj = self._batch_obj[Idx, :].mean(dim=0)
-
       # find best replacement candidates and substitute if decrease tol
       # satisfied
       rep_reset_successes = 0
       for cidx in rep_reset_cids:
         cand_ridx, cand_cidx, cand_obj = self._reset_cluster(ridx, cidx)
-        old_obj = self._reset_obj[ridx].item()
+        old_obj = cache_obj[ridx].item()
         obj_decr = 1.0 - cand_obj / old_obj
 
         reset_success = obj_decr > self.reset_accept_tol
         if reset_success:
+          rep_reset_successes += 1
           # reset parameters
           self.Us.data[ridx, cidx, :] = self.Us.data[cand_ridx, cand_cidx, :]
           if self.affine:
@@ -382,24 +389,20 @@ class KSubspaceBaseModel(nn.Module):
                 cand_ridx, cand_cidx, :]
 
           # reset batch metrics (matters if there are multiple resets to do)
-          self._reset_assign_obj[:, ridx, cidx] = self._reset_assign_obj[
+          self.cache_assign_obj[:, ridx, cidx] = self.cache_assign_obj[
               :, cand_ridx, cand_cidx]
-          self._reset_obj[ridx] = cand_obj
+          cache_obj[ridx] = cand_obj
           self._batch_reg_out[ridx, cidx] = self._batch_reg_out[
               cand_ridx, cand_cidx]
-
-          # reset size, value
-          self.c_mean[ridx, :] = np.nan
-          self.value[ridx, :] = np.nan
-
-          rep_reset_successes += 1
 
         resets.append([ridx.item(), cidx.item(),
             reset_metric[ridx, cidx].item(), cand_ridx, cand_cidx,
             int(reset_success), obj_decr])
 
-      # reset patience counter and objectives after successful reset
+      # reset some state after successful reset
       if rep_reset_successes > 0:
+        self.c_mean[ridx, :] = np.nan
+        self.value[ridx, :] = np.nan
         self.num_bad_steps[ridx] = 0
         self.cooldown_counter[ridx] = self.reset_patience // 2
         self.jitter[ridx].random_(-self.reset_patience//2,
@@ -430,12 +433,10 @@ class KSubspaceBaseModel(nn.Module):
   def _reset_obj_criterion(self):
     """Identify replicates to reset based on relative objective decrease."""
     nan_mask = torch.isnan(self.best_obj)
-    if nan_mask.sum() > 0:
-      self.best_obj[nan_mask] = self.obj[nan_mask]
+    self.best_obj[nan_mask] = self.obj[nan_mask]
 
     cooldown_mask = self.cooldown_counter > 0
-    if cooldown_mask.sum() > 0:
-      self.cooldown_counter[cooldown_mask] -= 1.0
+    self.cooldown_counter[cooldown_mask] -= 1.0
 
     better_or_cooldown = torch.max(cooldown_mask,
         (self.obj < (1.0 - self.reset_try_tol)*self.best_obj))
@@ -463,7 +464,7 @@ class KSubspaceBaseModel(nn.Module):
 
     # extract indices for reset candidates
     cand_mask = torch.ones(self.r, self.k, dtype=torch.uint8,
-        device=self._batch_obj.device)
+        device=self.cache_assign_obj.device)
     cand_mask[ridx, :] = 0
     cand_Idx = cand_mask.nonzero()
 
@@ -471,8 +472,8 @@ class KSubspaceBaseModel(nn.Module):
     # (batch_size, (r-1)*k, 2)
     cidx_mask = torch.arange(self.k) != cidx.item()
     self._alt_assign_obj[:, :, 0] = torch.unsqueeze(torch.min(
-        self._reset_assign_obj[:, ridx, cidx_mask], dim=1)[0], 1)
-    self._alt_assign_obj[:, :, 1] = self._reset_assign_obj[:,
+        self.cache_assign_obj[:, ridx, cidx_mask], dim=1)[0], 1)
+    self._alt_assign_obj[:, :, 1] = self.cache_assign_obj[:,
         cand_Idx[:, 0], cand_Idx[:, 1]]
 
     # find new objectives for each alternative
@@ -515,11 +516,11 @@ class KSubspaceMFModel(KSubspaceBaseModel):
 
   def __init__(self, k, d, D, affine=False, replicates=5, reg_params={},
         reset_value_thr=0.2, reset_patience=100, reset_try_tol=0.01,
-        reset_accept_tol=1e-4, reset_sigma=0.05, reset_batch_size=None):
+        reset_accept_tol=1e-4, reset_sigma=0.05, reset_cache_size=None):
 
     super().__init__(k, d, D, affine, replicates, reg_params, reset_value_thr,
         reset_patience, reset_try_tol, reset_accept_tol, reset_sigma,
-        reset_batch_size)
+        reset_cache_size)
 
     self.reset_parameters()
     return
@@ -613,11 +614,11 @@ class KSubspaceProjModel(KSubspaceBaseModel):
 
   def __init__(self, k, d, D, affine=False, replicates=5, reg_params={},
         reset_value_thr=0.2, reset_patience=100, reset_try_tol=0.01,
-        reset_accept_tol=1e-4, reset_sigma=0.05, reset_batch_size=None):
+        reset_accept_tol=1e-4, reset_sigma=0.05, reset_cache_size=None):
 
     super().__init__(k, d, D, affine, replicates, reg_params, reset_value_thr,
         reset_patience, reset_try_tol, reset_accept_tol, reset_sigma,
-        reset_batch_size)
+        reset_cache_size)
 
     self.reset_parameters()
     return
@@ -679,7 +680,7 @@ class KSubspaceBatchAltBaseModel(KSubspaceBaseModel):
 
   def __init__(self, k, d, dataset, affine=False, replicates=5, reg_params={},
         reset_value_thr=0.2, reset_patience=2, reset_try_tol=0.01,
-        reset_accept_tol=1e-4, reset_sigma=0.05, reset_batch_size=None,
+        reset_accept_tol=1e-4, reset_sigma=0.05, reset_cache_size=None,
         svd_solver='randomized'):
 
     if svd_solver not in ('randomized', 'svds', 'svd'):
@@ -689,7 +690,7 @@ class KSubspaceBatchAltBaseModel(KSubspaceBaseModel):
     D = dataset.X.shape[1]
     super().__init__(k, d, D, affine, replicates, reg_params, reset_value_thr,
         reset_patience, reset_try_tol, reset_accept_tol, reset_sigma,
-        reset_batch_size)
+        reset_cache_size)
 
     self.dataset = dataset
     self.register_buffer('X', dataset.X)
@@ -729,8 +730,6 @@ class KSubspaceBatchAltBaseModel(KSubspaceBaseModel):
     self.groups = top2idx[:, :, 0]
     self.c.zero_().scatter_(2, self.groups.unsqueeze(2), 1)
 
-    self._batch_assign_obj = assign_obj
-    self._batch_min_assign_obj = top2obj[:, :, 0]
     self.c_mean = self._batch_c_mean = self.c.mean(dim=0)
     self.value = self._batch_value = torch.mean(self.c *
         (top2obj[:, :, [1]] - top2obj[:, :, [0]]), dim=0)
@@ -738,6 +737,7 @@ class KSubspaceBatchAltBaseModel(KSubspaceBaseModel):
     self.groups = self.groups.cpu()
     self._updates = ((self.groups != groups_prev).sum()
         if groups_prev is not None else self.N)
+    self._update_assign_obj_cache(assign_obj, top2obj[:, :, 0])
     return
 
   def eval_shrink(self, x_):
@@ -764,12 +764,12 @@ class KSubspaceBatchAltProjModel(KSubspaceBatchAltBaseModel,
 
   def __init__(self, k, d, dataset, affine=False, replicates=5, reg_params={},
         reset_value_thr=0.2, reset_patience=2, reset_try_tol=0.01,
-        reset_accept_tol=1e-4, reset_sigma=0.05, reset_batch_size=None,
+        reset_accept_tol=1e-4, reset_sigma=0.05, reset_cache_size=None,
         svd_solver='randomized'):
 
     super().__init__(k, d, dataset, affine, replicates, reg_params,
         reset_value_thr, reset_patience, reset_try_tol, reset_accept_tol,
-        reset_sigma, reset_batch_size, svd_solver)
+        reset_sigma, reset_cache_size, svd_solver)
 
     # must be zero, not supported
     self.reg_params['U_fro_out'] = 0.0
@@ -809,12 +809,12 @@ class KSubspaceBatchAltMFModel(KSubspaceBatchAltBaseModel, KSubspaceMFModel):
 
   def __init__(self, k, d, dataset, affine=False, replicates=5, reg_params={},
         reset_value_thr=0.2, reset_patience=2, reset_try_tol=0.01,
-        reset_accept_tol=1e-4, reset_sigma=0.05, reset_batch_size=None,
+        reset_accept_tol=1e-4, reset_sigma=0.05, reset_cache_size=None,
         svd_solver='randomized'):
 
     super().__init__(k, d, dataset, affine, replicates, reg_params,
         reset_value_thr, reset_patience, reset_try_tol, reset_accept_tol,
-        reset_sigma, reset_batch_size, svd_solver)
+        reset_sigma, reset_cache_size, svd_solver)
 
     # must be zero, not supported
     self.reg_params['U_fro_out'] = 0.0
@@ -905,7 +905,7 @@ class KMeansBatchAltModel(KSubspaceBatchAltBaseModel):
 
   def __init__(self, k, dataset, init='random', replicates=5, reg_params={},
         reset_value_thr=0.2, reset_patience=2, reset_try_tol=0.01,
-        reset_accept_tol=1e-4, reset_sigma=0.05, reset_batch_size=None,
+        reset_accept_tol=1e-4, reset_sigma=0.05, reset_cache_size=None,
         kpp_n_trials=None):
 
     if init not in {'k-means++', 'random'}:
@@ -916,7 +916,7 @@ class KMeansBatchAltModel(KSubspaceBatchAltBaseModel):
 
     super().__init__(k, d, dataset, affine, replicates, reg_params,
         reset_value_thr, reset_patience, reset_try_tol, reset_accept_tol,
-        reset_sigma, reset_batch_size)
+        reset_sigma, reset_cache_size)
 
     self.init = init
     # Number of candidate means to test. Will add the one that reduces the loss
@@ -1063,7 +1063,7 @@ class KSubspaceMFCorruptBaseModel(KSubspaceBaseModel):
 
   def __init__(self, k, d, D, affine=False, replicates=5, reg_params={},
         reset_value_thr=0.2, reset_patience=100, reset_try_tol=0.01,
-        reset_accept_tol=1e-4, reset_sigma=0.05, reset_batch_size=None,
+        reset_accept_tol=1e-4, reset_sigma=0.05, reset_cache_size=None,
         encode_max_iter=20, encode_tol=1e-3):
 
     if encode_max_iter <= 0:
@@ -1072,7 +1072,7 @@ class KSubspaceMFCorruptBaseModel(KSubspaceBaseModel):
 
     super().__init__(k, d, D, affine, replicates, reg_params, reset_value_thr,
         reset_patience, reset_try_tol, reset_accept_tol, reset_sigma,
-        reset_batch_size)
+        reset_cache_size)
 
     # when e reg parameter is set to zero we disable the corruption term,
     # although strictly speaking it should give the trivial solution e = full
@@ -1245,12 +1245,12 @@ class KSubspaceMCModel(KSubspaceMFCorruptBaseModel):
 
   def __init__(self, k, d, D, affine=False, replicates=5, reg_params={},
         reset_value_thr=0.2, reset_patience=100, reset_try_tol=0.01,
-        reset_accept_tol=1e-4, reset_sigma=0.05, reset_batch_size=None,
+        reset_accept_tol=1e-4, reset_sigma=0.05, reset_cache_size=None,
         encode_max_iter=20, encode_tol=1e-3):
 
     super().__init__(k, d, D, affine, replicates, reg_params, reset_value_thr,
         reset_patience, reset_try_tol, reset_accept_tol, reset_sigma,
-        reset_batch_size, encode_max_iter, encode_tol)
+        reset_cache_size, encode_max_iter, encode_tol)
 
     self.omega = None
     self.reset_parameters()
