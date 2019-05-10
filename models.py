@@ -644,7 +644,8 @@ class KSubspaceMFModel(KSubspaceBaseModel):
       lamb = ((self.reg_params['U_frosqr_in']/batch_size) *
           batch_cluster_sizes + self.reg_params['U_frosqr_out'])
       # (r, k, d, d)
-      Id = torch.eye(self.d).mul(lamb.view(self.r, self.k, 1, 1))
+      Id = torch.eye(self.d, device=self.z.device).mul(
+          lamb.view(self.r, self.k, 1, 1))
       Hess.add_(Id)
 
       # (r, k)

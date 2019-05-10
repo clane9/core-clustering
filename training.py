@@ -212,7 +212,7 @@ def train_epoch(model, data_loader, optimizer, device, eval_rank=False,
         # ridx, cidx, cand_ridx, cand_cidx
         reset_ids = batch_resets[success_mask, :][:,
             [0, 1, 2, 3]].astype(np.int64)
-        ut.reset_optimizer_state(model, optimizer, reset_ids, copy=True)
+        ut.reset_optimizer_state(model, optimizer, reset_ids, copy=False)
       if batch_resets.shape[0] > 0:
         resets.append(batch_resets)
 
