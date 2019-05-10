@@ -82,7 +82,6 @@ def train_synth_uos_cluster(args):
     }
     model = mod.KSubspaceBatchAltProjModel(args.model_n, args.model_d,
         synth_dataset, args.affine, args.reps, reg_params=reg_params,
-        reset_value_thr=args.reset_value_thr,
         reset_patience=args.reset_patience, reset_try_tol=args.reset_try_tol,
         reset_accept_tol=args.reset_accept_tol, reset_sigma=args.reset_sigma,
         svd_solver='randomized')
@@ -96,7 +95,6 @@ def train_synth_uos_cluster(args):
     }
     model = mod.KSubspaceBatchAltMFModel(args.model_n, args.model_d,
         synth_dataset, args.affine, args.reps, reg_params=reg_params,
-        reset_value_thr=args.reset_value_thr,
         reset_patience=args.reset_patience, reset_try_tol=args.reset_try_tol,
         reset_accept_tol=args.reset_accept_tol, reset_sigma=args.reset_sigma,
         svd_solver='randomized')
@@ -112,7 +110,6 @@ def train_synth_uos_cluster(args):
       }
       model = mod.KSubspaceMCModel(args.model_n, args.model_d, args.D,
           args.affine, args.reps, reg_params=reg_params,
-          reset_value_thr=args.reset_value_thr,
           reset_patience=args.reset_patience, reset_try_tol=args.reset_try_tol,
           reset_accept_tol=args.reset_accept_tol, reset_sigma=args.reset_sigma)
     else:
@@ -125,7 +122,6 @@ def train_synth_uos_cluster(args):
       }
       model = mod.KSubspaceMFModel(args.model_n, args.model_d,
           args.D, args.affine, args.reps, reg_params=reg_params,
-          reset_value_thr=args.reset_value_thr,
           reset_patience=args.reset_patience, reset_try_tol=args.reset_try_tol,
           reset_accept_tol=args.reset_accept_tol, reset_sigma=args.reset_sigma)
   else:
@@ -135,7 +131,6 @@ def train_synth_uos_cluster(args):
     }
     model = mod.KSubspaceProjModel(args.model_n, args.model_d, args.D,
         args.affine, args.reps, reg_params=reg_params,
-        reset_value_thr=args.reset_value_thr,
         reset_patience=args.reset_patience, reset_try_tol=args.reset_try_tol,
         reset_accept_tol=args.reset_accept_tol, reset_sigma=args.reset_sigma)
   if args.prob_farthest_insert:
@@ -234,9 +229,6 @@ if __name__ == '__main__':
                       help='Initial learning rate [default: 0.5]')
   parser.add_argument('--reset-unused', action='store_true', default=False,
                       help='Reset nearly unused clusters')
-  parser.add_argument('--reset-value-thr', type=float, default=0.2,
-                      help=('Threshold for identifying unused clusters, '
-                      'relative to max [default: 0.2]'))
   parser.add_argument('--reset-patience', type=int, default=2,
                       help=('Epochs to wait without obj decrease '
                       'before trying to reset [default: 2]'))

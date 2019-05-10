@@ -40,7 +40,7 @@ def train_loop(model, data_loader, device, optimizer, out_dir=None, epochs=200,
       'reg.out={:.1e},{:.1e},{:.1e} |x_|={:.1e},{:.1e},{:.1e} ')
   if eval_rank:
     printformstr += 'rank={:.0f},{:.0f},{:.0f} '
-  printformstr += 'resets={:d}/{:d} samp/s={:.0f} rtime={:.2f}'
+  printformstr += 'resets={:d} samp/s={:.0f} rtime={:.2f}'
 
   if out_dir is not None:
     logheader = ('Epoch,LR,' + ','.join(['{}.{}'.format(met, meas)
@@ -48,7 +48,7 @@ def train_loop(model, data_loader, device, optimizer, out_dir=None, epochs=200,
         for meas in ['min', 'med', 'max']]) + ',')
     if eval_rank:
       logheader += 'Rank.min,Rank.med,Rank.max,'
-    logheader += 'Resets,Reset.attempts,Samp.s,RT'
+    logheader += 'Resets,Samp.s,RT'
 
     logformstr = ('{:d},{:.9e},{:.9f},{:.9f},{:.9f},'
         '{:.9e},{:.9e},{:.9e},{:.9e},{:.9e},{:.9e},'
@@ -56,7 +56,7 @@ def train_loop(model, data_loader, device, optimizer, out_dir=None, epochs=200,
         '{:.9e},{:.9e},{:.9e},')
     if eval_rank:
       logformstr += '{:.0f},{:.9f},{:.0f},'
-    logformstr += '{:d},{:d},{:.0f},{:.9f}'
+    logformstr += '{:d},{:.0f},{:.9f}'
 
     val_logf = '{}/val_log.csv'.format(out_dir)
     with open(val_logf, 'w') as f:
@@ -149,7 +149,7 @@ def train_loop(model, data_loader, device, optimizer, out_dir=None, epochs=200,
   finally:
     if reset_unused:
       resets = (np.concatenate(resets, axis=0) if len(resets) > 0
-          else np.zeros((0, 8), dtype=object))
+          else np.zeros((0, 7), dtype=object))
     if out_dir is not None:
       with open('{}/metrics.npz'.format(out_dir), 'wb') as f:
         np.savez(f, metrics=metrics[:epoch, :])
@@ -207,11 +207,11 @@ def train_epoch(model, data_loader, optimizer, device, eval_rank=False,
 
     if reset_unused:
       batch_resets = model.reset_unused()
-      success_mask = batch_resets[:, 5] == 1
+      success_mask = batch_resets[:, 4] == 1
       if success_mask.sum() > 0:
         # ridx, cidx, cand_ridx, cand_cidx
         reset_ids = batch_resets[success_mask, :][:,
-            [0, 1, 3, 4]].astype(np.int64)
+            [0, 1, 2, 3]].astype(np.int64)
         ut.reset_optimizer_state(model, optimizer, reset_ids, copy=True)
       if batch_resets.shape[0] > 0:
         resets.append(batch_resets)
@@ -239,11 +239,10 @@ def train_epoch(model, data_loader, optimizer, device, eval_rank=False,
     # cols (reset_ridx, reset_cidx, reset_metric, cand_ridx, cand_cidx,
     # reset_success, obj_decr)
     resets = (np.concatenate(resets) if len(resets) > 0
-        else np.zeros((0, 7), dtype=object))
-    reset_attempts = resets.shape[0]
-    reset_count = int(resets[:, 5].sum())
+        else np.zeros((0, 6), dtype=object))
+    reset_count = int(resets[:, 4].sum())
   else:
-    reset_attempts, reset_count = 0, 0
+    reset_count = 0
 
   metrics = torch.stack([errors] + [met.avg for met in metrics])
   metrics_summary = torch.stack([metrics.min(dim=1)[0],
@@ -251,7 +250,7 @@ def train_epoch(model, data_loader, optimizer, device, eval_rank=False,
   metrics = metrics.cpu().numpy()
   metrics_summary = metrics_summary.view(-1).numpy().tolist()
   metrics_summary = (metrics_summary + rank_stats +
-      [reset_count, reset_attempts] + [sampsec.avg, rtime])
+      [reset_count, sampsec.avg, rtime])
   return metrics_summary, metrics, conf_mats, svs, resets
 
 
@@ -272,11 +271,10 @@ def batch_alt_step(model, eval_rank=False, reset_unused=False):
     # cols (reset_ridx, reset_cidx, reset_metric, cand_ridx, cand_cidx,
     # reset_success, obj_decr)
     resets = model.reset_unused()
-    reset_attempts = resets.shape[0]
-    reset_count = int(resets[:, 5].sum())
+    reset_count = int(resets[:, 4].sum())
   else:
-    resets = np.zeros((0, 7), dtype=object)
-    reset_count, reset_attempts = 0, 0
+    resets = np.zeros((0, 6), dtype=object)
+    reset_count = 0
 
   rtime = time.time() - epoch_tic
   sampsec = model.N / rtime
@@ -300,5 +298,5 @@ def batch_alt_step(model, eval_rank=False, reset_unused=False):
   metrics = metrics.numpy()
   metrics_summary = metrics_summary.view(-1).numpy().tolist()
   metrics_summary = (metrics_summary + rank_stats +
-      [reset_count, reset_attempts] + [sampsec, rtime])
+      [reset_count, sampsec, rtime])
   return metrics_summary, metrics, conf_mats, svs, resets

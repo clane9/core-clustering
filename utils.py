@@ -37,9 +37,13 @@ def reset_optimizer_state(model, optimizer, reset_ids, copy=False):
   """Reset optimizer states to zero for re-initialized replicates &
   clusters. Or, if copy=True, copy states from duplicated clusters."""
   if copy:
-    # copy optimizer state from duplicated cluster
-    rIdx, cIdx = reset_ids[:, 0], reset_ids[:, 1]
-    cand_rIdx, cand_cIdx = reset_ids[:, 2], reset_ids[:, 3]
+    # choose last occurrence of each ridx, cidx pair
+    revIdx = np.arange(reset_ids.shape[0] - 1, -1, -1)
+    _, uniqIdx = np.unique(reset_ids[revIdx, :][:, [0, 1]], axis=0,
+        return_index=True)
+    uniqIdx = revIdx[uniqIdx]
+    rIdx, cIdx = reset_ids[uniqIdx, 0], reset_ids[uniqIdx, 1]
+    cand_rIdx, cand_cIdx = reset_ids[uniqIdx, 2], reset_ids[uniqIdx, 3]
   else:
     rIdx = np.unique(reset_ids[:, 0])
 

@@ -103,9 +103,6 @@ if __name__ == '__main__':
                       help='Initial learning rate [default: 0.5]')
   parser.add_argument('--reset-unused', action='store_true', default=False,
                       help='Reset nearly unused clusters')
-  parser.add_argument('--reset-value-thr', type=float, default=0.2,
-                      help=('Threshold for identifying unused clusters, '
-                      'relative to max [default: 0.2]'))
   parser.add_argument('--reset-patience', type=int, default=2,
                       help=('Epochs to wait without obj decrease '
                       'before trying to reset [default: 2]'))

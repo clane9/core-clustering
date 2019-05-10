@@ -41,10 +41,10 @@ def train_synth_kmeans_cluster(args):
   }
 
   model = mod.KMeansBatchAltModel(args.model_n, synth_dataset, args.init,
-      args.reps, reg_params=reg_params, reset_value_thr=args.reset_value_thr,
-      reset_patience=args.reset_patience, reset_try_tol=args.reset_try_tol,
-      reset_accept_tol=args.reset_accept_tol, reset_sigma=args.reset_sigma,
-      reset_batch_size=args.reset_batch_size, kpp_n_trials=args.kpp_n_trials)
+      args.reps, reg_params=reg_params, reset_patience=args.reset_patience,
+      reset_try_tol=args.reset_try_tol, reset_accept_tol=args.reset_accept_tol,
+      reset_sigma=args.reset_sigma, reset_batch_size=args.reset_batch_size,
+      kpp_n_trials=args.kpp_n_trials)
   model = model.to(device)
 
   if args.chkp_freq is None or args.chkp_freq <= 0:
@@ -96,9 +96,6 @@ if __name__ == '__main__':
                       help='Number of epochs to train [default: 50]')
   parser.add_argument('--reset-unused', action='store_true', default=False,
                       help='Reset nearly unused clusters')
-  parser.add_argument('--reset-value-thr', type=float, default=0.2,
-                      help=('Threshold for identifying unused clusters, '
-                      'relative to max [default: 0.2]'))
   parser.add_argument('--reset-patience', type=int, default=2,
                       help=('Epochs to wait without obj decrease '
                       'before trying to reset [default: 2]'))
