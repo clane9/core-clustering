@@ -66,8 +66,8 @@ def train_loop(model, data_loader, device, optimizer, out_dir=None, epochs=200,
 
   batch_alt_mode = isinstance(model, KSubspaceBatchAltBaseModel)
 
-  # dim 1: err, obj, loss, reg.in, reg.out, |x_|
-  metrics = np.zeros((epochs, 6, model.r), dtype=np.float32)
+  # dim 1: err, obj, loss, reg.in, reg.out, |x_|, resets
+  metrics = np.zeros((epochs, 7, model.r), dtype=np.float32)
   true_n = (model.true_classes.size if batch_alt_mode
       else data_loader.dataset.classes.size)
   conf_mats = np.zeros((epochs, model.r, model.k, true_n), dtype=np.int64)
@@ -240,14 +240,22 @@ def train_epoch(model, data_loader, optimizer, device, eval_rank=False,
     # reset_success, obj_decr)
     resets = (np.concatenate(resets) if len(resets) > 0
         else np.zeros((0, 6), dtype=object))
-    reset_count = int(resets[:, 4].sum())
+    success_mask = resets[:, 4] == 1
+    reset_count = success_mask.sum()
+    rep_reset_counts = np.zeros((1, model.r))
+    if reset_count > 0:
+      reset_rids, success_counts = np.unique(
+          resets[success_mask, 0].astype(np.int64), return_counts=True)
+      rep_reset_counts[0, reset_rids] = success_counts
   else:
     reset_count = 0
+    rep_reset_counts = np.zeros((1, model.r))
 
   metrics = torch.stack([errors] + [met.avg for met in metrics])
   metrics_summary = torch.stack([metrics.min(dim=1)[0],
       metrics.median(dim=1)[0], metrics.max(dim=1)[0]], dim=1)
   metrics = metrics.cpu().numpy()
+  metrics = np.concatenate((metrics, rep_reset_counts))
   metrics_summary = metrics_summary.view(-1).numpy().tolist()
   metrics_summary = (metrics_summary + rank_stats +
       [reset_count, sampsec.avg, rtime])
@@ -271,10 +279,17 @@ def batch_alt_step(model, eval_rank=False, reset_unused=False):
     # cols (reset_ridx, reset_cidx, reset_metric, cand_ridx, cand_cidx,
     # reset_success, obj_decr)
     resets = model.reset_unused()
-    reset_count = int(resets[:, 4].sum())
+    success_mask = resets[:, 4] == 1
+    reset_count = success_mask.sum()
+    rep_reset_counts = np.zeros((1, model.r))
+    if reset_count > 0:
+      reset_rids, success_counts = np.unique(
+          resets[success_mask, 0].astype(np.int64), return_counts=True)
+      rep_reset_counts[0, reset_rids] = success_counts
   else:
     resets = np.zeros((0, 6), dtype=object)
     reset_count = 0
+    rep_reset_counts = np.zeros((1, model.r))
 
   rtime = time.time() - epoch_tic
   sampsec = model.N / rtime
@@ -296,6 +311,7 @@ def batch_alt_step(model, eval_rank=False, reset_unused=False):
   metrics_summary = torch.stack([metrics.min(dim=1)[0],
       metrics.median(dim=1)[0], metrics.max(dim=1)[0]], dim=1)
   metrics = metrics.numpy()
+  metrics = np.concatenate((metrics, rep_reset_counts))
   metrics_summary = metrics_summary.view(-1).numpy().tolist()
   metrics_summary = (metrics_summary + rank_stats +
       [reset_count, sampsec, rtime])

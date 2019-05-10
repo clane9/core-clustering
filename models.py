@@ -56,7 +56,7 @@ class KSubspaceBaseModel(nn.Module):
     self.reset_accept_tol = reset_accept_tol
     self.reset_sigma = reset_sigma
     if reset_cache_size is None or reset_cache_size <= 0:
-      reset_cache_size = 100 * int(np.ceil(4*k*np.log(k) / 100))
+      reset_cache_size = 100 * int(np.ceil(k*np.log(k) / 100))
     self.reset_cache_size = reset_cache_size
 
     # group assignment, ultimate shape (batch_size, r, k)
@@ -83,6 +83,7 @@ class KSubspaceBaseModel(nn.Module):
     self.register_buffer('cache_assign_obj',
         torch.ones(reset_cache_size, self.r, k).mul_(np.nan))
     self.cache_assign_obj_head = 0
+    self._reset_buffers = None
     return
 
   def reset_parameters(self):
@@ -360,26 +361,28 @@ class KSubspaceBaseModel(nn.Module):
         self._batch_reg_out.sum(dim=1))
 
     # allocate buffers to use during resets
-    device = self.cache_assign_obj.device
-    buffers = (
-        # drop_assign_obj
-        torch.zeros((self.reset_cache_size, self.k, self.k), device=device),
-        # alt_assign_obj
-        torch.zeros((self.reset_cache_size, self.k, self.r*self.k, 2),
-            device=device),
-        # alt_obj
-        torch.zeros((self.reset_cache_size, self.k, self.r*self.k),
-            device=device),
-        # tmp_Idx
-        torch.zeros((self.reset_cache_size, self.k, self.r*self.k),
-            dtype=torch.int64, device=device)
-    )
+    if self._reset_buffers is None:
+      # NOTE: will cause late OOM error if cache_size, k too large
+      device = self.cache_assign_obj.device
+      self._reset_buffers = (
+          # drop_assign_obj
+          torch.zeros((self.reset_cache_size, self.k, self.k), device=device),
+          # alt_assign_obj
+          torch.zeros((self.reset_cache_size, self.k, self.r*self.k, 2),
+              device=device),
+          # alt_obj
+          torch.zeros((self.reset_cache_size, self.k, self.r*self.k),
+              device=device),
+          # tmp_Idx
+          torch.zeros((self.reset_cache_size, self.k, self.r*self.k),
+              dtype=torch.int64, device=device)
+      )
 
     # attempt to re-initialize replicates by greedy hill-climbing
     resets = []
     for ridx in reset_rids:
       rep_resets = self._reset_replicate(ridx.item(), cache_obj[ridx],
-          self.reset_accept_tol, self.reset_max_steps, buffers)
+          self.reset_accept_tol, self.reset_max_steps, self._reset_buffers)
       resets.extend(rep_resets)
     resets = np.array(resets, dtype=object)
 
@@ -534,11 +537,21 @@ class KSubspaceMFModel(KSubspaceBaseModel):
 
   def __init__(self, k, d, D, affine=False, replicates=5, reg_params={},
         reset_patience=100, reset_try_tol=0.01, reset_max_steps=None,
-        reset_accept_tol=1e-4, reset_sigma=0.05, reset_cache_size=None):
+        reset_accept_tol=1e-4, reset_sigma=0.05, reset_cache_size=None,
+        scale_grad_freq=100):
 
     super().__init__(k, d, D, affine, replicates, reg_params,
         reset_patience, reset_try_tol, reset_max_steps, reset_accept_tol,
         reset_sigma, reset_cache_size)
+
+    if scale_grad_freq is not None and scale_grad_freq >= 0:
+      self.scale_grad_freq = scale_grad_freq
+      self.Lip = None
+      self.steps = 0
+      self.Us.register_hook(lambda UGrad: self._scale_grad(UGrad))
+      if self.affine:
+        self.bs.register_hook(lambda bGrad: self._scale_grad(bGrad,
+            update=False))
 
     self.reset_parameters()
     return
@@ -617,6 +630,32 @@ class KSubspaceMFModel(KSubspaceBaseModel):
       z_frosqr = torch.sum(self.z.data.pow(2), dim=3).permute(2, 0, 1)
       regs['z'] = z_frosqr.mul(self.reg_params['z']*0.5)
     return regs
+
+  def _scale_grad(self, Grad, update=True):
+    """Divide gradients by an estimate of the Lipschitz constant, per
+    replicate."""
+    if self.Lip is None or (update and self.steps % self.scale_grad_freq == 0):
+      batch_size = self.c.shape[0]
+      z_zero = self.c.permute(1, 2, 0).unsqueeze(3) * self.z
+      Hess = torch.matmul(z_zero.transpose(2, 3), z_zero).div_(batch_size)
+
+      # (r, k)
+      batch_cluster_sizes = self.c.sum(dim=0)
+      lamb = ((self.reg_params['U_frosqr_in']/batch_size) *
+          batch_cluster_sizes + self.reg_params['U_frosqr_out'])
+      # (r, k, d, d)
+      Id = torch.eye(self.d).mul(lamb.view(self.r, self.k, 1, 1))
+      Hess.add_(Id)
+
+      # (r, k)
+      Lip = np.linalg.norm(Hess.cpu().numpy(), ord=2, axis=(2, 3))
+      Lip = torch.from_numpy(Lip).to(Hess.device)
+      # (r,)
+      self.Lip = Lip.max(dim=1)[0].view(self.r, 1, 1, 1)
+    Grad_scale = Grad.div(self.Lip)
+    if update:
+      self.steps += 1
+    return Grad_scale
 
 
 class KSubspaceProjModel(KSubspaceBaseModel):
