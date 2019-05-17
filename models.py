@@ -17,8 +17,10 @@ class KSubspaceBaseModel(nn.Module):
   assign_reg_terms = set()
 
   def __init__(self, k, d, D, affine=False, replicates=5, reg_params={},
-        reset_patience=100, reset_try_tol=0.01, reset_max_steps=None,
-        reset_accept_tol=1e-4, reset_sigma=0.05, reset_cache_size=None):
+        reset_patience=100, reset_jitter=True, reset_try_tol=0.01,
+        reset_max_steps=None, reset_accept_tol=1e-4, reset_stochastic=True,
+        reset_low_value=False, reset_value_thr=0.1, reset_sigma=0.05,
+        reset_cache_size=None, cache_subsample_rate=None):
 
     if replicates < 1:
       raise ValueError("Invalid replicates parameter {}".format(replicates))
@@ -49,15 +51,25 @@ class KSubspaceBaseModel(nn.Module):
     self.reg_params = reg_params
 
     self.reset_patience = reset_patience
+    self.reset_jitter = reset_jitter
     self.reset_try_tol = reset_try_tol
     if reset_max_steps is None or reset_max_steps <= 0:
       reset_max_steps = k
     self.reset_max_steps = reset_max_steps
     self.reset_accept_tol = reset_accept_tol
+    self.reset_stochastic = reset_stochastic
+    self.reset_low_value = reset_low_value
+    self.reset_value_thr = reset_value_thr
+    self.n_reset_cands = 1 if reset_low_value else k
     self.reset_sigma = reset_sigma
     if reset_cache_size is None or reset_cache_size <= 0:
-      reset_cache_size = 100 * int(np.ceil(k*np.log(k) / 100))
+      reset_cache_size = 100 * int(np.ceil(4*k*np.log(k) / 100))
     self.reset_cache_size = reset_cache_size
+    if cache_subsample_rate is None or cache_subsample_rate <= 0:
+      cache_subsample_rate = 1.0 / k
+    self.cache_subsample_rate = cache_subsample_rate
+    self.cache_subsample_size = min(reset_cache_size,
+        int(np.ceil(cache_subsample_rate * reset_cache_size)))
 
     # group assignment, ultimate shape (batch_size, r, k)
     self.c = None
@@ -75,11 +87,17 @@ class KSubspaceBaseModel(nn.Module):
     self.register_buffer('value', torch.ones(self.r, k).mul_(np.nan))
     self.register_buffer('obj', torch.ones(self.r).mul_(np.nan))
     self.register_buffer('best_obj', torch.ones(self.r).mul_(np.nan))
-    self.register_buffer('jitter', torch.randint(-reset_patience//2,
-        reset_patience//2 + 1, (self.r,), dtype=torch.float32))
-    self.register_buffer('num_bad_steps', torch.zeros(self.r))
+    if reset_jitter:
+      init_jitter = torch.randint(-reset_patience//2, reset_patience//2 + 1,
+          (self.r,), dtype=torch.float32)
+    else:
+      init_jitter = torch.zeros(self.r)
+    self.register_buffer('jitter', init_jitter)
+    # 1st row counts since last reset, 2nd since last *successful* reset
+    self.register_buffer('num_bad_steps', torch.zeros(2, self.r))
     self.register_buffer('cooldown_counter',
         torch.ones(self.r).mul_(reset_patience//2))
+
     self.register_buffer('cache_assign_obj',
         torch.ones(reset_cache_size, self.r, k).mul_(np.nan))
     self.cache_assign_obj_head = 0
@@ -356,9 +374,6 @@ class KSubspaceBaseModel(nn.Module):
     cache_not_full = torch.any(torch.isnan(self.cache_assign_obj))
     if cache_not_full:
       return empty_output
-    cache_min_assign_obj = self.cache_assign_obj.min(dim=2)[0]
-    cache_obj = (cache_min_assign_obj.mean(dim=0) +
-        self._batch_reg_out.sum(dim=1))
 
     # allocate buffers to use during resets
     if self._reset_buffers is None:
@@ -366,25 +381,29 @@ class KSubspaceBaseModel(nn.Module):
       device = self.cache_assign_obj.device
       self._reset_buffers = (
           # drop_assign_obj
-          torch.zeros((self.reset_cache_size, self.k, self.k), device=device),
+          torch.zeros((self.cache_subsample_size, self.n_reset_cands, self.k),
+              device=device),
           # alt_assign_obj
-          torch.zeros((self.reset_cache_size, self.k, self.r*self.k, 2),
-              device=device),
+          torch.zeros((self.cache_subsample_size, self.n_reset_cands,
+              self.r*self.k, 2), device=device),
           # alt_obj
-          torch.zeros((self.reset_cache_size, self.k, self.r*self.k),
-              device=device),
+          torch.zeros((self.cache_subsample_size, self.n_reset_cands,
+              self.r*self.k), device=device),
           # tmp_Idx
-          torch.zeros((self.reset_cache_size, self.k, self.r*self.k),
-              dtype=torch.int64, device=device)
+          torch.zeros((self.cache_subsample_size, self.n_reset_cands,
+              self.r*self.k), dtype=torch.int64, device=device)
       )
 
     # attempt to re-initialize replicates by greedy hill-climbing
     resets = []
     for ridx in reset_rids:
-      rep_resets = self._reset_replicate(ridx.item(), cache_obj[ridx],
-          self.reset_accept_tol, self.reset_max_steps, self._reset_buffers)
+      rep_resets = self._reset_replicate(ridx.item())
       resets.extend(rep_resets)
-    resets = np.array(resets, dtype=object)
+
+    if len(resets) == 0:
+      resets = empty_output
+    else:
+      resets = np.array(resets, dtype=object)
 
     # perturb all bases slightly in replicates with resets to make sure we
     # always have some diversity across replicates
@@ -414,104 +433,166 @@ class KSubspaceBaseModel(nn.Module):
     better_or_cooldown = torch.max(cooldown_mask,
         (self.obj < (1.0 - self.reset_try_tol)*self.best_obj))
     self.best_obj[better_or_cooldown] = self.obj[better_or_cooldown]
-    self.num_bad_steps[better_or_cooldown] = 0.0
-    self.num_bad_steps[better_or_cooldown == 0] += 1.0
+    self.num_bad_steps[:, better_or_cooldown] = 0.0
+    self.num_bad_steps[:, better_or_cooldown == 0] += 1.0
 
-    reset_mask = self.num_bad_steps > (self.reset_patience + self.jitter)
+    reset_mask = self.num_bad_steps[0, :] > (self.reset_patience + self.jitter)
     reset_rids = reset_mask.nonzero().view(-1)
     return reset_rids
 
-  def _reset_replicate(self, ridx, old_obj, accept_tol, max_steps, buffers):
+  def _reset_replicate(self, ridx):
     """Re-initialize a replicate by executing several steps of greedy
     hill-climbing over the graph of (rk choose k) subsets of bases."""
+    cids = np.arange(self.k)
+    attempt_cids = []
     resets = []
     successes = 0
-    for _ in range(max_steps):
-      # find best candidate swap for each cluster
-      alt_obj, alt_Idx = self._find_best_swaps(ridx, buffers)
 
-      # choose cluster to swap probabilistically, weighted by relative
-      # objective decrease. alternatively could choose deterministically.
+    for _ in range(self.reset_max_steps):
+      value, rep_min_assign_obj = self._eval_value(ridx)
+
+      if self.reset_low_value:
+        # find lowest value cluster among those we haven't tried to reset
+        avail_cids = np.setdiff1d(cids, attempt_cids)
+        cidx = avail_cids[np.argmin(value[avail_cids])]
+        # don't try to reset if it's too valuable
+        if value[cidx] > self.reset_value_thr:
+          break
+        attempt_cids.append(cidx)
+      else:
+        cidx = None
+
+      if self.cache_subsample_size is not None:
+        # restrict to worst represented data points
+        sub_Idx = torch.sort(rep_min_assign_obj, descending=True)[1]
+        sub_Idx = sub_Idx[:self.cache_subsample_size]
+        old_obj = (rep_min_assign_obj[sub_Idx].mean() +
+            self._batch_reg_out[ridx].sum())
+      else:
+        sub_Idx = None
+        old_obj = (rep_min_assign_obj.mean() + self._batch_reg_out[ridx].sum())
+
+      # evaluate all alternative objectives
+      # either shape (k, rk), or (1, rk) if resetting low value
+      alt_obj = self._eval_alt_obj(ridx, cidx=cidx, sub_Idx=sub_Idx)
+      alt_obj = alt_obj.view(-1)
+
+      # choose substitution either probabilistically, weighted by relative
+      # objective decrease, or deterministically.
       obj_decr = 1.0 - alt_obj / old_obj
-      if obj_decr.max() > accept_tol:
-        sample_prob = obj_decr.clone()
-        sample_prob[obj_decr <= accept_tol] = 0.0
-        cidx = torch.multinomial(sample_prob, 1)[0].item()
+      if obj_decr.max() > self.reset_accept_tol:
+        if self.reset_stochastic:
+          sample_prob = (obj_decr - self.reset_accept_tol).clamp_(min=0)
+          idx = torch.multinomial(sample_prob, 1)[0].item()
+        else:
+          idx = obj_decr.view(-1).argmax()
       else:
         # only for logging purpose
-        cidx = obj_decr.argmax().item()
-      cand_ridx = (alt_Idx[cidx] // self.k).item()
-      cand_cidx = (alt_Idx[cidx] % self.k).item()
-      cand_obj = alt_obj[cidx].item()
-      obj_decr = obj_decr[cidx].item()
+        idx = obj_decr.argmax().item()
 
-      success = obj_decr > accept_tol
-      resets.append([ridx, cidx, cand_ridx, cand_cidx, int(success), obj_decr])
-      if not success:
-        break
+      obj_decr = obj_decr[idx].item()
+      if self.reset_low_value:
+        cand_ridx, cand_cidx = np.unravel_index(idx,
+            (self.r, self.k))
       else:
-        # reset parameters
+        cidx, cand_ridx, cand_cidx = np.unravel_index(idx,
+            (self.k, self.r, self.k))
+      success = obj_decr > self.reset_accept_tol
+      resets.append([ridx, cidx, cand_ridx, cand_cidx, int(success), obj_decr])
+
+      if success:
+        # reset parameters and caches
         self.Us.data[ridx, cidx, :] = self.Us.data[cand_ridx, cand_cidx, :]
         if self.affine:
           self.bs.data[ridx, cidx, :] = self.bs.data[
               cand_ridx, cand_cidx, :]
-
-        # reset caches
         self.cache_assign_obj[:, ridx, cidx] = self.cache_assign_obj[
             :, cand_ridx, cand_cidx]
         self._batch_reg_out[ridx, cidx] = self._batch_reg_out[
             cand_ridx, cand_cidx]
 
-        old_obj = cand_obj
         successes += 1
+      elif not self.reset_low_value:
+        # we know we've converged if doing full search
+        break
 
     # reset some state
     if successes > 0:
       self.c_mean[ridx, :] = np.nan
       self.value[ridx, :] = np.nan
       self.obj[ridx] = self.best_obj[ridx] = np.nan
+      self.num_bad_steps[1, ridx] = 0
+      self.cooldown_counter[ridx] = self.reset_patience // 2
 
-    self.num_bad_steps[ridx] = 0
-    self.cooldown_counter[ridx] = self.reset_patience // 2
-    self.jitter[ridx].random_(-self.reset_patience//2,
-        self.reset_patience//2 + 1)
+    self.num_bad_steps[0, ridx] = 0
+    if self.reset_jitter:
+      self.jitter[ridx].random_(-self.reset_patience//2,
+          self.reset_patience//2 + 1)
     return resets
 
-  def _find_best_swaps(self, ridx, buffers):
+  def _eval_value(self, ridx):
+    """Evaluate current value of every cluster based on cache objective in given
+    replicate."""
+    rep_assign_obj = self.cache_assign_obj[:, ridx, :]
+    top2obj, top2idx = torch.topk(rep_assign_obj, 2, dim=1,
+        largest=False, sorted=True)
+    rep_groups = top2idx[:, [0]]
+    value = torch.zeros_like(rep_assign_obj)
+    value = value.scatter_(1, rep_groups,
+        (top2obj[:, [1]] - top2obj[:, [0]])).mean(dim=0)
+    value.sub_(self._batch_reg_out[ridx, :])
+    value.div_(max(value.max(), EPS))
+    return value, top2obj[:, 0]
+
+  def _eval_alt_obj(self, ridx, cidx=None, sub_Idx=None):
     """Find the best candidate swap for each of a given replicate's
     clusters."""
-    # (cache_size, k, k), (cache_size, k, rk, 2), (cache_size, k, rk),
-    # (cache_size, k, rk)
-    drop_assign_obj, alt_assign_obj, alt_obj, tmp_Idx = buffers
+    # (cache_subsample_size, n_cand, k), (cache_subsample_size, n_cand, rk, 2),
+    # (cache_subsample_size, n_cand, rk), (cache_subsample_size, n_cand, rk)
+    drop_assign_obj, alt_assign_obj, alt_obj, tmp_Idx = self._reset_buffers
 
-    # construct (cache_size, k) matrix of min assign objs, where col j has
-    # cluster j dropped.
-    Idx = torch.arange(self.k)
-    # (cache_size, k, k)
-    drop_assign_obj[:] = self.cache_assign_obj[:, [ridx], :]
-    drop_assign_obj[:, Idx, Idx] = np.inf
+    # full search: construct (cache_subsample_size, k) matrix of min assign
+    # objs, where col j has cluster j dropped.
+    # cidx given: (cache_subsample_size, 1) of min assign objs with cidx
+    # dropped.
+    if sub_Idx is None:
+      drop_assign_obj[:] = self.cache_assign_obj[:, [ridx], :]
+    else:
+      drop_assign_obj[:] = self.cache_assign_obj[sub_Idx, :][:, [ridx], :]
+    if cidx is None:
+      Idx = torch.arange(self.k)
+      # (cache_subsample_size, k, k)
+      drop_assign_obj[:, Idx, Idx] = np.inf
+    else:
+      drop_assign_obj[:, 0, cidx] = np.inf
     drop_assign_obj = drop_assign_obj.min(dim=2)[0]
 
-    # and (k,) vector of reg values, one for each dropped cluster
+    # full search: contstruct (k,) vector of reg values, one for each dropped
+    # cluster
+    # cidx given: scalar reg value for single dropped cluster cidx
     drop_reg_out = self._batch_reg_out[ridx, :]
-    drop_reg_out = drop_reg_out.sum() - drop_reg_out
+    if cidx is None:
+      drop_reg_out = drop_reg_out.sum() - drop_reg_out
+    else:
+      drop_reg_out = drop_reg_out.sum() - drop_reg_out[cidx]
 
-    # (cache_size, k, rk, 2)
+    # (cache_subsample_size, n_cand, rk, 2)
     alt_assign_obj[:, :, :, 0] = drop_assign_obj.unsqueeze(2)
-    alt_assign_obj[:, :, :, 1] = self.cache_assign_obj.view(-1,
-        self.r*self.k).unsqueeze(1)
-    # (cache_size, k, rk)
+    if sub_Idx is None:
+      alt_assign_obj[:, :, :, 1] = self.cache_assign_obj.view(-1,
+          self.r*self.k).unsqueeze(1)
+    else:
+      alt_assign_obj[:, :, :, 1] = self.cache_assign_obj[sub_Idx, :].view(
+          -1, self.r*self.k).unsqueeze(1)
+
+    # (cache_subsample_size, n_cand, rk)
     alt_obj, _ = torch.min(alt_assign_obj, dim=3, out=(alt_obj, tmp_Idx))
 
-    # average over cache and add regularization, (k, rk)
+    # average over cache and add regularization, (n_cand, rk)
     alt_obj = alt_obj.mean(dim=0)
     alt_obj.add_(drop_reg_out.view(-1, 1))
     alt_obj.add_(self._batch_reg_out.view(-1))
-
-    # take minimum over the rk swaps, (k,)
-    alt_Idx = alt_obj.argmin(dim=1)
-    alt_obj = alt_obj[Idx, alt_Idx]
-    return alt_obj, alt_Idx
+    return alt_obj
 
   def zero(self):
     """Zero out near zero bases.
@@ -536,13 +617,15 @@ class KSubspaceMFModel(KSubspaceBaseModel):
   assign_reg_terms = {'U_frosqr_in', 'z'}
 
   def __init__(self, k, d, D, affine=False, replicates=5, reg_params={},
-        reset_patience=100, reset_try_tol=0.01, reset_max_steps=None,
-        reset_accept_tol=1e-4, reset_sigma=0.05, reset_cache_size=None,
-        scale_grad_freq=100):
+        reset_patience=100, reset_jitter=True, reset_try_tol=0.01,
+        reset_max_steps=None, reset_accept_tol=1e-4, reset_stochastic=True,
+        reset_low_value=False, reset_value_thr=0.1, reset_sigma=0.05,
+        reset_cache_size=None, cache_subsample_rate=None, scale_grad_freq=100):
 
     super().__init__(k, d, D, affine, replicates, reg_params,
-        reset_patience, reset_try_tol, reset_max_steps, reset_accept_tol,
-        reset_sigma, reset_cache_size)
+        reset_patience, reset_jitter, reset_try_tol, reset_max_steps,
+        reset_accept_tol, reset_stochastic, reset_low_value, reset_value_thr,
+        reset_sigma, reset_cache_size, cache_subsample_rate)
 
     if scale_grad_freq is not None and scale_grad_freq >= 0:
       self.scale_grad_freq = scale_grad_freq
@@ -670,12 +753,15 @@ class KSubspaceProjModel(KSubspaceBaseModel):
   assign_reg_terms = {'U_frosqr_in'}
 
   def __init__(self, k, d, D, affine=False, replicates=5, reg_params={},
-        reset_patience=100, reset_try_tol=0.01, reset_max_steps=None,
-        reset_accept_tol=1e-4, reset_sigma=0.05, reset_cache_size=None):
+        reset_patience=100, reset_jitter=True, reset_try_tol=0.01,
+        reset_max_steps=None, reset_accept_tol=1e-4, reset_stochastic=True,
+        reset_low_value=False, reset_value_thr=0.1, reset_sigma=0.05,
+        reset_cache_size=None, cache_subsample_rate=None):
 
     super().__init__(k, d, D, affine, replicates, reg_params,
-        reset_patience, reset_try_tol, reset_max_steps, reset_accept_tol,
-        reset_sigma, reset_cache_size)
+        reset_patience, reset_jitter, reset_try_tol, reset_max_steps,
+        reset_accept_tol, reset_stochastic, reset_low_value, reset_value_thr,
+        reset_sigma, reset_cache_size, cache_subsample_rate)
 
     self.reset_parameters()
     return
@@ -736,8 +822,10 @@ class KSubspaceBatchAltBaseModel(KSubspaceBaseModel):
   assign_reg_terms = dict()
 
   def __init__(self, k, d, dataset, affine=False, replicates=5, reg_params={},
-        reset_patience=2, reset_try_tol=0.01, reset_max_steps=None,
-        reset_accept_tol=1e-4, reset_sigma=0.05, reset_cache_size=None,
+        reset_patience=2, reset_jitter=True, reset_try_tol=0.01,
+        reset_max_steps=None, reset_accept_tol=1e-4, reset_stochastic=True,
+        reset_low_value=False, reset_value_thr=0.1, reset_sigma=0.05,
+        reset_cache_size=None, cache_subsample_rate=None,
         svd_solver='randomized'):
 
     if svd_solver not in ('randomized', 'svds', 'svd'):
@@ -746,8 +834,9 @@ class KSubspaceBatchAltBaseModel(KSubspaceBaseModel):
     # X assumed to be N x D.
     D = dataset.X.shape[1]
     super().__init__(k, d, D, affine, replicates, reg_params, reset_patience,
-        reset_try_tol, reset_max_steps, reset_accept_tol, reset_sigma,
-        reset_cache_size)
+        reset_jitter, reset_try_tol, reset_max_steps, reset_accept_tol,
+        reset_stochastic, reset_low_value, reset_value_thr, reset_sigma,
+        reset_cache_size, cache_subsample_rate)
 
     self.dataset = dataset
     self.register_buffer('X', dataset.X)
@@ -772,7 +861,7 @@ class KSubspaceBatchAltBaseModel(KSubspaceBaseModel):
     """
     ret_vals = super().objective(self.X)
     # objective is exact for batch algorithm, override ema.
-    self.obj = ret_vals[1]
+    self.obj = ret_vals[1].clone()
     return ret_vals
 
   def set_assign(self, assign_obj):
@@ -820,13 +909,16 @@ class KSubspaceBatchAltProjModel(KSubspaceBatchAltBaseModel,
   assign_reg_terms = {'U_frosqr_in'}
 
   def __init__(self, k, d, dataset, affine=False, replicates=5, reg_params={},
-        reset_patience=2, reset_try_tol=0.01, reset_max_steps=None,
-        reset_accept_tol=1e-4, reset_sigma=0.05, reset_cache_size=None,
+        reset_patience=2, reset_jitter=True, reset_try_tol=0.01,
+        reset_max_steps=None, reset_accept_tol=1e-4, reset_stochastic=True,
+        reset_low_value=False, reset_value_thr=0.1, reset_sigma=0.05,
+        reset_cache_size=None, cache_subsample_rate=None,
         svd_solver='randomized'):
 
     super().__init__(k, d, dataset, affine, replicates, reg_params,
-        reset_patience, reset_try_tol, reset_max_steps, reset_accept_tol,
-        reset_sigma, reset_cache_size, svd_solver)
+        reset_patience, reset_jitter, reset_try_tol, reset_max_steps,
+        reset_accept_tol, reset_stochastic, reset_low_value, reset_value_thr,
+        reset_sigma, reset_cache_size, cache_subsample_rate, svd_solver)
 
     # must be zero, not supported
     self.reg_params['U_fro_out'] = 0.0
@@ -865,13 +957,16 @@ class KSubspaceBatchAltMFModel(KSubspaceBatchAltBaseModel, KSubspaceMFModel):
   assign_reg_terms = {'U_frosqr_in', 'z'}
 
   def __init__(self, k, d, dataset, affine=False, replicates=5, reg_params={},
-        reset_patience=2, reset_try_tol=0.01, reset_max_steps=None,
-        reset_accept_tol=1e-4, reset_sigma=0.05, reset_cache_size=None,
+        reset_patience=2, reset_jitter=True, reset_try_tol=0.01,
+        reset_max_steps=None, reset_accept_tol=1e-4, reset_stochastic=True,
+        reset_low_value=False, reset_value_thr=0.1, reset_sigma=0.05,
+        reset_cache_size=None, cache_subsample_rate=None,
         svd_solver='randomized'):
 
     super().__init__(k, d, dataset, affine, replicates, reg_params,
-        reset_patience, reset_try_tol, reset_max_steps, reset_accept_tol,
-        reset_sigma, reset_cache_size, svd_solver)
+        reset_patience, reset_jitter, reset_try_tol, reset_max_steps,
+        reset_accept_tol, reset_stochastic, reset_low_value, reset_value_thr,
+        reset_sigma, reset_cache_size, cache_subsample_rate, svd_solver)
 
     # must be zero, not supported
     self.reg_params['U_fro_out'] = 0.0
@@ -956,14 +1051,15 @@ class KSubspaceBatchAltMFModel(KSubspaceBatchAltBaseModel, KSubspaceMFModel):
 class KMeansBatchAltModel(KSubspaceBatchAltBaseModel):
   """K-means model as a special case of K-subspaces."""
   default_reg_params = {
-      'b_frosqr_out': 1e-4
+      'b_frosqr_out': 0.0
   }
   assign_reg_terms = {}
 
   def __init__(self, k, dataset, init='random', replicates=5, reg_params={},
-        reset_patience=2, reset_try_tol=0.01, reset_max_steps=None,
-        reset_accept_tol=1e-4, reset_sigma=0.05, reset_cache_size=None,
-        kpp_n_trials=None):
+        reset_patience=2, reset_jitter=True, reset_try_tol=0.01,
+        reset_max_steps=None, reset_accept_tol=1e-4, reset_stochastic=True,
+        reset_low_value=False, reset_value_thr=0.1, reset_sigma=0.05,
+        reset_cache_size=None, cache_subsample_rate=None, kpp_n_trials=None):
 
     if init not in {'k-means++', 'random'}:
       raise ValueError("Invalid init parameter {}".format(init))
@@ -972,15 +1068,14 @@ class KMeansBatchAltModel(KSubspaceBatchAltBaseModel):
     affine = True
 
     super().__init__(k, d, dataset, affine, replicates, reg_params,
-        reset_patience, reset_try_tol, reset_max_steps, reset_accept_tol,
-        reset_sigma, reset_cache_size)
+        reset_patience, reset_jitter, reset_try_tol, reset_max_steps,
+        reset_accept_tol, reset_stochastic, reset_low_value, reset_value_thr,
+        reset_sigma, reset_cache_size, cache_subsample_rate)
 
     self.init = init
     # Number of candidate means to test. Will add the one that reduces the loss
-    # the most. This procedure is described in original paper, and also
-    # implemented in scikit-learn k_means. Although it's not explicit in most
-    # descriptions of the algorithm. It does seem to make a big difference,
-    # helping avoid the likely event that a single sample is bad.
+    # the most. This procedure is described briefly in original paper, and also
+    # implemented in scikit-learn k_means.
     if kpp_n_trials is None or kpp_n_trials <= 0:
       kpp_n_trials = int(np.ceil(2 * np.log(self.k)))
     self.kpp_n_trials = kpp_n_trials
@@ -1025,6 +1120,7 @@ class KMeansBatchAltModel(KSubspaceBatchAltBaseModel):
 
         self.bs.data[:, ii, :] = self.X[Idx, :]
     else:
+      # pick random data points
       Idx = torch.randint(0, self.N, (self.r, self.k), dtype=torch.int64)
       self.bs.data.copy_(self.X[Idx, :])
     return
@@ -1061,7 +1157,7 @@ class KMeansBatchAltModel(KSubspaceBatchAltBaseModel):
     XTb = torch.matmul(bs, self.XT).permute(2, 0, 1)
     # (batch_size, r, k)
     loss = self.Xsqrnorms.view(-1, 1, 1).sub(XTb).add(bsqrnorms.unsqueeze(0))
-    return loss.abs()
+    return loss.clamp_(min=0.0)
 
   def encode(self, x):
     raise NotImplementedError("encode not implemented.")
@@ -1092,15 +1188,17 @@ class KMeansBatchAltModel(KSubspaceBatchAltBaseModel):
   def step(self):
     """Update k means (and increment step count).
 
-    min_b 1/N_j (\sum_{i=1}^N_j 1/2 ||x_i - b||_2^2) + \lambda/2 ||b||_2^2
-                (1 + \lambda) b = 1/N_j \sum_i x_i
-
+    min_{{b_j}} 1/N \sum_{i=1}^N [\sum_{j=1}^k 1/2 c_{i j} || b_j - x_i ||_2^2
+                                  + lambda/2 || b_j ||_2^2 ]
+    grad b_j = N_j b_j - \sum_{i in C_j} x_i + N lambda b_j
+    b_j = (1/(N_j + lambda N)) \sum_{i in C_j} x_i
     """
     for ii in range(self.r):
       for jj in range(self.k):
         if self.c_mean[ii, jj] > 0:
           Xj = self.X[self.c[:, ii, jj] == 1, :]
-          b = Xj.mean(dim=0).div(1.0 + self.reg_params['b_frosqr_out'])
+          b = Xj.sum(dim=0).div_(Xj.shape[0] +
+              self.reg_params['b_frosqr_out']*self.N)
         else:
           b = torch.zeros(self.D, dtype=self.bs.dtype, device=self.bs.device)
         self.bs.data[ii, jj, :] = b
@@ -1119,17 +1217,20 @@ class KSubspaceMFCorruptBaseModel(KSubspaceBaseModel):
   assign_reg_terms = {'U_frosqr_in', 'z', 'e'}
 
   def __init__(self, k, d, D, affine=False, replicates=5, reg_params={},
-        reset_patience=100, reset_try_tol=0.01, reset_max_steps=None,
-        reset_accept_tol=1e-4, reset_sigma=0.05, reset_cache_size=None,
-        encode_max_iter=20, encode_tol=1e-3):
+        reset_patience=100, reset_jitter=True, reset_try_tol=0.01,
+        reset_max_steps=None, reset_accept_tol=1e-4, reset_stochastic=True,
+        reset_low_value=False, reset_value_thr=0.1, reset_sigma=0.05,
+        reset_cache_size=None, cache_subsample_rate=None, encode_max_iter=20,
+        encode_tol=1e-3):
 
     if encode_max_iter <= 0:
       raise ValueError(("Invalid encode_max_iter parameter {}").format(
           encode_max_iter))
 
     super().__init__(k, d, D, affine, replicates, reg_params, reset_patience,
-        reset_try_tol, reset_max_steps, reset_accept_tol, reset_sigma,
-        reset_cache_size)
+        reset_jitter, reset_try_tol, reset_max_steps, reset_accept_tol,
+        reset_stochastic, reset_low_value, reset_value_thr, reset_sigma,
+        reset_cache_size, cache_subsample_rate)
 
     # when e reg parameter is set to zero we disable the corruption term,
     # although strictly speaking it should give the trivial solution e = full
@@ -1301,13 +1402,16 @@ class KSubspaceMCModel(KSubspaceMFCorruptBaseModel):
   assign_reg_terms = {'U_frosqr_in', 'z', 'e'}
 
   def __init__(self, k, d, D, affine=False, replicates=5, reg_params={},
-        reset_patience=100, reset_try_tol=0.01, reset_max_steps=None,
-        reset_accept_tol=1e-4, reset_sigma=0.05, reset_cache_size=None,
-        encode_max_iter=20, encode_tol=1e-3):
+        reset_patience=100, reset_jitter=True, reset_try_tol=0.01,
+        reset_max_steps=None, reset_accept_tol=1e-4, reset_stochastic=True,
+        reset_low_value=False, reset_value_thr=0.1, reset_sigma=0.05,
+        reset_cache_size=None, cache_subsample_rate=None, encode_max_iter=20,
+        encode_tol=1e-3):
 
     super().__init__(k, d, D, affine, replicates, reg_params, reset_patience,
-        reset_try_tol, reset_max_steps, reset_accept_tol, reset_sigma,
-        reset_cache_size, encode_max_iter, encode_tol)
+        reset_jitter, reset_try_tol, reset_max_steps, reset_accept_tol,
+        reset_stochastic, reset_low_value, reset_value_thr, reset_sigma,
+        reset_cache_size, cache_subsample_rate, encode_max_iter, encode_tol)
 
     self.omega = None
     self.reset_parameters()

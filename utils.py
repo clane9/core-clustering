@@ -33,6 +33,10 @@ class AverageMeter(object):
     self.avg = self.sum / self.count
 
 
+def boolarg(arg):
+  return bool(int(arg))
+
+
 def reset_optimizer_state(model, optimizer, reset_ids, copy=False):
   """Reset optimizer states to zero for re-initialized replicates &
   clusters. Or, if copy=True, copy states from duplicated clusters."""

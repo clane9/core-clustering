@@ -12,11 +12,12 @@ import utils as ut
 from models import KSubspaceBatchAltBaseModel
 
 EPS = 1e-8
+COPY_OPT_STATE = False
 
 
 def train_loop(model, data_loader, device, optimizer, out_dir=None, epochs=200,
       chkp_freq=50, stop_freq=-1, scheduler=None, eval_rank=False,
-      reset_unused=False, save_data=True):
+      reset_unused=False, save_data=True, init_time=0.0):
   """Train k-subspace model for series of epochs.
 
   Args:
@@ -33,6 +34,7 @@ def train_loop(model, data_loader, device, optimizer, out_dir=None, epochs=200,
       models (default: False)
     reset_unused: whether to reset unused clusters (default: False)
     save_data: whether to save conf_mats, svs, resets (default: True)
+    init_time: initialization time to add to first epoch (default: 0.0)
   """
   printformstr = ('(epoch {:d}/{:d}) lr={:.1e} '
       'err={:.3f},{:.3f},{:.3f} obj={:.2e},{:.2e},{:.2e} '
@@ -79,7 +81,7 @@ def train_loop(model, data_loader, device, optimizer, out_dir=None, epochs=200,
     max_lr = ut.get_learning_rate(optimizer)
     min_lr = max(EPS, 0.5**10 * max_lr)
     scheduler = ReduceLROnPlateau(optimizer, factor=0.5, patience=10,
-        threshold=1e-3, min_lr=min_lr)
+        threshold=(model.reset_try_tol/10), min_lr=min_lr)
 
   # training loop
   err = None
@@ -97,6 +99,9 @@ def train_loop(model, data_loader, device, optimizer, out_dir=None, epochs=200,
                 optimizer, device, eval_rank, reset_unused)
         lr = ut.get_learning_rate(optimizer)
 
+      if epoch == 1:
+        metrics_summary[-1] += init_time
+
       if eval_rank:
         svs[epoch-1, :] = epoch_svs
       if reset_unused and epoch_resets.shape[0] > 0:
@@ -112,8 +117,7 @@ def train_loop(model, data_loader, device, optimizer, out_dir=None, epochs=200,
           for ii in [0, 3, 5]]
 
       waiting_to_reset = (reset_unused and
-          (model.num_bad_steps <= model.reset_patience +
-          model.jitter).any().item())
+          (model.num_bad_steps[1, :] <= 3*model.reset_patience).any().item())
       is_conv = (((model._updates == 0 if batch_alt_mode else lr <= min_lr) and
           (not waiting_to_reset)) or epoch == epochs)
 
@@ -123,8 +127,6 @@ def train_loop(model, data_loader, device, optimizer, out_dir=None, epochs=200,
         ut.save_checkpoint({
             'epoch': epoch,
             'model': model.state_dict(),
-            'optimizer': (optimizer.state_dict()
-                if not batch_alt_mode else None),
             'err': cluster_error,
             'obj': min_obj},
             is_best=False,
@@ -206,13 +208,14 @@ def train_epoch(model, data_loader, optimizer, device, eval_rank=False,
     conf_mats.update(batch_conf_mats, 1)
 
     if reset_unused:
+      # cols: ridx, cidx, cand_ridx, cand_cidx, success, obj_decr
       batch_resets = model.reset_unused()
       success_mask = batch_resets[:, 4] == 1
       if success_mask.sum() > 0:
         # ridx, cidx, cand_ridx, cand_cidx
-        reset_ids = batch_resets[success_mask, :][:,
-            [0, 1, 2, 3]].astype(np.int64)
-        ut.reset_optimizer_state(model, optimizer, reset_ids, copy=True)
+        reset_ids = batch_resets[success_mask, :][:, :4].astype(np.int64)
+        ut.reset_optimizer_state(model, optimizer, reset_ids,
+            copy=COPY_OPT_STATE)
       if batch_resets.shape[0] > 0:
         resets.append(batch_resets)
 
@@ -236,8 +239,6 @@ def train_epoch(model, data_loader, optimizer, device, eval_rank=False,
     rank_stats, svs = [], None
 
   if reset_unused:
-    # cols (reset_ridx, reset_cidx, reset_metric, cand_ridx, cand_cidx,
-    # reset_success, obj_decr)
     resets = (np.concatenate(resets) if len(resets) > 0
         else np.zeros((0, 6), dtype=object))
     success_mask = resets[:, 4] == 1
@@ -276,8 +277,7 @@ def batch_alt_step(model, eval_rank=False, reset_unused=False):
       for ii in range(model.replicates)])
 
   if reset_unused:
-    # cols (reset_ridx, reset_cidx, reset_metric, cand_ridx, cand_cidx,
-    # reset_success, obj_decr)
+    # cols: ridx, cidx, cand_ridx, cand_cidx, success, obj_decr
     resets = model.reset_unused()
     success_mask = resets[:, 4] == 1
     reset_count = success_mask.sum()
