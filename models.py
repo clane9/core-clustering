@@ -135,25 +135,43 @@ class KSubspaceBaseModel(nn.Module):
     self._insert_next(0, X[Idx, :], X, nn_k)
 
     for jj in range(1, self.k):
-      with torch.no_grad():
-        X_ = self.forward(X)
-        # (N, r, k)
-        loss = self.loss(X, X_)
+      # (N, r, k')
+      loss = self._prob_insert_loss(X, jj)
       # (N, r)
-      min_loss = torch.min(loss[:, :, :jj], dim=2)[0]
+      min_loss = torch.min(loss, dim=2)[0]
       # (r,)
       Idx = torch.multinomial(min_loss.t(), 1).view(-1)
       self._insert_next(jj, X[Idx, :], X, nn_k)
     return
 
+  def _prob_insert_loss(self, X, jj):
+    """Evaluate loss wrt X for current initialized subspaces up to but not
+    including jj. Assumes Us are orthogonal and x_i unit norm. Does not
+    consider bs.
+
+    Computes:
+      1/2 || x - U U^T x ||_2^2
+      1/2 || x ||_2^2 - x^T U U^T x + 1/2 x^T U U^T U U^T x
+      1/2 || x ||_2^2 - 1/2 || U^T x ||_2^2
+      1/2 (1 - || U^T x ||_2^2)
+    """
+    # shape (r, k', D, d), assumed to be orthogonal
+    Us = self.Us.data[:, :jj, :]
+    # (r, k', N, d)
+    z = torch.matmul(X, Us)
+    # (r, k', N)
+    znormsqr = z.pow(2).sum(dim=3)
+    # (N, r, k')
+    # assumes x_i are normalized
+    loss = (1.0 - znormsqr).mul(0.5).permute(2, 0, 1)
+    return loss
+
   def _insert_next(self, jj, y, X, nn_k):
     """Insert next basis (jj) centered on sampled points y from X."""
     y_knn = ut.cos_knn(y, X, nn_k)
     for ii in range(self.r):
-      U, b = ut.reg_pca(y_knn[ii, :], self.d, affine=self.affine)
+      U, _ = ut.reg_pca(y_knn[ii, :], self.d)
       self.Us.data[ii, jj, :] = U
-      if self.affine:
-        self.bs.data[ii, jj, :] = b
     return
 
   def forward(self, x):
@@ -718,6 +736,7 @@ class KSubspaceMFModel(KSubspaceBaseModel):
     """Divide gradients by an estimate of the Lipschitz constant, per
     replicate."""
     if self.Lip is None or (update and self.steps % self.scale_grad_freq == 0):
+      device = self.z.device
       batch_size = self.c.shape[0]
       z_zero = self.c.permute(1, 2, 0).unsqueeze(3) * self.z
       Hess = torch.matmul(z_zero.transpose(2, 3), z_zero).div_(batch_size)
@@ -725,15 +744,15 @@ class KSubspaceMFModel(KSubspaceBaseModel):
       # (r, k)
       batch_cluster_sizes = self.c.sum(dim=0)
       lamb = ((self.reg_params['U_frosqr_in']/batch_size) *
-          batch_cluster_sizes + self.reg_params['U_frosqr_out'])
+          batch_cluster_sizes + self.reg_params['U_frosqr_out']).to(device)
       # (r, k, d, d)
-      Id = torch.eye(self.d, device=self.z.device).mul(
+      Id = torch.eye(self.d, device=device).mul(
           lamb.view(self.r, self.k, 1, 1))
       Hess.add_(Id)
 
       # (r, k)
       Lip = np.linalg.norm(Hess.cpu().numpy(), ord=2, axis=(2, 3))
-      Lip = torch.from_numpy(Lip).to(Hess.device)
+      Lip = torch.from_numpy(Lip).to(device)
       # (r,)
       self.Lip = Lip.max(dim=1)[0].view(self.r, 1, 1, 1)
     Grad_scale = Grad.div(self.Lip)
