@@ -41,7 +41,7 @@ def train_synth_kmeans_cluster(args):
   reg_params = {
       'b_frosqr_out': args.b_frosqr_out_lamb
   }
-  if args.reset_cache_size is None or args.reset_cache_size <= 0:
+  if args.reset_cache_size is not None and args.reset_cache_size <= 0:
     args.reset_cache_size = synth_dataset.N
 
   tic = time.time()
@@ -69,7 +69,8 @@ def train_synth_kmeans_cluster(args):
   optimizer = None
   tr.train_loop(model, synth_data_loader, device, optimizer, args.out_dir,
       args.epochs, args.chkp_freq, args.stop_freq, scheduler=None,
-      eval_rank=False, reset_unused=args.reset_unused, init_time=init_time)
+      eval_rank=False, reset_unused=args.reset_unused,
+      save_data=args.save_large_data, init_time=init_time)
   return
 
 
@@ -129,7 +130,8 @@ if __name__ == '__main__':
                       help=('Scale of perturbation to add after reset '
                       '[default: 0.05]'))
   parser.add_argument('--reset-cache-size', type=int, default=None,
-                      help='Num samples for reset assign obj [default: N]')
+                      help=('Num samples for reset assign obj '
+                      '[default: 4 k log k]'))
   parser.add_argument('--cuda', type=ut.boolarg, default=False,
                       help='Enable CUDA training [default: 0]')
   parser.add_argument('--num-threads', type=int, default=1,
@@ -140,6 +142,8 @@ if __name__ == '__main__':
                       help='How often to save checkpoints [default: None]')
   parser.add_argument('--stop-freq', type=int, default=None,
                       help='How often to stop in ipdb [default: None]')
+  parser.add_argument('--save-large-data', type=ut.boolarg, default=True,
+                      help='Save larger data [default: 1]')
   args = parser.parse_args()
 
   train_synth_kmeans_cluster(args)

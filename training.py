@@ -33,7 +33,7 @@ def train_loop(model, data_loader, device, optimizer, out_dir=None, epochs=200,
     eval_rank: evaluate ranks of group models, only implemented for subspace
       models (default: False)
     reset_unused: whether to reset unused clusters (default: False)
-    save_data: whether to save conf_mats, svs, resets (default: True)
+    save_data: whether to save bigger data, ie conf_mats, svs (default: True)
     init_time: initialization time to add to first epoch (default: 0.0)
   """
   printformstr = ('(epoch {:d}/{:d}) lr={:.1e} '
@@ -155,15 +155,15 @@ def train_loop(model, data_loader, device, optimizer, out_dir=None, epochs=200,
     if out_dir is not None:
       with open('{}/metrics.npz'.format(out_dir), 'wb') as f:
         np.savez(f, metrics=metrics[:epoch, :])
+      if reset_unused:
+        with open('{}/resets.npz'.format(out_dir), 'wb') as f:
+          np.savez(f, resets=resets)
       if save_data:
         with open('{}/conf_mats.npz'.format(out_dir), 'wb') as f:
           np.savez(f, conf_mats=conf_mats[:epoch, :])
         if eval_rank:
           with open('{}/svs.npz'.format(out_dir), 'wb') as f:
             np.savez(f, svs=svs[:epoch, :])
-        if reset_unused:
-          with open('{}/resets.npz'.format(out_dir), 'wb') as f:
-            np.savez(f, resets=resets)
     if err is not None:
       raise err
   return conf_mats, svs, resets
