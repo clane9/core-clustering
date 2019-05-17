@@ -8,13 +8,17 @@ import argparse
 import os
 import shutil
 import json
+import time
 
+import numpy as np
 import torch
 from torch.utils.data import DataLoader
+from torch.optim.lr_scheduler import ReduceLROnPlateau
 
 import datasets as dat
 import models as mod
 import training as tr
+import utils as ut
 
 
 def train_synth_uos_cluster(args):
@@ -33,31 +37,33 @@ def train_synth_uos_cluster(args):
 
   # construct dataset
   torch.manual_seed(args.data_seed)
+  if args.Ng is None:
+    args.Ng = args.N // args.k
+    args.N = args.Ng * args.k
+  else:
+    # Ng takes precedent if neither is None
+    args.N = args.k * args.Ng
+
   if args.online:
-    if args.N is None:
-      args.N = args.n * args.Ng
     if batch_alt_mode:
       raise ValueError(("Online mode not compatible with "
           "batch_alt formulation."))
     if args.miss_rate > 0:
-      synth_dataset = dat.SynthUoSMissOnlineDataset(args.n, args.d, args.D,
+      synth_dataset = dat.SynthUoSMissOnlineDataset(args.k, args.d, args.D,
           args.N, args.affine, args.sigma, args.theta, args.miss_rate,
           args.normalize, args.data_seed)
     else:
-      synth_dataset = dat.SynthUoSOnlineDataset(args.n, args.d, args.D,
+      synth_dataset = dat.SynthUoSOnlineDataset(args.k, args.d, args.D,
           args.N, args.affine, args.sigma, args.theta, args.normalize,
           args.data_seed)
     shuffle_data = False
   else:
-    if args.Ng is None:
-      args.Ng = args.N // args.n
-      args.N = args.Ng * args.n
     if args.miss_rate > 0:
-      synth_dataset = dat.SynthUoSMissDataset(args.n, args.d, args.D, args.Ng,
+      synth_dataset = dat.SynthUoSMissDataset(args.k, args.d, args.D, args.Ng,
           args.affine, args.sigma, args.theta, args.miss_rate, args.normalize,
           args.data_seed)
     else:
-      synth_dataset = dat.SynthUoSDataset(args.n, args.d, args.D, args.Ng,
+      synth_dataset = dat.SynthUoSDataset(args.k, args.d, args.D, args.Ng,
           args.affine, args.sigma, args.theta, args.normalize, args.data_seed)
     shuffle_data = True
   kwargs = {'num_workers': args.num_workers}
@@ -73,18 +79,27 @@ def train_synth_uos_cluster(args):
   torch.manual_seed(args.seed)
   if args.model_d is None or args.model_d <= 0:
     args.model_d = args.d
-  if args.model_n is None or args.model_n <= 0:
-    args.model_n = args.n
+  if args.model_k is None or args.model_k <= 0:
+    args.model_k = args.k
+  reset_kwargs = dict(reset_patience=args.reset_patience,
+      reset_jitter=args.reset_jitter,
+      reset_try_tol=args.reset_try_tol,
+      reset_accept_tol=args.reset_accept_tol,
+      reset_stochastic=args.reset_stochastic,
+      reset_low_value=args.reset_low_value,
+      reset_value_thr=args.reset_value_thr,
+      reset_sigma=args.reset_sigma,
+      reset_cache_size=args.reset_cache_size)
+
+  tic = time.time()
   if args.form == 'batch-alt-proj':
     reg_params = {
         'U_frosqr_in': args.U_frosqr_in_lamb,
         'U_frosqr_out': args.U_frosqr_out_lamb
     }
-    model = mod.KSubspaceBatchAltProjModel(args.model_n, args.model_d,
+    model = mod.KSubspaceBatchAltProjModel(args.model_k, args.model_d,
         synth_dataset, args.affine, args.reps, reg_params=reg_params,
-        reset_patience=args.reset_patience, reset_try_tol=args.reset_try_tol,
-        reset_accept_tol=args.reset_accept_tol, reset_sigma=args.reset_sigma,
-        svd_solver='randomized')
+        svd_solver='randomized', **reset_kwargs)
   elif args.form == 'batch-alt-mf':
     reg_params = {
         'U_frosqr_in': args.U_frosqr_in_lamb / args.z_lamb,
@@ -93,11 +108,9 @@ def train_synth_uos_cluster(args):
             max(args.U_frosqr_in_lamb, args.U_frosqr_out_lamb) > 0
             else 0.0)
     }
-    model = mod.KSubspaceBatchAltMFModel(args.model_n, args.model_d,
+    model = mod.KSubspaceBatchAltMFModel(args.model_k, args.model_d,
         synth_dataset, args.affine, args.reps, reg_params=reg_params,
-        reset_patience=args.reset_patience, reset_try_tol=args.reset_try_tol,
-        reset_accept_tol=args.reset_accept_tol, reset_sigma=args.reset_sigma,
-        svd_solver='randomized')
+        svd_solver='randomized', **reset_kwargs)
   elif args.form == 'mf':
     if args.miss_rate > 0:
       reg_params = {
@@ -108,10 +121,8 @@ def train_synth_uos_cluster(args):
               else 0.0),
           'e': 1.0
       }
-      model = mod.KSubspaceMCModel(args.model_n, args.model_d, args.D,
-          args.affine, args.reps, reg_params=reg_params,
-          reset_patience=args.reset_patience, reset_try_tol=args.reset_try_tol,
-          reset_accept_tol=args.reset_accept_tol, reset_sigma=args.reset_sigma)
+      model = mod.KSubspaceMCModel(args.model_k, args.model_d, args.D,
+          args.affine, args.reps, reg_params=reg_params, **reset_kwargs)
     else:
       reg_params = {
           'U_frosqr_in': args.U_frosqr_in_lamb / args.z_lamb,
@@ -120,26 +131,29 @@ def train_synth_uos_cluster(args):
               max(args.U_frosqr_in_lamb, args.U_frosqr_out_lamb) > 0
               else 0.0)
       }
-      model = mod.KSubspaceMFModel(args.model_n, args.model_d,
-          args.D, args.affine, args.reps, reg_params=reg_params,
-          reset_patience=args.reset_patience, reset_try_tol=args.reset_try_tol,
-          reset_accept_tol=args.reset_accept_tol, reset_sigma=args.reset_sigma)
-  else:
+
+      model = mod.KSubspaceMFModel(args.model_k, args.model_d, args.D,
+          args.affine, args.reps, reg_params=reg_params,
+          scale_grad_freq=args.scale_grad_freq, **reset_kwargs)
+  elif args.form == 'proj':
     reg_params = {
         'U_frosqr_in': args.U_frosqr_in_lamb,
         'U_frosqr_out': args.U_frosqr_out_lamb
     }
-    model = mod.KSubspaceProjModel(args.model_n, args.model_d, args.D,
-        args.affine, args.reps, reg_params=reg_params,
-        reset_patience=args.reset_patience, reset_try_tol=args.reset_try_tol,
-        reset_accept_tol=args.reset_accept_tol, reset_sigma=args.reset_sigma)
+    model = mod.KSubspaceProjModel(args.model_k, args.model_d, args.D,
+        args.affine, args.reps, reg_params=reg_params, **reset_kwargs)
+  else:
+    raise ValueError("formulation {} not recognized".format(args.form))
   if args.prob_farthest_insert:
-    model.prob_farthest_insert(synth_dataset.X, nn_q=0)
+    model.prob_farthest_insert(synth_dataset.X,
+        nn_q=int(np.ceil(0.2*args.model_d)))
+  init_time = time.time() - tic
   model = model.to(device)
 
   # optimizer
   if batch_alt_mode:
     optimizer = None
+    scheduler = None
   else:
     if args.optim == 'SGD':
       optimizer = torch.optim.SGD(model.parameters(), lr=args.init_lr,
@@ -149,9 +163,19 @@ def train_synth_uos_cluster(args):
           betas=(0.9, 0.9), amsgrad=True)
     else:
       raise ValueError("Invalid optimizer {}.".format(args.optim))
+    min_lr = max(1e-8, 0.1**4 * args.init_lr)
+    if args.reset_unused:
+      patience = int(np.ceil(3 * args.reset_patience /
+          (args.N // args.batch_size)))
+      threshold = args.reset_try_tol/10
+    else:
+      patience = 10
+      threshold = 1e-4
+    scheduler = ReduceLROnPlateau(optimizer, factor=0.5, patience=patience,
+        threshold=threshold, min_lr=min_lr)
 
   if args.chkp_freq is None or args.chkp_freq <= 0:
-    args.chkp_freq = args.epochs + 2
+    args.chkp_freq = args.epochs + 1
   if args.stop_freq is None or args.stop_freq <= 0:
     args.stop_freq = -1
 
@@ -160,9 +184,9 @@ def train_synth_uos_cluster(args):
     json.dump(args.__dict__, f, sort_keys=True, indent=4)
 
   tr.train_loop(model, synth_data_loader, device, optimizer, args.out_dir,
-      args.epochs, args.chkp_freq, args.stop_freq, scheduler=None,
+      args.epochs, args.chkp_freq, args.stop_freq, scheduler=scheduler,
       eval_rank=args.eval_rank, reset_unused=args.reset_unused,
-      save_data=(not args.no_save_data))
+      save_data=args.save_large_data, init_time=init_time)
   return
 
 
@@ -171,7 +195,7 @@ if __name__ == '__main__':
   parser.add_argument('--out-dir', type=str, required=True,
                       help='Output directory.')
   # data settings
-  parser.add_argument('--n', type=int, default=10,
+  parser.add_argument('--k', type=int, default=10,
                       help='Number of subspaces [default: 10]')
   parser.add_argument('--d', type=int, default=10,
                       help='Subspace dimension [default: 10]')
@@ -181,8 +205,8 @@ if __name__ == '__main__':
                       help='Points per group [default: 1000]')
   parser.add_argument('--N', type=int, default=None,
                       help='Alternatively, total data points [default: None]')
-  parser.add_argument('--affine', action='store_true',
-                      help='Affine setting')
+  parser.add_argument('--affine', type=ut.boolarg, default=False,
+                      help='Affine setting [default: 0]')
   parser.add_argument('--sigma', type=float, default=0.01,
                       help='Data noise sigma [default: 0.01]')
   parser.add_argument('--theta', type=float, default=None,
@@ -190,20 +214,23 @@ if __name__ == '__main__':
                       '[default: None]'))
   parser.add_argument('--miss-rate', type=float, default=0.0,
                       help='Data missing rate [default: 0.0]')
-  parser.add_argument('--normalize', action='store_true',
-                      help='Project data onto sphere')
+  parser.add_argument('--normalize', type=ut.boolarg, default=False,
+                      help='Project data onto sphere [default: 0]')
   parser.add_argument('--data-seed', type=int, default=1904,
                       help='Data random seed [default: 1904]')
-  parser.add_argument('--online', action='store_true',
-                      help='Online data generation')
+  parser.add_argument('--online', type=ut.boolarg, default=False,
+                      help='Online data generation [default: 0]')
   # model settings
-  parser.add_argument('--form', type=str, default='proj',
+  parser.add_argument('--form', type=str, default='mf',
                       help=('Model formulation (proj, mf, batch-alt-proj, '
-                      'batch-alt-mf) [default: proj]'))
-  parser.add_argument('--reps', type=int, default=5,
-                      help='Number of model replicates [default: 5]')
-  parser.add_argument('--model-n', type=int, default=None,
-                      help='Model number of subspaces [default: n]')
+                      'batch-alt-mf) [default: mf]'))
+  parser.add_argument('--prob-farthest-insert', type=ut.boolarg, default=False,
+                      help=('Initialize by probabilistic farthest insertion '
+                      '[default: 0]'))
+  parser.add_argument('--reps', type=int, default=6,
+                      help='Number of model replicates [default: 6]')
+  parser.add_argument('--model-k', type=int, default=None,
+                      help='Model number of subspaces [default: k]')
   parser.add_argument('--model-d', type=int, default=None,
                       help='Model subspace dimension [default: d]')
   parser.add_argument('--U-frosqr-in-lamb', type=float, default=0.01,
@@ -215,9 +242,6 @@ if __name__ == '__main__':
   parser.add_argument('--z-lamb', type=float, default=0.01,
                       help=('L2 squared coefficient reg parameter, '
                       'inside assignment [default: 0.01]'))
-  parser.add_argument('--prob-farthest-insert', action='store_true',
-                      default=False, help=('Initialize by probabilistic '
-                      'farthest insertion'))
   # training settings
   parser.add_argument('--batch-size', type=int, default=100,
                       help='Input batch size for training [default: 100]')
@@ -225,38 +249,54 @@ if __name__ == '__main__':
                       help='Number of epochs to train [default: 50]')
   parser.add_argument('--optim', type=str, default='SGD',
                       help='Optimizer [default: SGD]')
-  parser.add_argument('--init-lr', type=float, default=0.5,
-                      help='Initial learning rate [default: 0.5]')
-  parser.add_argument('--reset-unused', action='store_true', default=False,
-                      help='Reset nearly unused clusters')
-  parser.add_argument('--reset-patience', type=int, default=2,
-                      help=('Epochs to wait without obj decrease '
-                      'before trying to reset [default: 2]'))
+  parser.add_argument('--init-lr', type=float, default=1.0,
+                      help='Initial learning rate [default: 1.0]')
+  parser.add_argument('--scale-grad-freq', type=int, default=100,
+                      help=('How often to re-compute local Lipschitz for MF '
+                      'formulation [default: 100]'))
+  parser.add_argument('--reset-unused', type=ut.boolarg, default=False,
+                      help='Reset nearly unused clusters [default: 0]')
+  parser.add_argument('--reset-patience', type=int, default=50,
+                      help=('Steps to wait without obj decrease '
+                      'before trying to reset [default: 50]'))
+  parser.add_argument('--reset-jitter', type=ut.boolarg, default=True,
+                      help='Jitter reset patience [default: 1]')
+  parser.add_argument('--reset-low-value', type=ut.boolarg, default=True,
+                      help='Choose low value cluster to reset [default: 1]')
+  parser.add_argument('--reset-value-thr', type=float, default=0.1,
+                      help=('Value threshold for low value clusters '
+                      '[default: 0.1]'))
+  parser.add_argument('--reset-stochastic', type=ut.boolarg, default=False,
+                      help=('Choose reset substitution stochastically '
+                      '[default: 0]'))
   parser.add_argument('--reset-try-tol', type=float, default=0.01,
                       help=('Objective decrease tolerance for deciding'
                       'when to reset [default: 0.01]'))
-  parser.add_argument('--reset-accept-tol', type=float, default=1e-3,
+  parser.add_argument('--reset-accept-tol', type=float, default=0.01,
                       help=('Objective decrease tolerance for accepting'
-                      'a reset [default: 1e-3]'))
+                      'a reset [default: 0.01]'))
   parser.add_argument('--reset-sigma', type=float, default=0.05,
                       help=('Scale of perturbation to add after reset '
                       '[default: 0.05]'))
-  parser.add_argument('--cuda', action='store_true', default=False,
-                      help='Enables CUDA training')
+  parser.add_argument('--reset-cache-size', type=int, default=None,
+                      help=('Num samples for reset assign obj '
+                      '[default: 4 k log k]'))
+  parser.add_argument('--cuda', type=ut.boolarg, default=False,
+                      help='Enables CUDA training [default: 0]')
   parser.add_argument('--num-threads', type=int, default=1,
                       help='Number of parallel threads to use [default: 1]')
   parser.add_argument('--num-workers', type=int, default=1,
                       help='Number of workers for data loading [default: 1]')
   parser.add_argument('--seed', type=int, default=2018,
                       help='Training random seed [default: 2018]')
-  parser.add_argument('--eval-rank', action='store_true', default=False,
-                      help='Evaluate ranks of subspace models')
+  parser.add_argument('--eval-rank', type=ut.boolarg, default=False,
+                      help='Evaluate ranks of subspace models [default: 0]')
   parser.add_argument('--chkp-freq', type=int, default=None,
                       help='How often to save checkpoints [default: None]')
   parser.add_argument('--stop-freq', type=int, default=None,
                       help='How often to stop in ipdb [default: None]')
-  parser.add_argument('--no-save-data', action='store_true', default=False,
-                      help='Don\'t save extra data')
+  parser.add_argument('--save-large-data', type=ut.boolarg, default=True,
+                      help='Save larger data [default: 1]')
   args = parser.parse_args()
 
   train_synth_uos_cluster(args)

@@ -82,6 +82,8 @@ def train_loop(model, data_loader, device, optimizer, out_dir=None, epochs=200,
     min_lr = max(EPS, 0.5**10 * max_lr)
     scheduler = ReduceLROnPlateau(optimizer, factor=0.5, patience=10,
         threshold=(model.reset_try_tol/10), min_lr=min_lr)
+  elif scheduler is not None:
+    min_lr = scheduler.min_lrs[0]
 
   # training loop
   err = None
@@ -176,8 +178,8 @@ def train_epoch(model, data_loader, optimizer, device, eval_rank=False,
   metrics = None
   resets = []
   conf_mats, sampsec = [ut.AverageMeter() for _ in range(2)]
+  tic = time.time()
   for x, groups in data_loader:
-    tic = time.time()
     x = x.to(device)
 
     # opt step
@@ -219,7 +221,9 @@ def train_epoch(model, data_loader, optimizer, device, eval_rank=False,
       if batch_resets.shape[0] > 0:
         resets.append(batch_resets)
 
-    batch_time = time.time() - tic
+    toc = time.time()
+    batch_time = toc - tic
+    tic = toc
     sampsec.update(batch_size/batch_time, batch_size)
     if torch.isnan(batch_obj_mean):
       raise RuntimeError('Divergence! NaN objective.')
@@ -255,7 +259,7 @@ def train_epoch(model, data_loader, optimizer, device, eval_rank=False,
   metrics = torch.stack([errors] + [met.avg for met in metrics])
   metrics_summary = torch.stack([metrics.min(dim=1)[0],
       metrics.median(dim=1)[0], metrics.max(dim=1)[0]], dim=1)
-  metrics = metrics.cpu().numpy()
+  metrics = metrics.numpy()
   metrics = np.concatenate((metrics, rep_reset_counts))
   metrics_summary = metrics_summary.view(-1).numpy().tolist()
   metrics_summary = (metrics_summary + rank_stats +
