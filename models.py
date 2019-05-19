@@ -171,7 +171,7 @@ class KSubspaceBaseModel(nn.Module):
     znormsqr = z.pow(2).sum(dim=3)
     # (N, r, k')
     # assumes x_i are normalized
-    loss = (1.0 - znormsqr).mul(0.5).permute(2, 0, 1)
+    loss = (1.0 - znormsqr).mul(0.5).permute(2, 0, 1).clamp(min=0)
     return loss
 
   def _insert_next(self, jj, y, X, nn_k):
