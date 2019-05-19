@@ -37,11 +37,11 @@ def train_synth_uos_cluster(args):
 
   # construct dataset
   torch.manual_seed(args.data_seed)
-  if args.Ng is None:
+  if args.Ng is None or args.Ng <= 0:
     args.Ng = args.N // args.k
     args.N = args.Ng * args.k
   else:
-    # Ng takes precedent if neither is None
+    # Ng takes precedent if both given
     args.N = args.k * args.Ng
 
   if args.online:
