@@ -39,14 +39,14 @@ def train_loop(model, data_loader, device, optimizer, out_dir=None, epochs=200,
   printformstr = ('(epoch {:d}/{:d}) lr={:.1e} '
       'err={:.3f},{:.3f},{:.3f} obj={:.2e},{:.2e},{:.2e} '
       'loss={:.1e},{:.1e},{:.1e} reg.in={:.1e},{:.1e},{:.1e} '
-      'reg.out={:.1e},{:.1e},{:.1e} |x_|={:.1e},{:.1e},{:.1e} ')
+      'reg.out={:.1e},{:.1e},{:.1e} ')
   if eval_rank:
     printformstr += 'rank={:.0f},{:.0f},{:.0f} '
   printformstr += 'resets={:d} samp/s={:.0f} rtime={:.2f}'
 
   if out_dir is not None:
     logheader = ('Epoch,LR,' + ','.join(['{}.{}'.format(met, meas)
-        for met in ['Err', 'Obj', 'Loss', 'Reg.in', 'Reg.out', 'Norm.x_']
+        for met in ['Err', 'Obj', 'Loss', 'Reg.in', 'Reg.out']
         for meas in ['min', 'med', 'max']]) + ',')
     if eval_rank:
       logheader += 'Rank.min,Rank.med,Rank.max,'
@@ -54,8 +54,7 @@ def train_loop(model, data_loader, device, optimizer, out_dir=None, epochs=200,
 
     logformstr = ('{:d},{:.9e},{:.9f},{:.9f},{:.9f},'
         '{:.9e},{:.9e},{:.9e},{:.9e},{:.9e},{:.9e},'
-        '{:.9e},{:.9e},{:.9e},{:.9e},{:.9e},{:.9e},'
-        '{:.9e},{:.9e},{:.9e},')
+        '{:.9e},{:.9e},{:.9e},{:.9e},{:.9e},{:.9e},')
     if eval_rank:
       logformstr += '{:.0f},{:.9f},{:.0f},'
     logformstr += '{:d},{:.0f},{:.9f}'
@@ -68,8 +67,8 @@ def train_loop(model, data_loader, device, optimizer, out_dir=None, epochs=200,
 
   batch_alt_mode = isinstance(model, KSubspaceBatchAltBaseModel)
 
-  # dim 1: err, obj, loss, reg.in, reg.out, |x_|, resets
-  metrics = np.zeros((epochs, 7, model.r), dtype=np.float32)
+  # dim 1: err, obj, loss, reg.in, reg.out, resets
+  metrics = np.zeros((epochs, 6, model.r), dtype=np.float32)
   true_n = (model.true_classes.size if batch_alt_mode
       else data_loader.dataset.classes.size)
   conf_mats = np.zeros((epochs, model.r, model.k, true_n), dtype=np.int64)
@@ -185,16 +184,14 @@ def train_epoch(model, data_loader, optimizer, device, eval_rank=False,
     # opt step
     optimizer.zero_grad()
     (batch_obj_mean, batch_obj, batch_loss,
-        batch_reg_in, batch_reg_out, x_) = model.objective(x)
+        batch_reg_in, batch_reg_out) = model.objective(x)
     batch_obj_mean.backward()
     optimizer.step()
 
     # zero out near zero bases to improve numerical performance
     model.zero()
 
-    batch_norm_x_ = model.eval_shrink(x, x_)
-    batch_metrics = [batch_obj, batch_loss, batch_reg_in, batch_reg_out,
-        batch_norm_x_]
+    batch_metrics = [batch_obj, batch_loss, batch_reg_in, batch_reg_out]
 
     # eval batch cluster confusion
     batch_conf_mats = torch.stack([
@@ -270,10 +267,9 @@ def train_epoch(model, data_loader, optimizer, device, eval_rank=False,
 def batch_alt_step(model, eval_rank=False, reset_unused=False):
   """Take one full batch alt min step and record convergence measures."""
   epoch_tic = time.time()
-  _, obj, loss, reg_in, reg_out, x_ = model.objective()
+  _, obj, loss, reg_in, reg_out = model.objective()
   model.step()
 
-  norm_x_ = model.eval_shrink(x_)
   # eval cluster confusion
   conf_mats = torch.stack([
       torch.from_numpy(ut.eval_confusion(model.groups[:, ii],
@@ -311,7 +307,7 @@ def batch_alt_step(model, eval_rank=False, reset_unused=False):
     rank_stats, svs = [], None
 
   metrics = torch.stack([errors, obj.cpu(), loss.cpu(), reg_in.cpu(),
-      reg_out.cpu(), norm_x_.cpu()])
+      reg_out.cpu()])
   metrics_summary = torch.stack([metrics.min(dim=1)[0],
       metrics.median(dim=1)[0], metrics.max(dim=1)[0]], dim=1)
   metrics = metrics.numpy()

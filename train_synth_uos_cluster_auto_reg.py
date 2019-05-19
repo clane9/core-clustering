@@ -30,7 +30,7 @@ def set_args(args):
   if args.sigma_hat is None or args.sigma_hat < 0:
     args.sigma_hat = args.sigma
   if args.min_size is None or args.min_size < 0:
-    args.min_size = 0.01
+    args.min_size = 0.0
   if args.min_size >= 1:
     raise ValueError("min size {} should be < 1.".format(args.min_size))
 
@@ -63,8 +63,8 @@ if __name__ == '__main__':
                       help='Alternatively, total data points [default: None]')
   parser.add_argument('--affine', type=ut.boolarg, default=False,
                       help='Affine setting [default: 0]')
-  parser.add_argument('--sigma', type=float, default=0.01,
-                      help='Data noise sigma [default: 0.01]')
+  parser.add_argument('--sigma', type=float, default=0.4,
+                      help='Data noise sigma [default: 0.4]')
   parser.add_argument('--theta', type=float, default=None,
                       help=('Principal angles between subspaces '
                       '[default: None]'))
@@ -72,8 +72,8 @@ if __name__ == '__main__':
                       help='Data missing rate [default: 0.0]')
   parser.add_argument('--normalize', type=ut.boolarg, default=False,
                       help='Project data onto sphere [default: 0]')
-  parser.add_argument('--data-seed', type=int, default=1904,
-                      help='Data random seed [default: 1904]')
+  parser.add_argument('--data-seed', type=int, default=2001,
+                      help='Data random seed [default: 2001]')
   parser.add_argument('--online', type=ut.boolarg, default=False,
                       help='Online data generation [default: 0]')
   # model settings
@@ -91,33 +91,33 @@ if __name__ == '__main__':
                       help='Model subspace dimension [default: d]')
   parser.add_argument('--sigma-hat', type=float, default=None,
                       help='Noise estimate [default: sigma]')
-  parser.add_argument('--min-size', type=float, default=None,
+  parser.add_argument('--min-size', type=float, default=0.0,
                       help=('Minimum cluster size as fraction relative to 1/n'
-                      '[default: 0.01]'))
+                      '[default: 0.0]'))
   # training settings
   parser.add_argument('--batch-size', type=int, default=100,
                       help='Input batch size for training [default: 100]')
-  parser.add_argument('--epochs', type=int, default=50,
-                      help='Number of epochs to train [default: 50]')
+  parser.add_argument('--epochs', type=int, default=20,
+                      help='Number of epochs to train [default: 20]')
   parser.add_argument('--optim', type=str, default='SGD',
                       help='Optimizer [default: SGD]')
-  parser.add_argument('--init-lr', type=float, default=1.0,
-                      help='Initial learning rate [default: 1.0]')
-  parser.add_argument('--scale-grad-freq', type=int, default=100,
+  parser.add_argument('--init-lr', type=float, default=0.5,
+                      help='Initial learning rate [default: 0.5]')
+  parser.add_argument('--scale-grad-freq', type=int, default=20,
                       help=('How often to re-compute local Lipschitz for MF '
-                      'formulation [default: 100]'))
-  parser.add_argument('--reset-unused', type=ut.boolarg, default=False,
-                      help='Reset nearly unused clusters [default: 0]')
-  parser.add_argument('--reset-patience', type=int, default=50,
+                      'formulation [default: 20]'))
+  parser.add_argument('--reset-unused', type=ut.boolarg, default=True,
+                      help='Reset nearly unused clusters [default: 1]')
+  parser.add_argument('--reset-patience', type=int, default=100,
                       help=('Steps to wait without obj decrease '
-                      'before trying to reset [default: 50]'))
-  parser.add_argument('--reset-jitter', type=ut.boolarg, default=True,
-                      help='Jitter reset patience [default: 1]')
+                      'before trying to reset [default: 100]'))
+  parser.add_argument('--reset-jitter', type=ut.boolarg, default=False,
+                      help='Jitter reset patience [default: 0]')
   parser.add_argument('--reset-low-value', type=ut.boolarg, default=True,
                       help='Choose low value cluster to reset [default: 1]')
-  parser.add_argument('--reset-value-thr', type=float, default=0.1,
+  parser.add_argument('--reset-value-thr', type=float, default=0.2,
                       help=('Value threshold for low value clusters '
-                      '[default: 0.1]'))
+                      '[default: 0.2]'))
   parser.add_argument('--reset-stochastic', type=ut.boolarg, default=False,
                       help=('Choose reset substitution stochastically '
                       '[default: 0]'))
@@ -127,12 +127,15 @@ if __name__ == '__main__':
   parser.add_argument('--reset-accept-tol', type=float, default=0.01,
                       help=('Objective decrease tolerance for accepting'
                       'a reset [default: 0.01]'))
-  parser.add_argument('--reset-sigma', type=float, default=0.05,
+  parser.add_argument('--reset-sigma', type=float, default=0.0,
                       help=('Scale of perturbation to add after reset '
-                      '[default: 0.05]'))
+                      '[default: 0.0]'))
   parser.add_argument('--reset-cache-size', type=int, default=None,
                       help=('Num samples for reset assign obj '
                       '[default: 4 k log k]'))
+  parser.add_argument('--serial-eval', type=str, default=None,
+                      help=('Serial evaluation mode, one of '
+                      '(none, r, k, r,k) [default: None]'))
   parser.add_argument('--cuda', type=ut.boolarg, default=False,
                       help='Enables CUDA training [default: 0]')
   parser.add_argument('--num-threads', type=int, default=1,
@@ -150,7 +153,5 @@ if __name__ == '__main__':
   parser.add_argument('--save-large-data', type=ut.boolarg, default=True,
                       help='Save larger data [default: 1]')
   args = parser.parse_args()
-
   args = set_args(args)
-
   tr.train_synth_uos_cluster(args)

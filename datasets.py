@@ -112,12 +112,9 @@ class SynthUoSMissDataset(SynthUoSDataset):
 
     # sample observed entries uniformly
     self.miss_rate = miss_rate
-    self.Omega = (self.rng.rand(self.N, self.D) >=
-        miss_rate).astype(np.float32)
-    self.Omega = torch.tensor(self.Omega, dtype=torch.float32)
-
-    # NOTE: X is not masked by Omega
-    self.X = torch.stack((self.X, self.Omega), dim=1)
+    self.Omega = (torch.tensor(self.rng.rand(self.N, self.D),
+        dtype=torch.float32) >= miss_rate)
+    self.X[self.Omega == 0] = np.nan
     return
 
 
@@ -170,9 +167,8 @@ class SynthUoSMissOnlineDataset(SynthUoSOnlineDataset):
 
   def __getitem__(self, ii):
     x, grp = super().__getitem__(ii)
-    omega = (torch.rand(self.D) >= self.miss_rate).to(torch.float32)
-    # NOTE: X is not masked by Omega
-    x = torch.stack((x, omega), dim=0)
+    omegac = (torch.rand(self.D) < self.miss_rate)
+    x[omegac] = np.nan
     return x, grp
 
 

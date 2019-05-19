@@ -17,10 +17,10 @@ class KSubspaceBaseModel(nn.Module):
   assign_reg_terms = set()
 
   def __init__(self, k, d, D, affine=False, replicates=5, reg_params={},
-        reset_patience=100, reset_jitter=True, reset_try_tol=0.01,
-        reset_max_steps=None, reset_accept_tol=1e-4, reset_stochastic=True,
-        reset_low_value=False, reset_value_thr=0.1, reset_sigma=0.05,
-        reset_cache_size=None, cache_subsample_rate=None):
+        serial_eval={}, reset_patience=100, reset_jitter=True,
+        reset_try_tol=0.01, reset_max_steps=None, reset_accept_tol=1e-4,
+        reset_stochastic=True, reset_low_value=False, reset_value_thr=0.1,
+        reset_sigma=0.05, reset_cache_size=None, cache_subsample_rate=None):
 
     if replicates < 1:
       raise ValueError("Invalid replicates parameter {}".format(replicates))
@@ -32,6 +32,8 @@ class KSubspaceBaseModel(nn.Module):
         raise ValueError("Invalid {} reg parameter {}".format(k, val))
     if not set(reg_params).issubset(set(self.default_reg_params)):
       raise ValueError("Invalid reg parameter keys")
+    if not set(serial_eval).issubset({'r', 'k'}):
+      raise ValueError("Invalid serial eval mode.".format(serial_eval))
     if reset_patience <= 0:
       raise ValueError("Invalid reset_patience parameter {}".format(
           reset_patience))
@@ -49,6 +51,7 @@ class KSubspaceBaseModel(nn.Module):
     self.affine = affine
     self.replicates = self.r = replicates
     self.reg_params = reg_params
+    self.serial_eval = set(serial_eval)
 
     self.reset_patience = reset_patience
     self.reset_jitter = reset_jitter
@@ -74,8 +77,12 @@ class KSubspaceBaseModel(nn.Module):
     # group assignment, ultimate shape (batch_size, r, k)
     self.c = None
     self.groups = None
-    # subspace coefficients, ultimate shape (batch_size, r, k, d)
+    # subspace coefficient norms, shape (r, k, batch_size)
+    self.z_frosqr = None
+    # subspace coefficients, shape (r, k, batch_size, d)
+    # stored only if cache_z is True, since can be a large memory burden
     self.z = None
+    self.cache_z = False
 
     self.Us = nn.Parameter(torch.Tensor(self.r, k, D, d))
     if affine:
@@ -102,6 +109,7 @@ class KSubspaceBaseModel(nn.Module):
         torch.ones(reset_cache_size, self.r, k).mul_(np.nan))
     self.cache_assign_obj_head = 0
     self._reset_buffers = None
+
     return
 
   def reset_parameters(self):
@@ -174,38 +182,88 @@ class KSubspaceBaseModel(nn.Module):
       self.Us.data[ii, jj, :] = U
     return
 
-  def forward(self, x):
+  def forward(self, x, ii=None, jj=None):
     """Compute representation of x wrt each subspace.
 
     Input:
       x: data, shape (batch_size, D)
+      ii, jj: rep, cluster indices. Either int index or None.
 
     Returns:
       x_: reconstruction, shape (r, k, batch_size, D)
     """
-    z = self.encode(x)
-    self.z = z.data
-    x_ = self.decode(z)
+    z = self.encode(x, ii, jj)
+    x_ = self.decode(z, ii, jj)
+    x_ = x_.squeeze()
+    self._update_forward_cache(ii, jj, (z,))
     return x_
 
-  def decode(self, z):
+  def decode(self, z, ii=None, jj=None):
     """Embed low-dim code z into ambient space.
 
     Input:
       z: latent code, shape (r, k, batch_size, d)
+      ii, jj: rep, cluster indices. Either int index or None.
 
     Returns:
       x_: reconstruction, shape (r, k, batch_size, D)
     """
+    Us, bs = self._slice_Us_bs(ii, jj, no_grad=False)
     assert(z.dim() == 4 and
-        (z.size(0), z.size(1), z.size(3)) == (self.r, self.k, self.d))
+        (z.size(0), z.size(1)) == (Us.size(0), Us.size(1)))
 
     # x_ = U z + b
     # shape (r, k, batch_size, D)
-    x_ = torch.matmul(z, self.Us.transpose(2, 3))
+    x_ = torch.matmul(z, Us.transpose(2, 3))
     if self.affine:
       x_ = x_.add(self.bs.unsqueeze(2))
     return x_
+
+  def _slice_Us_bs(self, ii, jj, no_grad=True):
+    """Extract slice of Us, bs. Limited slicing supported, ii, jj must be index
+    or slice(None)."""
+    # don't lose dims
+    ii, jj = self._parse_slice(ii, jj)
+    Us = self.Us[ii, jj, :]
+    bs = self.bs[ii, jj, :] if self.affine else None
+    if no_grad:
+      Us = Us.data
+      if self.affine:
+        bs = bs.data
+    return Us, bs
+
+  def _parse_slice(self, ii, jj):
+    """Parse ii jj slice into Us, bs."""
+    # this is probably dumb but too tired..
+    if type(ii) is int and type(jj) is int:
+      ii = np.array([[ii]])
+      jj = np.array([[jj]])
+    elif type(ii) is int:
+      ii = np.array([ii])
+      jj = slice(None)
+    elif type(jj) is int:
+      ii = slice(None)
+      jj = np.array([jj])
+    else:
+      ii, jj = slice(None), slice(None)
+    return ii, jj
+
+  def _update_forward_cache(self, ii, jj, cache_vals):
+    """Update any cached values from forward call."""
+    z = cache_vals[0]
+    batch_size = z.shape[2]
+    device = z.device
+
+    if self.z_frosqr is None or self.z_frosqr.shape[2] != batch_size:
+      self.z_frosqr = torch.zeros(self.r, self.k, batch_size, device=device)
+      if self.cache_z:
+        self.z = torch.zeros(self.r, self.k, batch_size, self.d, device=device)
+
+    ii, jj = self._parse_slice(ii, jj)
+    self.z_frosqr[ii, jj, :] = z.data.pow(2).sum(dim=-1)
+    if self.cache_z:
+      self.z[ii, jj, :] = z
+    return
 
   def objective(self, x):
     """Evaluate objective function.
@@ -216,10 +274,8 @@ class KSubspaceBaseModel(nn.Module):
     Returns:
       obj_mean: average objective across replicates
       obj, loss, reg_in, reg_out: metrics per replicate, shape (r,)
-      x_: reconstruction, shape (r, k, batch_size, D)
     """
-    x_ = self(x)
-    loss = self.loss(x, x_)
+    loss = self.loss(x)
     reg = self.reg()
 
     # split regs into assign and outside terms
@@ -251,19 +307,32 @@ class KSubspaceBaseModel(nn.Module):
     nan_mask = torch.isnan(self.obj)
     self.obj[nan_mask] = obj.data[nan_mask]
     self.obj.mul_(EMA_DECAY).add_(1-EMA_DECAY, obj.data)
-    return obj_mean, obj.data, loss.data, reg_in.data, reg_out.data, x_.data
+    return obj_mean, obj.data, loss.data, reg_in.data, reg_out.data
 
-  def loss(self, x, x_):
+  def loss(self, x):
     """Evaluate reconstruction loss
 
     Inputs:
       x: data, shape (batch_size, D)
-      x_: reconstruction, shape (r, k, batch_size, D)
 
     Returns:
       loss: shape (batch_size, r, k)
     """
-    loss = torch.sum((x - x_)**2, dim=3).mul(0.5).permute(2, 0, 1)
+    batch_size = x.shape[0]
+    device = x.device
+    loss = torch.zeros(self.r, self.k, batch_size, device=device)
+
+    # Note that X[slice(None)] acts the same as X[:]
+    rep_range = range(self.r) if 'r' in self.serial_eval else [None]
+    cluster_range = range(self.k) if 'k' in self.serial_eval else [None]
+
+    for ii in rep_range:
+      for jj in cluster_range:
+        x_ = self.forward(x, ii, jj)
+        slci, slcj = self._parse_slice(ii, jj)
+        loss[slci, slcj, :] = torch.sum((x_ - x)**2, dim=-1).mul(0.5)
+
+    loss = loss.permute(2, 0, 1)
     return loss
 
   def set_assign(self, assign_obj):
@@ -628,27 +697,32 @@ class KSubspaceMFModel(KSubspaceBaseModel):
   default_reg_params = {
       'U_frosqr_in': 0.01,
       'U_frosqr_out': 1e-4,
-      'U_fro_out': 0.0,
-      'U_gram_fro_out': 0.0,
       'z': 0.01
   }
   assign_reg_terms = {'U_frosqr_in', 'z'}
 
   def __init__(self, k, d, D, affine=False, replicates=5, reg_params={},
-        reset_patience=100, reset_jitter=True, reset_try_tol=0.01,
-        reset_max_steps=None, reset_accept_tol=1e-4, reset_stochastic=True,
-        reset_low_value=False, reset_value_thr=0.1, reset_sigma=0.05,
-        reset_cache_size=None, cache_subsample_rate=None, scale_grad_freq=100):
+        serial_eval={}, reset_patience=100, reset_jitter=True,
+        reset_try_tol=0.01, reset_max_steps=None, reset_accept_tol=1e-4,
+        reset_stochastic=True, reset_low_value=False, reset_value_thr=0.1,
+        reset_sigma=0.05, reset_cache_size=None, cache_subsample_rate=None,
+        scale_grad_freq=100):
 
-    super().__init__(k, d, D, affine, replicates, reg_params,
-        reset_patience, reset_jitter, reset_try_tol, reset_max_steps,
-        reset_accept_tol, reset_stochastic, reset_low_value, reset_value_thr,
-        reset_sigma, reset_cache_size, cache_subsample_rate)
+    super().__init__(k, d, D,
+        affine=affine, replicates=replicates, reg_params=reg_params,
+        serial_eval=serial_eval, reset_patience=reset_patience,
+        reset_jitter=reset_jitter, reset_try_tol=reset_try_tol,
+        reset_max_steps=reset_max_steps, reset_accept_tol=reset_accept_tol,
+        reset_stochastic=reset_stochastic, reset_low_value=reset_low_value,
+        reset_value_thr=reset_value_thr, reset_sigma=reset_sigma,
+        reset_cache_size=reset_cache_size,
+        cache_subsample_rate=cache_subsample_rate)
 
     if scale_grad_freq is not None and scale_grad_freq >= 0:
       self.scale_grad_freq = scale_grad_freq
       self.Lip = None
       self.steps = 0
+      self.cache_z = True
       self.Us.register_hook(lambda UGrad: self._scale_grad(UGrad))
       if self.affine:
         self.bs.register_hook(lambda bGrad: self._scale_grad(bGrad,
@@ -657,8 +731,8 @@ class KSubspaceMFModel(KSubspaceBaseModel):
     self.reset_parameters()
     return
 
-  def encode(self, x):
-    """Compute subspace coefficients for x in closed form, but computing
+  def encode(self, x, ii=None, jj=None):
+    """Compute subspace coefficients for x in closed form, by computing
     batched solution to normal equations.
 
       min_z 1/2 || x - (Uz + b) ||_2^2 + \lambda/2 ||z||_2^2
@@ -666,17 +740,18 @@ class KSubspaceMFModel(KSubspaceBaseModel):
 
     Input:
       x: shape (batch_size, D)
+      ii, jj: rep, cluster indices. Either int index or None.
 
     Returns:
       z: latent low-dimensional codes (r, k, batch_size, d)
     """
-    assert(x.dim() == 2 and x.size(1) == self.D)
+    Us, bs = self._slice_Us_bs(ii, jj, no_grad=True)
     batch_size = x.size(0)
 
     # shape (r, k, d, D)
-    Uts = self.Us.data.transpose(2, 3)
+    Uts = Us.transpose(2, 3)
     # (r, k, d, d)
-    A = torch.matmul(Uts, self.Us.data)
+    A = torch.matmul(Uts, Us)
     if self.reg_params['z'] > 0:
       # (d, d)
       lambeye = torch.eye(self.d,
@@ -688,7 +763,7 @@ class KSubspaceMFModel(KSubspaceBaseModel):
     B = x.data.t().view(1, 1, self.D, batch_size)
     if self.affine:
       # bs shape (r, k, D)
-      B = B.sub(self.bs.data.unsqueeze(3))
+      B = B.sub(bs.unsqueeze(3))
     # (r, k, d, batch_size)
     B = torch.matmul(Uts, B)
 
@@ -703,7 +778,7 @@ class KSubspaceMFModel(KSubspaceBaseModel):
     regs = dict()
     # U regularization, each is shape (r, k)
     if max([self.reg_params[key] for key in
-          ('U_frosqr_in', 'U_frosqr_out', 'U_fro_out')]) > 0:
+          ('U_frosqr_in', 'U_frosqr_out')]) > 0:
       U_frosqr = torch.sum(self.Us.pow(2), dim=(2, 3))
 
       if self.reg_params['U_frosqr_in'] > 0:
@@ -714,22 +789,11 @@ class KSubspaceMFModel(KSubspaceBaseModel):
         regs['U_frosqr_out'] = U_frosqr.mul(
             self.reg_params['U_frosqr_out']*0.5)
 
-      if self.reg_params['U_fro_out'] > 0:
-        U_fro = U_frosqr.sqrt()
-        regs['U_fro_out'] = U_fro.mul(self.reg_params['U_fro_out'])
-
-    if self.reg_params['U_gram_fro_out'] > 0:
-      UtUs = torch.matmul(self.Us.transpose(2, 3), self.Us)
-      UtUs_fro = torch.sum(UtUs.pow(2), dim=(2, 3)).sqrt()
-      regs['U_gram_fro_out'] = UtUs_fro.mul(
-          self.reg_params['U_gram_fro_out'])
-
     # z regularization, shape is (batch_size, r, k)
     # does not affect gradients, only included to ensure objective value
     # is accurate
     if self.reg_params['z'] > 0:
-      z_frosqr = torch.sum(self.z.data.pow(2), dim=3).permute(2, 0, 1)
-      regs['z'] = z_frosqr.mul(self.reg_params['z']*0.5)
+      regs['z'] = self.z_frosqr.permute(2, 0, 1).mul(self.reg_params['z']*0.5)
     return regs
 
   def _scale_grad(self, Grad, update=True):
@@ -766,47 +830,51 @@ class KSubspaceProjModel(KSubspaceBaseModel):
   matrix."""
   default_reg_params = {
       'U_frosqr_in': 0.01,
-      'U_frosqr_out': 1e-4,
-      'U_fro_out': 0.0,
-      'U_gram_fro_out': 0.0
+      'U_frosqr_out': 1e-4
   }
   assign_reg_terms = {'U_frosqr_in'}
 
   def __init__(self, k, d, D, affine=False, replicates=5, reg_params={},
-        reset_patience=100, reset_jitter=True, reset_try_tol=0.01,
-        reset_max_steps=None, reset_accept_tol=1e-4, reset_stochastic=True,
-        reset_low_value=False, reset_value_thr=0.1, reset_sigma=0.05,
-        reset_cache_size=None, cache_subsample_rate=None):
+        serial_eval={}, reset_patience=100, reset_jitter=True,
+        reset_try_tol=0.01, reset_max_steps=None, reset_accept_tol=1e-4,
+        reset_stochastic=True, reset_low_value=False, reset_value_thr=0.1,
+        reset_sigma=0.05, reset_cache_size=None, cache_subsample_rate=None):
 
-    super().__init__(k, d, D, affine, replicates, reg_params,
-        reset_patience, reset_jitter, reset_try_tol, reset_max_steps,
-        reset_accept_tol, reset_stochastic, reset_low_value, reset_value_thr,
-        reset_sigma, reset_cache_size, cache_subsample_rate)
+    super().__init__(k, d, D,
+        affine=affine, replicates=replicates, reg_params=reg_params,
+        serial_eval=serial_eval, reset_patience=reset_patience,
+        reset_jitter=reset_jitter, reset_try_tol=reset_try_tol,
+        reset_max_steps=reset_max_steps, reset_accept_tol=reset_accept_tol,
+        reset_stochastic=reset_stochastic, reset_low_value=reset_low_value,
+        reset_value_thr=reset_value_thr, reset_sigma=reset_sigma,
+        reset_cache_size=reset_cache_size,
+        cache_subsample_rate=cache_subsample_rate)
 
     self.reset_parameters()
     return
 
-  def encode(self, x):
+  def encode(self, x, ii=None, jj=None):
     """Project x onto each of k low-dimensional spaces.
 
     Input:
       x: shape (batch_size, D)
+      ii, jj: rep, cluster indices. Either int index or None.
 
     Returns:
-      z: latent low-dimensional codes (k, batch_size, d)
+      z: latent low-dimensional codes (r, k, batch_size, d)
     """
-    assert(x.dim() == 2 and x.size(1) == self.D)
+    Us, bs = self._slice_Us_bs(ii, jj, no_grad=False)
     batch_size = x.size(0)
 
     # z = U^T (x - b) or z = V (x - b)
     if self.affine:
       # (r, k, batch_size, D)
-      x = x.sub(self.bs.unsqueeze(2))
+      x = x.sub(bs.unsqueeze(2))
     else:
       x = x.view(1, 1, batch_size, self.D)
 
     # (r, k, batch_size, d)
-    z = torch.matmul(x, self.Us)
+    z = torch.matmul(x, Us)
     return z
 
   def reg(self):
@@ -814,7 +882,7 @@ class KSubspaceProjModel(KSubspaceBaseModel):
     regs = dict()
     # U regularization, each is shape (r, k)
     if max([self.reg_params[key] for key in
-          ('U_frosqr_in', 'U_frosqr_out', 'U_fro_out')]) > 0:
+          ('U_frosqr_in', 'U_frosqr_out')]) > 0:
       U_frosqr = torch.sum(self.Us.pow(2), dim=(2, 3))
 
       if self.reg_params['U_frosqr_in'] > 0:
@@ -824,16 +892,6 @@ class KSubspaceProjModel(KSubspaceBaseModel):
       if self.reg_params['U_frosqr_out'] > 0:
         regs['U_frosqr_out'] = U_frosqr.mul(
             self.reg_params['U_frosqr_out'])
-
-      if self.reg_params['U_fro_out'] > 0:
-        regs['U_fro_out'] = U_frosqr.sqrt().mul(
-            self.reg_params['U_fro_out'])
-
-    if self.reg_params['U_gram_fro_out'] > 0:
-      UtUs = torch.matmul(self.Us.transpose(2, 3), self.Us)
-      UtUs_fro = torch.sum(UtUs.pow(2), dim=(2, 3)).sqrt()
-      regs['U_gram_fro_out'] = UtUs_fro.mul(
-          self.reg_params['U_gram_fro_out'])
     return regs
 
 
@@ -842,10 +900,10 @@ class KSubspaceBatchAltBaseModel(KSubspaceBaseModel):
   assign_reg_terms = dict()
 
   def __init__(self, k, d, dataset, affine=False, replicates=5, reg_params={},
-        reset_patience=2, reset_jitter=True, reset_try_tol=0.01,
-        reset_max_steps=None, reset_accept_tol=1e-4, reset_stochastic=True,
-        reset_low_value=False, reset_value_thr=0.1, reset_sigma=0.05,
-        reset_cache_size=None, cache_subsample_rate=None,
+        serial_eval={}, reset_patience=2, reset_jitter=True,
+        reset_try_tol=0.01, reset_max_steps=None, reset_accept_tol=1e-4,
+        reset_stochastic=True, reset_low_value=False, reset_value_thr=0.1,
+        reset_sigma=0.05, reset_cache_size=None, cache_subsample_rate=None,
         svd_solver='randomized'):
 
     if svd_solver not in ('randomized', 'svds', 'svd'):
@@ -853,10 +911,15 @@ class KSubspaceBatchAltBaseModel(KSubspaceBaseModel):
 
     # X assumed to be N x D.
     D = dataset.X.shape[1]
-    super().__init__(k, d, D, affine, replicates, reg_params, reset_patience,
-        reset_jitter, reset_try_tol, reset_max_steps, reset_accept_tol,
-        reset_stochastic, reset_low_value, reset_value_thr, reset_sigma,
-        reset_cache_size, cache_subsample_rate)
+    super().__init__(k, d, D,
+        affine=affine, replicates=replicates, reg_params=reg_params,
+        serial_eval=serial_eval, reset_patience=reset_patience,
+        reset_jitter=reset_jitter, reset_try_tol=reset_try_tol,
+        reset_max_steps=reset_max_steps, reset_accept_tol=reset_accept_tol,
+        reset_stochastic=reset_stochastic, reset_low_value=reset_low_value,
+        reset_value_thr=reset_value_thr, reset_sigma=reset_sigma,
+        reset_cache_size=reset_cache_size,
+        cache_subsample_rate=cache_subsample_rate)
 
     self.dataset = dataset
     self.register_buffer('X', dataset.X)
@@ -922,34 +985,32 @@ class KSubspaceBatchAltProjModel(KSubspaceBatchAltBaseModel,
       KSubspaceProjModel):
   default_reg_params = {
       'U_frosqr_in': 0.01,
-      'U_frosqr_out': 1e-4,
-      'U_fro_out': 0.0,
-      'U_gram_fro_out': 0.0
+      'U_frosqr_out': 1e-4
   }
   assign_reg_terms = {'U_frosqr_in'}
 
   def __init__(self, k, d, dataset, affine=False, replicates=5, reg_params={},
-        reset_patience=2, reset_jitter=True, reset_try_tol=0.01,
-        reset_max_steps=None, reset_accept_tol=1e-4, reset_stochastic=True,
-        reset_low_value=False, reset_value_thr=0.1, reset_sigma=0.05,
-        reset_cache_size=None, cache_subsample_rate=None,
+        serial_eval={}, reset_patience=2, reset_jitter=True,
+        reset_try_tol=0.01, reset_max_steps=None, reset_accept_tol=1e-4,
+        reset_stochastic=True, reset_low_value=False, reset_value_thr=0.1,
+        reset_sigma=0.05, reset_cache_size=None, cache_subsample_rate=None,
         svd_solver='randomized'):
 
-    super().__init__(k, d, dataset, affine, replicates, reg_params,
-        reset_patience, reset_jitter, reset_try_tol, reset_max_steps,
-        reset_accept_tol, reset_stochastic, reset_low_value, reset_value_thr,
-        reset_sigma, reset_cache_size, cache_subsample_rate, svd_solver)
-
-    # must be zero, not supported
-    self.reg_params['U_fro_out'] = 0.0
+    super().__init__(k, d, dataset,
+        affine=affine, replicates=replicates, reg_params=reg_params,
+        serial_eval=serial_eval, reset_patience=reset_patience,
+        reset_jitter=reset_jitter, reset_try_tol=reset_try_tol,
+        reset_max_steps=reset_max_steps, reset_accept_tol=reset_accept_tol,
+        reset_stochastic=reset_stochastic, reset_low_value=reset_low_value,
+        reset_value_thr=reset_value_thr, reset_sigma=reset_sigma,
+        reset_cache_size=reset_cache_size,
+        cache_subsample_rate=cache_subsample_rate, svd_solver=svd_solver)
 
     self.reset_parameters()
     return
 
   def step(self):
     """Update subspace bases by regularized pca (and increment step count)."""
-    gamma = self.N*self.reg_params['U_gram_fro_out']
-
     for ii in range(self.r):
       for jj in range(self.k):
         if self.c_mean[ii, jj] > 0:
@@ -957,7 +1018,7 @@ class KSubspaceBatchAltProjModel(KSubspaceBatchAltBaseModel,
           Nj = Xj.shape[0]
           lamb = (Nj*self.reg_params['U_frosqr_in'] +
               self.N*self.reg_params['U_frosqr_out'])
-          U, b = ut.reg_pca(Xj, self.d, form='proj', lamb=lamb, gamma=gamma,
+          U, b = ut.reg_pca(Xj, self.d, form='proj', lamb=lamb,
               affine=self.affine, solver=self.svd_solver)
 
           self.Us.data[ii, jj, :] = U
@@ -970,27 +1031,26 @@ class KSubspaceBatchAltMFModel(KSubspaceBatchAltBaseModel, KSubspaceMFModel):
   default_reg_params = {
       'U_frosqr_in': 0.01,
       'U_frosqr_out': 1e-4,
-      'U_fro_out': 0.0,
-      'U_gram_fro_out': 0.0,
       'z': 0.01
   }
   assign_reg_terms = {'U_frosqr_in', 'z'}
 
   def __init__(self, k, d, dataset, affine=False, replicates=5, reg_params={},
-        reset_patience=2, reset_jitter=True, reset_try_tol=0.01,
-        reset_max_steps=None, reset_accept_tol=1e-4, reset_stochastic=True,
-        reset_low_value=False, reset_value_thr=0.1, reset_sigma=0.05,
-        reset_cache_size=None, cache_subsample_rate=None,
+        serial_eval={}, reset_patience=2, reset_jitter=True,
+        reset_try_tol=0.01, reset_max_steps=None, reset_accept_tol=1e-4,
+        reset_stochastic=True, reset_low_value=False, reset_value_thr=0.1,
+        reset_sigma=0.05, reset_cache_size=None, cache_subsample_rate=None,
         svd_solver='randomized'):
 
-    super().__init__(k, d, dataset, affine, replicates, reg_params,
-        reset_patience, reset_jitter, reset_try_tol, reset_max_steps,
-        reset_accept_tol, reset_stochastic, reset_low_value, reset_value_thr,
-        reset_sigma, reset_cache_size, cache_subsample_rate, svd_solver)
-
-    # must be zero, not supported
-    self.reg_params['U_fro_out'] = 0.0
-    self.reg_params['U_gram_fro_out'] = 0.0
+    super().__init__(k, d, dataset,
+        affine=affine, replicates=replicates, reg_params=reg_params,
+        serial_eval=serial_eval, reset_patience=reset_patience,
+        reset_jitter=reset_jitter, reset_try_tol=reset_try_tol,
+        reset_max_steps=reset_max_steps, reset_accept_tol=reset_accept_tol,
+        reset_stochastic=reset_stochastic, reset_low_value=reset_low_value,
+        reset_value_thr=reset_value_thr, reset_sigma=reset_sigma,
+        reset_cache_size=reset_cache_size,
+        cache_subsample_rate=cache_subsample_rate, svd_solver=svd_solver)
 
     self.reset_parameters()
     return
@@ -1008,34 +1068,35 @@ class KSubspaceBatchAltMFModel(KSubspaceBatchAltBaseModel, KSubspaceMFModel):
         self.Us.data[ii, jj, :] = P.mul_(S)
     return
 
-  def encode(self, x):
+  def encode(self, x, ii=None, jj=None):
     """Compute subspace coefficients for x in closed form, by computing
     batched solution to normal equations. Use fact that colums of U are
-    orthogonal.
+    orthogonal (althought not necessarily unit norm).
 
       min_z 1/2 || x - (Uz + b) ||_2^2 + \lambda/2 ||z||_2^2
       (U^T U + \lambda I) z* = U^T (x - b)
 
     Input:
       x: shape (batch_size, D)
+      ii, jj: rep, cluster indices. Either int index or None.
 
     Returns:
       z: latent low-dimensional codes (r, k, batch_size, d)
     """
-    assert(x.dim() == 2 and x.size(1) == self.D)
+    Us, bs = self._slice_Us_bs(ii, jj, no_grad=True)
     batch_size = x.size(0)
 
     if self.affine:
       # (r, k, batch_size, D)
-      x = x.sub(self.bs.unsqueeze(2))
+      x = x.sub(bs.unsqueeze(2))
     else:
       x = x.view(1, 1, batch_size, self.D)
 
     # (r, k, batch_size, d)
-    b = torch.matmul(x, self.Us.data)
+    b = torch.matmul(x, Us)
 
     # (r, k, 1, d)
-    S = torch.norm(self.Us.data, dim=2, keepdim=True)
+    S = torch.norm(Us, dim=2, keepdim=True)
     lambeye = torch.ones_like(S).mul_(self.reg_params['z'])
 
     # (r, k, batch_size, d)
@@ -1076,10 +1137,11 @@ class KMeansBatchAltModel(KSubspaceBatchAltBaseModel):
   assign_reg_terms = {}
 
   def __init__(self, k, dataset, init='random', replicates=5, reg_params={},
-        reset_patience=2, reset_jitter=True, reset_try_tol=0.01,
-        reset_max_steps=None, reset_accept_tol=1e-4, reset_stochastic=True,
-        reset_low_value=False, reset_value_thr=0.1, reset_sigma=0.05,
-        reset_cache_size=None, cache_subsample_rate=None, kpp_n_trials=None):
+        serial_eval={}, reset_patience=2, reset_jitter=True,
+        reset_try_tol=0.01, reset_max_steps=None, reset_accept_tol=1e-4,
+        reset_stochastic=True, reset_low_value=False, reset_value_thr=0.1,
+        reset_sigma=0.05, reset_cache_size=None, cache_subsample_rate=None,
+        kpp_n_trials=None):
 
     if init not in {'k-means++', 'random'}:
       raise ValueError("Invalid init parameter {}".format(init))
@@ -1087,10 +1149,15 @@ class KMeansBatchAltModel(KSubspaceBatchAltBaseModel):
     d = 1  # Us not used, but retained for consistency/out of laziness
     affine = True
 
-    super().__init__(k, d, dataset, affine, replicates, reg_params,
-        reset_patience, reset_jitter, reset_try_tol, reset_max_steps,
-        reset_accept_tol, reset_stochastic, reset_low_value, reset_value_thr,
-        reset_sigma, reset_cache_size, cache_subsample_rate)
+    super().__init__(k, d, dataset,
+        affine=affine, replicates=replicates, reg_params=reg_params,
+        serial_eval=serial_eval, reset_patience=reset_patience,
+        reset_jitter=reset_jitter, reset_try_tol=reset_try_tol,
+        reset_max_steps=reset_max_steps, reset_accept_tol=reset_accept_tol,
+        reset_stochastic=reset_stochastic, reset_low_value=reset_low_value,
+        reset_value_thr=reset_value_thr, reset_sigma=reset_sigma,
+        reset_cache_size=reset_cache_size,
+        cache_subsample_rate=cache_subsample_rate)
 
     self.init = init
     # Number of candidate means to test. Will add the one that reduces the loss
@@ -1145,7 +1212,7 @@ class KMeansBatchAltModel(KSubspaceBatchAltBaseModel):
       self.bs.data.copy_(self.X[Idx, :])
     return
 
-  def forward(self, x):
+  def forward(self, x, ii=None, jj=None):
     """Null placeholder forward method
 
     Input:
@@ -1179,10 +1246,10 @@ class KMeansBatchAltModel(KSubspaceBatchAltBaseModel):
     loss = self.Xsqrnorms.view(-1, 1, 1).sub(XTb).add(bsqrnorms.unsqueeze(0))
     return loss.clamp_(min=0.0)
 
-  def encode(self, x):
+  def encode(self, x, ii=None, jj=None):
     raise NotImplementedError("encode not implemented.")
 
-  def decode(self, x):
+  def decode(self, x, ii=None, jj=None):
     raise NotImplementedError("decode not implemented.")
 
   def reg(self):
@@ -1202,7 +1269,7 @@ class KMeansBatchAltModel(KSubspaceBatchAltBaseModel):
     Returns:
       norm_x_: vector of -1, null placeholder.
     """
-    norm_x_ = torch.ones(self.r, dtype=x_.dtype, device=x_.device).mul(-1)
+    norm_x_ = torch.ones(x_.shape[0], dtype=x_.dtype, device=x_.device).mul(-1)
     return norm_x_
 
   def step(self):
@@ -1225,7 +1292,7 @@ class KMeansBatchAltModel(KSubspaceBatchAltBaseModel):
     return
 
 
-class KSubspaceMFCorruptBaseModel(KSubspaceBaseModel):
+class KSubspaceMFCorruptModel(KSubspaceMFModel):
   """K-subspace model where low-dim coefficients are computed in closed
   form. Adapted to handle corrupted data."""
   default_reg_params = {
@@ -1237,20 +1304,25 @@ class KSubspaceMFCorruptBaseModel(KSubspaceBaseModel):
   assign_reg_terms = {'U_frosqr_in', 'z', 'e'}
 
   def __init__(self, k, d, D, affine=False, replicates=5, reg_params={},
-        reset_patience=100, reset_jitter=True, reset_try_tol=0.01,
-        reset_max_steps=None, reset_accept_tol=1e-4, reset_stochastic=True,
-        reset_low_value=False, reset_value_thr=0.1, reset_sigma=0.05,
-        reset_cache_size=None, cache_subsample_rate=None, encode_max_iter=20,
-        encode_tol=1e-3):
+        serial_eval={}, reset_patience=100, reset_jitter=True,
+        reset_try_tol=0.01, reset_max_steps=None, reset_accept_tol=1e-4,
+        reset_stochastic=True, reset_low_value=False, reset_value_thr=0.1,
+        reset_sigma=0.05, reset_cache_size=None, cache_subsample_rate=None,
+        encode_max_iter=20, encode_tol=1e-3):
 
     if encode_max_iter <= 0:
       raise ValueError(("Invalid encode_max_iter parameter {}").format(
           encode_max_iter))
 
-    super().__init__(k, d, D, affine, replicates, reg_params, reset_patience,
-        reset_jitter, reset_try_tol, reset_max_steps, reset_accept_tol,
-        reset_stochastic, reset_low_value, reset_value_thr, reset_sigma,
-        reset_cache_size, cache_subsample_rate)
+    super().__init__(k, d, D,
+        affine=affine, replicates=replicates, reg_params=reg_params,
+        serial_eval=serial_eval, reset_patience=reset_patience,
+        reset_jitter=reset_jitter, reset_try_tol=reset_try_tol,
+        reset_max_steps=reset_max_steps, reset_accept_tol=reset_accept_tol,
+        reset_stochastic=reset_stochastic, reset_low_value=reset_low_value,
+        reset_value_thr=reset_value_thr, reset_sigma=reset_sigma,
+        reset_cache_size=reset_cache_size,
+        cache_subsample_rate=cache_subsample_rate)
 
     # when e reg parameter is set to zero we disable the corruption term,
     # although strictly speaking it should give the trivial solution e = full
@@ -1261,50 +1333,46 @@ class KSubspaceMFCorruptBaseModel(KSubspaceBaseModel):
     self.encode_tol = encode_tol
     self.encode_steps = None
     self.encode_update = None
+    self.cache_z = True
 
-    # corruption term
-    self.e = None
-
-    # cached SVDs for Us.
-    # NOTE: left singular vectors must be stored transposed, due to output
-    # format of torch.svd.
-    self.register_buffer('Us_P', torch.zeros(self.r, k, d, D).transpose(2, 3))
-    self.register_buffer('Us_s', torch.zeros(self.r, k, d))
-    self.register_buffer('Us_Q', torch.zeros(self.r, k, d, d))
+    # denoised x
+    self.cache_x0_ = True
+    self.x0_ = None
     return
 
-  def forward(self, x):
+  def forward(self, x, ii=None, jj=None):
     """Compute subspace coefficients and reconstruction for x by alternating
     least squares and proximal operator on e.
 
-      min_{z,e} 1/2 || Uz - (x - b) - e ||_2^2 +
+      min_{z,e} 1/2 || x - (Uz + b + e) ||_2^2
           \lambda/2 ||z||_2^2 + \gamma ||e||
 
     Input:
       x: shape (batch_size, D)
+      ii, jj: rep, cluster indices. Either int index or None.
 
     Returns:
       x_: reconstruction, shape (r, k, batch_size, D)
     """
-    assert(x.dim() == 2 and x.size(1) == self.D)
+    Us, bs = self._slice_Us_bs(ii, jj, no_grad=False)
     batch_size = x.size(0)
     xnorm = max(x.abs().max(), 1.0)
 
     if self.affine:
       # (r, k, batch_size, D)
-      x = x.sub(self.bs.unsqueeze(2))
+      x = x.sub(bs.data.unsqueeze(2))
     else:
       x = x.view(1, 1, batch_size, self.D)
 
-    ut.batch_svd(self.Us.data, out=(self.Us_P, self.Us_s, self.Us_Q))
-    UsT = self.Us.data.transpose(2, 3).contiguous()
+    Us_P, Us_s, Us_Q = ut.batch_svd(Us.data)
+    UsT = Us.data.transpose(2, 3).contiguous()
 
     e = torch.zeros((), dtype=x.dtype, device=x.device)
     for kk in range(self.encode_max_iter):
       e_old = e
-      z = self._least_squares(x + e)
+      z = self._least_squares(x - e, Us_P, Us_s, Us_Q)
       x_ = torch.matmul(z, UsT)
-      e = self._prox_e(x_ - x)
+      e = self._prox_e(x - x_)
 
       update = (e - e_old).abs().max()
       if update <= self.encode_tol * xnorm:
@@ -1318,23 +1386,23 @@ class KSubspaceMFCorruptBaseModel(KSubspaceBaseModel):
       self.encode_update = 0.0
 
     # one more time for tracking gradients.
-    z = self._least_squares(x + e)
-    x_ = torch.matmul(z, self.Us.transpose(2, 3))
-    e = self._prox_e(x_.data - x)
+    z = self._least_squares(x - e, Us_P, Us_s, Us_Q)
+    x_ = torch.matmul(z, Us.transpose(2, 3))
     if self.affine:
-      x_ = x_.add(self.bs.unsqueeze(2))
+      x_ = x_.add(bs.unsqueeze(2))
+    x0_ = x_.data.clone().squeeze()
+    x_ = x_.add(e).squeeze()
 
-    self.z = z
-    self.e = e
+    self._update_forward_cache(ii, jj, (z, x0_))
     return x_
 
-  def encode(self, x):
+  def encode(self, x, ii=None, jj=None):
     raise NotImplementedError("encode not implemented.")
 
-  def decode(self, x):
+  def decode(self, x, ii=None, jj=None):
     raise NotImplementedError("decode not implemented.")
 
-  def _least_squares(self, y):
+  def _least_squares(self, y, P, s, Q):
     """Solve regularized least squares using cached SVD
 
     min_z 1/2 || Uz - y ||_2^2 + \lambda/2 ||z||_2^2
@@ -1344,62 +1412,47 @@ class KSubspaceMFCorruptBaseModel(KSubspaceBaseModel):
               z = Q(diag(s)/(diag(s)^2 + \lambda I)) P^T y
     Input:
       y: least squares target, shape (r, k, batch_size, D)
+      P, s, Q: Us SVD.
 
     Returns:
       z: solution (r, k, batch_size, d)
     """
     # y shape (r, k, batch_size, D)
     # (r, k, batch_size, d)
-    PTy = torch.matmul(y, self.Us_P)
+    PTy = torch.matmul(y, P)
     lamb = self.reg_params['z']
     if lamb == 0:
       lamb = EPS
     # (r, k, 1, d)
-    s_div_sqr = (self.Us_s / (self.Us_s ** 2 + lamb)).unsqueeze(2)
+    s_div_sqr = (s / (s ** 2 + lamb)).unsqueeze(2)
     # (r, k, batch_size, d)
     Qtz = s_div_sqr * PTy
-    z = torch.matmul(Qtz, self.Us_Q.transpose(2, 3))
+    z = torch.matmul(Qtz, Q.transpose(2, 3))
     return z
 
   def _prox_e(self, w):
     """Compute proximal operator of e regularizer wrt w."""
     return torch.zeros((), dtype=w.dtype, device=w.device)
 
-  def loss(self, x, x_):
-    """Evaluate reconstruction loss
+  def _update_forward_cache(self, ii, jj, cache_vals):
+    """Update any cached values from forward call."""
+    z, x0_ = cache_vals
+    batch_size = z.shape[2]
+    device = z.device
 
-    Inputs:
-      x: data, shape (batch_size, D)
-      x_: reconstruction, shape (r, k, batch_size, D)
+    super()._update_forward_cache(ii, jj, (z,))
 
-    Returns:
-      loss: shape (batch_size, r, k)
-    """
-    loss = torch.sum((x.add(self.e) - x_)**2, dim=3).mul(0.5).permute(2, 0, 1)
-    return loss
+    ii, jj = self._parse_slice(ii, jj)
+    if self.cache_x0_:
+      if self.x0_ is None or self.x0_.shape[2] != batch_size:
+        self.x0_ = torch.zeros(self.r, self.k, batch_size, self.D,
+            device=device)
+      self.x0_[ii, jj, :] = x0_
+    return
 
   def reg(self):
     """Evaluate subspace regularization."""
-    regs = dict()
-    # U regularization, each is shape (r, k)
-    if max([self.reg_params[key] for key in
-          ('U_frosqr_in', 'U_frosqr_out')]) > 0:
-      U_frosqr = torch.sum(self.Us.pow(2), dim=(2, 3))
-
-      if self.reg_params['U_frosqr_in'] > 0:
-        regs['U_frosqr_in'] = U_frosqr.mul(
-            self.reg_params['U_frosqr_in']*0.5)
-
-      if self.reg_params['U_frosqr_out'] > 0:
-        regs['U_frosqr_out'] = U_frosqr.mul(
-            self.reg_params['U_frosqr_out']*0.5)
-
-    # z and e regularization, shapes are (batch_size, r, k)
-    # does not affect gradients, only included to ensure objective value
-    # is accurate
-    if self.reg_params['z'] > 0:
-      z_frosqr = torch.sum(self.z.data.pow(2), dim=3).permute(2, 0, 1)
-      regs['z'] = z_frosqr.mul(self.reg_params['z']*0.5)
+    regs = super().reg()
 
     if self.reg_params['e'] > 0:
       regs['e'] = self.reg_e() * self.reg_params['e']
@@ -1410,7 +1463,7 @@ class KSubspaceMFCorruptBaseModel(KSubspaceBaseModel):
     return 0.0
 
 
-class KSubspaceMCModel(KSubspaceMFCorruptBaseModel):
+class KSubspaceMCModel(KSubspaceMFCorruptModel):
   """K-subspace model where low-dim coefficients are computed in closed
   form. Adapted to handle missing data."""
   default_reg_params = {
@@ -1422,56 +1475,58 @@ class KSubspaceMCModel(KSubspaceMFCorruptBaseModel):
   assign_reg_terms = {'U_frosqr_in', 'z', 'e'}
 
   def __init__(self, k, d, D, affine=False, replicates=5, reg_params={},
-        reset_patience=100, reset_jitter=True, reset_try_tol=0.01,
-        reset_max_steps=None, reset_accept_tol=1e-4, reset_stochastic=True,
-        reset_low_value=False, reset_value_thr=0.1, reset_sigma=0.05,
-        reset_cache_size=None, cache_subsample_rate=None, encode_max_iter=20,
-        encode_tol=1e-3):
+        serial_eval={}, reset_patience=100, reset_jitter=True,
+        reset_try_tol=0.01, reset_max_steps=None, reset_accept_tol=1e-4,
+        reset_stochastic=True, reset_low_value=False, reset_value_thr=0.1,
+        reset_sigma=0.05, reset_cache_size=None, cache_subsample_rate=None,
+        encode_max_iter=20, encode_tol=1e-3):
 
-    super().__init__(k, d, D, affine, replicates, reg_params, reset_patience,
-        reset_jitter, reset_try_tol, reset_max_steps, reset_accept_tol,
-        reset_stochastic, reset_low_value, reset_value_thr, reset_sigma,
-        reset_cache_size, cache_subsample_rate, encode_max_iter, encode_tol)
+    super().__init__(k, d, D,
+        affine=affine, replicates=replicates, reg_params=reg_params,
+        serial_eval=serial_eval, reset_patience=reset_patience,
+        reset_jitter=reset_jitter, reset_try_tol=reset_try_tol,
+        reset_max_steps=reset_max_steps, reset_accept_tol=reset_accept_tol,
+        reset_stochastic=reset_stochastic, reset_low_value=reset_low_value,
+        reset_value_thr=reset_value_thr, reset_sigma=reset_sigma,
+        reset_cache_size=reset_cache_size,
+        cache_subsample_rate=cache_subsample_rate,
+        encode_max_iter=encode_max_iter, encode_tol=encode_tol)
 
     self.omega = None
-    self.reset_parameters()
     return
 
-  def objective(self, x_omega):
+  def objective(self, x_miss):
     """Evaluate objective function.
 
     Input:
-      x_omega: data with missing mask, shape (batch_size, 2, D).
-        x_omega[:, 0, :] is assumed to be data, x_omega[:, 1, :] the mask.
+      x_miss: data with missing elements coded as nan, shape (batch_size, D).
 
     Returns:
       obj_mean: average objective across replicates
       obj, loss, reg_in, reg_out: metrics per replicate, shape (r,)
       x_: reconstruction, shape (r, k, batch_size, D)
     """
-    x = self.parse_x_omega(x_omega)
+    x = self.parse_x_miss(x_miss)
     return super().objective(x)
 
-  def eval_shrink(self, x_omega, x_):
+  def eval_shrink(self, x_miss, x_):
     """measure shrinkage of reconstruction wrt data.
 
     Inputs:
-      x_omega: data with missing mask, shape (batch_size, 2, D).
-        x_omega[:, 0, :] is assumed to be data, x_omega[:, 1, :] the mask.
+      x_miss: data with missing elements coded as nan, shape (batch_size, D).
       x_: reconstruction, shape (r, k, batch_size, D)
 
     Returns:
       norm_x_: average norm of x_ relative to x, shape (r,)
     """
-    x = self.parse_x_omega(x_omega, update_omega=False)
+    x = self.parse_x_miss(x_miss, update_omega=False)
     return super().eval_shrink(x, x_)
 
-  def parse_x_omega(self, x_omega, update_omega=True):
-    """Parse stacked (x, omega) input
+  def parse_x_miss(self, x_miss, update_omega=True):
+    """Parse x with missing data coded as nan
 
     Input:
-      x_omega: data with missing mask, shape (batch_size, 2, D).
-        x_omega[:, 0, :] is assumed to be data, x_omega[:, 1, :] the mask.
+      x_miss: data with missing elements coded as nan, shape (batch_size, D).
       update_omega: whether to update omega attribute (default: True).
 
     Updates:
@@ -1480,10 +1535,11 @@ class KSubspaceMCModel(KSubspaceMFCorruptBaseModel):
     Returns:
       x: masked data x, shape (batch_size, D).
     """
+    omegac = torch.isnan(x_miss)
+    x = x_miss.clone()
+    x[omegac] = 0.0
     if update_omega:
-      self.omega = x_omega[:, 1, :] > 0
-    # NOTE: omega assumed to be binary mask.
-    x = x_omega[:, 0, :] * x_omega[:, 1, :]
+      self.omega = (omegac == 0)
     return x
 
   def _prox_e(self, w):
@@ -1492,3 +1548,29 @@ class KSubspaceMCModel(KSubspaceMFCorruptBaseModel):
     # w shape (r, k, batch_size, D)
     w[:, :, self.omega] = 0.0
     return w
+
+  def eval_comp_error(self, x0):
+    """Evaluate completion error over observed entries in x0.
+
+    Input:
+      x0: data with missing elements coded as nan, shape (batch_size, D).
+
+    Returns:
+      recovery: relative squared error, averaged over batch.
+    """
+    omegac = torch.isnan(x0)
+    x0 = x0.clone()
+    x0[omegac] = 0.0
+
+    # x0_ shape (r, k, batch_size, D)
+    # c shape (batch_size, r, k)
+    # (r, batch_size, D)
+    # NOTE: could save factor of k by indexing instead but too lazy right now
+    x0_ = (self.x0_ * self.c.permute(1, 2, 0).unsqueeze(3)).sum(dim=1)
+    x0_[omegac] = 0.0
+
+    # (r, batch_size)
+    recovery = (x0_ - x0).pow(2).sum(dim=2).div(x0.pow(2).sum(dim=1))
+    # (r,)
+    recovery = recovery.mean(dim=1)
+    return recovery
