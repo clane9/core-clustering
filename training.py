@@ -143,6 +143,7 @@ def train_loop(model, data_loader, device, optimizer, out_dir=None, epochs=200,
         break
 
   except Exception as e:
+    epoch = max(0, epoch-1)  # go back to last successful epoch
     err = e
     print('{}: {}'.format(type(err), err))
     if out_dir is not None:
@@ -160,11 +161,17 @@ def train_loop(model, data_loader, device, optimizer, out_dir=None, epochs=200,
         with open('{}/resets.npz'.format(out_dir), 'wb') as f:
           np.savez(f, resets=resets)
       if save_data:
-        with open('{}/conf_mats.npz'.format(out_dir), 'wb') as f:
-          np.savez(f, conf_mats=conf_mats[:epoch, :])
-        if eval_rank:
-          with open('{}/svs.npz'.format(out_dir), 'wb') as f:
-            np.savez(f, svs=svs[:epoch, :])
+        save_conf_mats = conf_mats[:epoch, :]
+        save_svs = svs[:epoch, :] if eval_rank else None
+      else:
+        save_conf_mats = conf_mats[[epoch-1], :]
+        save_svs = svs[[epoch-1], :] if eval_rank else None
+      with open('{}/conf_mats.npz'.format(out_dir), 'wb') as f:
+        np.savez(f, conf_mats=save_conf_mats)
+      if eval_rank:
+        with open('{}/svs.npz'.format(out_dir), 'wb') as f:
+          np.savez(f, svs=save_svs)
+
     if err is not None:
       raise err
   return conf_mats, svs, resets

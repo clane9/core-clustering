@@ -147,8 +147,6 @@ if __name__ == '__main__':
                       help='Number of workers for data loading [default: 1]')
   parser.add_argument('--seed', type=int, default=2018,
                       help='Training random seed [default: 2018]')
-  parser.add_argument('--eval-rank', type=ut.boolarg, default=False,
-                      help='Evaluate ranks of subspace models [default: 0]')
   parser.add_argument('--chkp-freq', type=int, default=None,
                       help='How often to save checkpoints [default: None]')
   parser.add_argument('--stop-freq', type=int, default=None,
