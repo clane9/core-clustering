@@ -230,10 +230,10 @@ def cos_knn(y, X, k, normalize=False):
       y = unit_normalize(y, dim=1)
       X = unit_normalize(X, dim=1)
 
-    # (n, N)
-    cos_abs = torch.matmul(y, X.t()).abs()
+    # (N, n)
+    cos_abs = torch.matmul(X, y.t()).abs()
     # (n, k)
-    Idx = torch.topk(cos_abs, k, dim=1)[1]
+    Idx = (torch.topk(cos_abs, k, dim=0)[1]).t()
     # (n, k, D)
     y_knn = X[Idx, :]
   return y_knn

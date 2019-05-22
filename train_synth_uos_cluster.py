@@ -96,6 +96,17 @@ def train_synth_uos_cluster(args):
   else:
     args.serial_eval = args.serial_eval.lower().strip().split(',')
 
+  if args.init.lower() in {'pfi', 'pca'}:
+    initN = 100 * int(np.ceil(
+        args.model_d*args.model_k*np.log(args.model_k) / 100))
+    if initN < synth_dataset.N:
+      Idx = torch.randperm(synth_dataset.N)[:initN]
+      initX = synth_dataset.X[Idx]
+    else:
+      initX = synth_dataset.X
+  else:
+    initX = None
+
   tic = time.time()
   if args.form == 'batch-alt-proj':
     reg_params = {
@@ -117,7 +128,8 @@ def train_synth_uos_cluster(args):
     model = mod.KSubspaceBatchAltMFModel(args.model_k, args.model_d,
         synth_dataset, affine=args.affine, replicates=args.reps,
         reg_params=reg_params, serial_eval=args.serial_eval,
-        svd_solver='randomized', **reset_kwargs)
+        svd_solver='randomized', init=args.init, initX=initX,
+        initk=args.init_k, **reset_kwargs)
   elif args.form == 'mf':
     if args.miss_rate > 0:
       reg_params = {
@@ -139,11 +151,10 @@ def train_synth_uos_cluster(args):
               max(args.U_frosqr_in_lamb, args.U_frosqr_out_lamb) > 0
               else 0.0)
       }
-
       model = mod.KSubspaceMFModel(args.model_k, args.model_d, args.D,
           affine=args.affine, replicates=args.reps, reg_params=reg_params,
           serial_eval=args.serial_eval, scale_grad_freq=args.scale_grad_freq,
-          **reset_kwargs)
+          init=args.init, initX=initX, initk=args.init_k, **reset_kwargs)
   elif args.form == 'proj':
     reg_params = {
         'U_frosqr_in': args.U_frosqr_in_lamb,
@@ -154,9 +165,6 @@ def train_synth_uos_cluster(args):
         serial_eval=args.serial_eval, **reset_kwargs)
   else:
     raise ValueError("formulation {} not recognized".format(args.form))
-  if args.prob_farthest_insert:
-    model.prob_farthest_insert(synth_dataset.X,
-        nn_q=int(np.ceil(0.2*args.model_d)))
   init_time = time.time() - tic
   model = model.to(device)
 
@@ -175,7 +183,7 @@ def train_synth_uos_cluster(args):
       raise ValueError("Invalid optimizer {}.".format(args.optim))
     min_lr = max(1e-8, 0.1**4 * args.init_lr)
     if args.reset_unused:
-      patience = int(np.ceil(3 * args.reset_patience /
+      patience = int(np.ceil(5 * args.reset_patience /
           (args.N // args.batch_size)))
       threshold = args.reset_try_tol/10
     else:
@@ -234,9 +242,12 @@ if __name__ == '__main__':
   parser.add_argument('--form', type=str, default='mf',
                       help=('Model formulation (proj, mf, batch-alt-proj, '
                       'batch-alt-mf) [default: mf]'))
-  parser.add_argument('--prob-farthest-insert', type=ut.boolarg, default=False,
-                      help=('Initialize by probabilistic farthest insertion '
-                      '[default: 0]'))
+  parser.add_argument('--init', type=str, default='random',
+                      help=('Initialization (random, pca, pfi) '
+                      '[default: random]'))
+  parser.add_argument('--init-k', type=int, default=None,
+                      help=('Number of clusters to initialize non-zero '
+                      '[default: k]'))
   parser.add_argument('--reps', type=int, default=6,
                       help='Number of model replicates [default: 6]')
   parser.add_argument('--model-k', type=int, default=None,

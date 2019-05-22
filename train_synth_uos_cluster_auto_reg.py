@@ -80,9 +80,12 @@ if __name__ == '__main__':
   parser.add_argument('--form', type=str, default='mf',
                       help=('Model formulation (proj, mf, batch-alt-proj, '
                       'batch-alt-mf) [default: mf]'))
-  parser.add_argument('--prob-farthest-insert', type=ut.boolarg, default=False,
-                      help=('Initialize by probabilistic farthest insertion '
-                      '[default: 0]'))
+  parser.add_argument('--init', type=str, default='random',
+                      help=('Initialization (random, pca, pfi) '
+                      '[default: random]'))
+  parser.add_argument('--init-k', type=int, default=None,
+                      help=('Number of clusters to initialize non-zero '
+                      '[default: k]'))
   parser.add_argument('--reps', type=int, default=6,
                       help='Number of model replicates [default: 6]')
   parser.add_argument('--model-k', type=int, default=None,

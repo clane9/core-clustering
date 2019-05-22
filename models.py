@@ -66,7 +66,7 @@ class KSubspaceBaseModel(nn.Module):
     self.n_reset_cands = 1 if reset_low_value else k
     self.reset_sigma = reset_sigma
     if reset_cache_size is None or reset_cache_size <= 0:
-      reset_cache_size = 100 * int(np.ceil(4*k*np.log(k) / 100))
+      reset_cache_size = 100 * int(np.ceil(d*k*np.log(k) / 100))
     self.reset_cache_size = reset_cache_size
     if cache_subsample_rate is None or cache_subsample_rate <= 0:
       cache_subsample_rate = 1.0 / k
@@ -109,7 +109,6 @@ class KSubspaceBaseModel(nn.Module):
         torch.ones(reset_cache_size, self.r, k).mul_(np.nan))
     self.cache_assign_obj_head = 0
     self._reset_buffers = None
-
     return
 
   def reset_parameters(self):
@@ -119,67 +118,6 @@ class KSubspaceBaseModel(nn.Module):
     self.Us.data.normal_(0., std)
     if self.affine:
       self.bs.data.zero_()
-    return
-
-  def prob_farthest_insert(self, X, nn_q=0):
-    """Initialize Us, bs by probabilistic farthest insertion (single trial)
-
-    Args:
-      X: Data matrix from which to select bases, shape (N, D)
-      nn_q: Extra nearest neighbors (default: 0).
-    """
-    nn_k = self.d + nn_q
-    if self.affine:
-      nn_k += 1
-    N = X.shape[0]
-    X = ut.unit_normalize(X, p=2, dim=1)
-
-    self.Us.data.zero_()
-    if self.affine:
-      self.bs.data.zero_()
-
-    # choose first basis randomly
-    Idx = torch.randint(0, N, (self.r,), dtype=torch.int64)
-    self._insert_next(0, X[Idx, :], X, nn_k)
-
-    for jj in range(1, self.k):
-      # (N, r, k')
-      loss = self._prob_insert_loss(X, jj)
-      # (N, r)
-      min_loss = torch.min(loss, dim=2)[0]
-      # (r,)
-      Idx = torch.multinomial(min_loss.t(), 1).view(-1)
-      self._insert_next(jj, X[Idx, :], X, nn_k)
-    return
-
-  def _prob_insert_loss(self, X, jj):
-    """Evaluate loss wrt X for current initialized subspaces up to but not
-    including jj. Assumes Us are orthogonal and x_i unit norm. Does not
-    consider bs.
-
-    Computes:
-      1/2 || x - U U^T x ||_2^2
-      1/2 || x ||_2^2 - x^T U U^T x + 1/2 x^T U U^T U U^T x
-      1/2 || x ||_2^2 - 1/2 || U^T x ||_2^2
-      1/2 (1 - || U^T x ||_2^2)
-    """
-    # shape (r, k', D, d), assumed to be orthogonal
-    Us = self.Us.data[:, :jj, :]
-    # (r, k', N, d)
-    z = torch.matmul(X, Us)
-    # (r, k', N)
-    znormsqr = z.pow(2).sum(dim=3)
-    # (N, r, k')
-    # assumes x_i are normalized
-    loss = (1.0 - znormsqr).mul(0.5).permute(2, 0, 1).clamp(min=0)
-    return loss
-
-  def _insert_next(self, jj, y, X, nn_k):
-    """Insert next basis (jj) centered on sampled points y from X."""
-    y_knn = ut.cos_knn(y, X, nn_k)
-    for ii in range(self.r):
-      U, _ = ut.reg_pca(y_knn[ii, :], self.d)
-      self.Us.data[ii, jj, :] = U
     return
 
   def forward(self, x, ii=None, jj=None):
@@ -194,7 +132,9 @@ class KSubspaceBaseModel(nn.Module):
     """
     z = self.encode(x, ii, jj)
     x_ = self.decode(z, ii, jj)
-    x_ = x_.squeeze()
+    # NOTE: previously I was squeezing output, not sure why. Causes errors when
+    # serial_eval = 'k'
+    # x_ = x_.squeeze()
     self._update_forward_cache(ii, jj, (z,))
     return x_
 
@@ -706,7 +646,17 @@ class KSubspaceMFModel(KSubspaceBaseModel):
         reset_try_tol=0.01, reset_max_steps=None, reset_accept_tol=1e-4,
         reset_stochastic=True, reset_low_value=False, reset_value_thr=0.1,
         reset_sigma=0.05, reset_cache_size=None, cache_subsample_rate=None,
-        scale_grad_freq=100):
+        scale_grad_freq=100, init='random', initX=None, initk=None):
+
+    if init.lower() not in {'random', 'pfi', 'pca'}:
+      raise ValueError("Invalid init mode {}".format(init))
+    if init.lower in {'pfi', 'pca'}:
+      if initX is None:
+        raise ValueError(("Data subset initX required for PFI or PCA "
+            "initialization"))
+      elif not (torch.is_tensor(initX) and
+            initX.dim() == 2 and initX.shape[1] == D):
+        raise ValueError("Invalid data subset initX ")
 
     super().__init__(k, d, D,
         affine=affine, replicates=replicates, reg_params=reg_params,
@@ -728,7 +678,137 @@ class KSubspaceMFModel(KSubspaceBaseModel):
         self.bs.register_hook(lambda bGrad: self._scale_grad(bGrad,
             update=False))
 
+    self.init = init.lower()
+    self.initX = initX
+    if initk is None or initk <= 0:
+      initk = k
+    self.initk = initk
     self.reset_parameters()
+    return
+
+  def reset_parameters(self):
+    """Initialize bases either with small random entries, by probabilistic
+    farthest insertion, or PCA."""
+    if self.init == 'random':
+      super().reset_parameters()
+      if self.initk < self.k:
+        self.Us.data[:, self.initk:, :] = 0.0
+    elif self.init == 'pca':
+      self._pca_init(self.initX)
+    else:
+      self._prob_farthest_insert_init(self.initX,
+          nn_q=int(np.ceil(0.1*self.d)))
+    return
+
+  def _pca_init(self, X, sigma=0.2):
+    """Initialize bases with perturbed singular vectors of X."""
+    N = X.shape[0]
+    lamb = np.sqrt(N*self.reg_params['U_frosqr_in'] *
+        self.reg_params['z'])
+    U, b = ut.reg_pca(X, self.d, form='mf', lamb=lamb, gamma=0.0,
+        affine=self.affine, solver='randomized')
+
+    # re-scale U
+    if lamb > 0:
+      alpha = (np.sqrt(self.reg_params['z']) /
+          np.sqrt(N*self.reg_params['U_frosqr_in'])) ** 0.5
+      U.mul_(alpha)
+
+    ZU = torch.randn(self.r, self.initk, self.D, self.d,
+        device=U.device).mul_(sigma*torch.norm(U) / np.sqrt(self.D*self.d))
+    self.Us.data.zero_()
+    self.Us.data[:, :self.initk, :] = U + ZU
+    if self.affine:
+      self.bs.data.zero_()
+      zb = torch.randn(self.r, self.k, self.D,
+          device=U.device).mul_(sigma*torch.norm(b) / np.sqrt(self.D))
+      self.bs.data[:, :self.initk, :] = b + zb
+    return
+
+  def _prob_farthest_insert_init(self, X, nn_q=0):
+    """Initialize Us, bs by probabilistic farthest insertion (single trial)
+
+    Args:
+      X: Data matrix from which to select bases, shape (N, D)
+      nn_q: Extra nearest neighbors (default: 0).
+    """
+    nn_k = self.d + nn_q
+    if self.affine:
+      nn_k += 1
+    N = X.shape[0]
+
+    self.Us.data.zero_()
+    if self.affine:
+      self.bs.data.zero_()
+
+    # normalization needed for easier nearest-neigbor calculation
+    # but possibly not the best in affine case
+    X = ut.unit_normalize(X, dim=1)
+
+    # choose first basis randomly
+    Idx = torch.randint(0, N, (self.r,), dtype=torch.int64)
+    self._insert_next(0, X[Idx, :], X, nn_k)
+
+    for cidx in range(1, self.initk):
+      # (N, r, k')
+      obj = self._prob_insert_objective(X, cidx)
+      # (N, r)
+      min_obj = torch.min(obj, dim=2)[0]
+      # (r,)
+      Idx = torch.multinomial(min_obj.t(), 1).view(-1)
+      self._insert_next(cidx, X[Idx, :], X, nn_k)
+    return
+
+  def _prob_insert_objective(self, X, cidx):
+    """Evaluate objective wrt X for current initialized subspaces up to but not
+    including cidx.
+    """
+    # NOTE: this mostly duplicates code from objective, loss. Purpose is to
+    # avoid unnecessary computation. But still, could probably simplify.
+    device = X.device
+    batch_size = X.shape[0]
+    loss = torch.zeros(self.r, cidx, batch_size, device=device)
+
+    with torch.no_grad():
+      for ii in range(self.r):
+        for jj in range(cidx):
+          X_ = self.forward(X, ii, jj)
+          slci, slcj = self._parse_slice(ii, jj)
+          loss[slci, slcj, :] = torch.sum((X_ - X)**2, dim=-1).mul(0.5)
+      loss = loss.permute(2, 0, 1)
+
+      reg = self.reg()
+      reg_in = torch.zeros(self.r, self.k, device=device)
+      for key, val in reg.items():
+        if key in self.assign_reg_terms:
+          reg_in = reg_in + val
+      if reg_in.dim() == 2:
+        reg_in = reg_in.unsqueeze(0)
+      reg_in = reg_in[:, :, :cidx]
+
+      assign_obj = loss + reg_in
+    return assign_obj
+
+  def _insert_next(self, cidx, y, X, nn_k):
+    """Insert next basis (cidx) centered on sampled points y from X."""
+    y_knn = ut.cos_knn(y, X, nn_k)
+    for ii in range(self.r):
+      Xj = y_knn[ii, :]
+      Nj = Xj.shape[0]
+      lamb = np.sqrt(Nj*self.reg_params['U_frosqr_in'] *
+          self.reg_params['z'])
+      U, b = ut.reg_pca(Xj, self.d, form='mf', lamb=lamb, gamma=0.0,
+          affine=self.affine, solver='randomized')
+
+      # re-scale U
+      if lamb > 0:
+        alpha = (np.sqrt(self.reg_params['z']) /
+            np.sqrt(Nj*self.reg_params['U_frosqr_in'])) ** 0.5
+        U.mul_(alpha)
+
+      self.Us.data[ii, cidx, :] = U
+      if self.affine:
+        self.bs.data[ii, cidx, :] = b
     return
 
   def encode(self, x, ii=None, jj=None):
@@ -904,7 +984,7 @@ class KSubspaceBatchAltBaseModel(KSubspaceBaseModel):
         reset_try_tol=0.01, reset_max_steps=None, reset_accept_tol=1e-4,
         reset_stochastic=True, reset_low_value=False, reset_value_thr=0.1,
         reset_sigma=0.05, reset_cache_size=None, cache_subsample_rate=None,
-        svd_solver='randomized'):
+        svd_solver='randomized', **kwargs):
 
     if svd_solver not in ('randomized', 'svds', 'svd'):
       raise ValueError("Invalid svd solver {}".format(svd_solver))
@@ -919,7 +999,7 @@ class KSubspaceBatchAltBaseModel(KSubspaceBaseModel):
         reset_stochastic=reset_stochastic, reset_low_value=reset_low_value,
         reset_value_thr=reset_value_thr, reset_sigma=reset_sigma,
         reset_cache_size=reset_cache_size,
-        cache_subsample_rate=cache_subsample_rate)
+        cache_subsample_rate=cache_subsample_rate, **kwargs)
 
     self.dataset = dataset
     self.register_buffer('X', dataset.X)
@@ -1005,8 +1085,6 @@ class KSubspaceBatchAltProjModel(KSubspaceBatchAltBaseModel,
         reset_value_thr=reset_value_thr, reset_sigma=reset_sigma,
         reset_cache_size=reset_cache_size,
         cache_subsample_rate=cache_subsample_rate, svd_solver=svd_solver)
-
-    self.reset_parameters()
     return
 
   def step(self):
@@ -1040,8 +1118,10 @@ class KSubspaceBatchAltMFModel(KSubspaceBatchAltBaseModel, KSubspaceMFModel):
         reset_try_tol=0.01, reset_max_steps=None, reset_accept_tol=1e-4,
         reset_stochastic=True, reset_low_value=False, reset_value_thr=0.1,
         reset_sigma=0.05, reset_cache_size=None, cache_subsample_rate=None,
-        svd_solver='randomized'):
+        init='random', initX=None, initk=None, svd_solver='randomized'):
 
+    mf_kwargs = {'scale_grad_freq': None, 'init': init, 'initX': initX,
+        'initk': initk}
     super().__init__(k, d, dataset,
         affine=affine, replicates=replicates, reg_params=reg_params,
         serial_eval=serial_eval, reset_patience=reset_patience,
@@ -1050,18 +1130,11 @@ class KSubspaceBatchAltMFModel(KSubspaceBatchAltBaseModel, KSubspaceMFModel):
         reset_stochastic=reset_stochastic, reset_low_value=reset_low_value,
         reset_value_thr=reset_value_thr, reset_sigma=reset_sigma,
         reset_cache_size=reset_cache_size,
-        cache_subsample_rate=cache_subsample_rate, svd_solver=svd_solver)
+        cache_subsample_rate=cache_subsample_rate, svd_solver=svd_solver,
+        **mf_kwargs)
 
-    self.reset_parameters()
-    return
-
-  def reset_parameters(self):
-    """Initialize Us, bs with entries drawn from normal with std
-    0.1/sqrt(D)."""
-    std = .1 / np.sqrt(self.D)
-    self.Us.data.normal_(0., std)
-    if self.affine:
-      self.bs.data.normal_(0., std)
+    # bases initialized in KSubspaceMFModel
+    # ensure columns are orthogonal
     for ii in range(self.r):
       for jj in range(self.k):
         P, S, _ = torch.svd(self.Us.data[ii, jj, :])
@@ -1308,7 +1381,7 @@ class KSubspaceMFCorruptModel(KSubspaceMFModel):
         reset_try_tol=0.01, reset_max_steps=None, reset_accept_tol=1e-4,
         reset_stochastic=True, reset_low_value=False, reset_value_thr=0.1,
         reset_sigma=0.05, reset_cache_size=None, cache_subsample_rate=None,
-        encode_max_iter=20, encode_tol=1e-3):
+        scale_grad_freq=100, encode_max_iter=20, encode_tol=1e-3):
 
     if encode_max_iter <= 0:
       raise ValueError(("Invalid encode_max_iter parameter {}").format(
@@ -1322,7 +1395,8 @@ class KSubspaceMFCorruptModel(KSubspaceMFModel):
         reset_stochastic=reset_stochastic, reset_low_value=reset_low_value,
         reset_value_thr=reset_value_thr, reset_sigma=reset_sigma,
         reset_cache_size=reset_cache_size,
-        cache_subsample_rate=cache_subsample_rate)
+        cache_subsample_rate=cache_subsample_rate,
+        scale_grad_freq=scale_grad_freq)
 
     # when e reg parameter is set to zero we disable the corruption term,
     # although strictly speaking it should give the trivial solution e = full
@@ -1379,21 +1453,24 @@ class KSubspaceMFCorruptModel(KSubspaceMFModel):
         break
 
     if self.encode_max_iter > 0:
-      self.encode_steps = kk + 1
-      self.encode_update = update
-    else:
-      self.encode_steps = 0.0
-      self.encode_update = 0.0
+      if self.encode_steps is None:
+        self.encode_steps = kk+1
+        self.encode_update = update
+      else:
+        self.encode_steps = (EMA_DECAY*self.encode_steps +
+            (1-EMA_DECAY)*(kk+1))
+        self.encode_update = (EMA_DECAY*self.encode_update +
+            (1-EMA_DECAY)*update)
 
     # one more time for tracking gradients.
     z = self._least_squares(x - e, Us_P, Us_s, Us_Q)
     x_ = torch.matmul(z, Us.transpose(2, 3))
     if self.affine:
       x_ = x_.add(bs.unsqueeze(2))
-    x0_ = x_.data.clone().squeeze()
-    x_ = x_.add(e).squeeze()
+    x0_ = x_.data.clone()
+    x_ = x_.add(e)
 
-    self._update_forward_cache(ii, jj, (z, x0_))
+    self._update_forward_cache(ii, jj, (z, e, x0_))
     return x_
 
   def encode(self, x, ii=None, jj=None):
@@ -1436,7 +1513,7 @@ class KSubspaceMFCorruptModel(KSubspaceMFModel):
 
   def _update_forward_cache(self, ii, jj, cache_vals):
     """Update any cached values from forward call."""
-    z, x0_ = cache_vals
+    z, _, x0_ = cache_vals
     batch_size = z.shape[2]
     device = z.device
 
@@ -1479,7 +1556,7 @@ class KSubspaceMCModel(KSubspaceMFCorruptModel):
         reset_try_tol=0.01, reset_max_steps=None, reset_accept_tol=1e-4,
         reset_stochastic=True, reset_low_value=False, reset_value_thr=0.1,
         reset_sigma=0.05, reset_cache_size=None, cache_subsample_rate=None,
-        encode_max_iter=20, encode_tol=1e-3):
+        encode_max_iter=20, encode_tol=1e-3, scale_grad_freq=100):
 
     super().__init__(k, d, D,
         affine=affine, replicates=replicates, reg_params=reg_params,
@@ -1490,7 +1567,8 @@ class KSubspaceMCModel(KSubspaceMFCorruptModel):
         reset_value_thr=reset_value_thr, reset_sigma=reset_sigma,
         reset_cache_size=reset_cache_size,
         cache_subsample_rate=cache_subsample_rate,
-        encode_max_iter=encode_max_iter, encode_tol=encode_tol)
+        encode_max_iter=encode_max_iter, encode_tol=encode_tol,
+        scale_grad_freq=scale_grad_freq)
 
     self.omega = None
     return
@@ -1574,3 +1652,54 @@ class KSubspaceMCModel(KSubspaceMFCorruptModel):
     # (r,)
     recovery = recovery.mean(dim=1)
     return recovery
+
+
+class KSubspaceMFOutlierModel(KSubspaceMFCorruptModel):
+  """K-subspace model where low-dim coefficients are computed in closed
+  form. Adapted to handle outliers."""
+  default_reg_params = {
+      'U_frosqr_in': 0.01,
+      'U_frosqr_out': 1e-4,
+      'z': 0.01,
+      'e': 0.4
+  }
+  assign_reg_terms = {'U_frosqr_in', 'z', 'e'}
+
+  def __init__(self, k, d, D, affine=False, replicates=5, reg_params={},
+        serial_eval={}, reset_patience=100, reset_jitter=True,
+        reset_try_tol=0.01, reset_max_steps=None, reset_accept_tol=1e-4,
+        reset_stochastic=True, reset_low_value=False, reset_value_thr=0.1,
+        reset_sigma=0.05, reset_cache_size=None, cache_subsample_rate=None,
+        encode_max_iter=20, encode_tol=1e-3, scale_grad_freq=100):
+
+    super().__init__(k, d, D,
+        affine=affine, replicates=replicates, reg_params=reg_params,
+        serial_eval=serial_eval, reset_patience=reset_patience,
+        reset_jitter=reset_jitter, reset_try_tol=reset_try_tol,
+        reset_max_steps=reset_max_steps, reset_accept_tol=reset_accept_tol,
+        reset_stochastic=reset_stochastic, reset_low_value=reset_low_value,
+        reset_value_thr=reset_value_thr, reset_sigma=reset_sigma,
+        reset_cache_size=reset_cache_size,
+        cache_subsample_rate=cache_subsample_rate,
+        encode_max_iter=encode_max_iter, encode_tol=encode_tol,
+        scale_grad_freq=scale_grad_freq)
+    return
+
+  def _prox_e(self, w):
+    """Compute proximal operator of ||.||_2."""
+    # w shape (r, k, batch_size, D)
+    wnorm = w.pow(2).sum(dim=3, keepdim=True).sqrt()
+    beta = (wnorm - self.reg_params['e']).clamp_(min=0).div_(wnorm)
+    e = beta * w
+    return e
+
+  def reg_e(self):
+    """Compute regularizer wrt e."""
+    return self.enorm
+
+  def _update_forward_cache(self, ii, jj, cache_vals):
+    """Update any cached values from forward call."""
+    super()._update_forward_cache(ii, jj, cache_vals)
+    _, e, _ = cache_vals
+    self.enorm = torch.norm(e, dim=3).permute(2, 0, 1)
+    return
