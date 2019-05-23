@@ -216,7 +216,7 @@ class ImageUoSDataset(Dataset):
       stopi = sv_range[1] if len(sv_range) == 2 else sv_range[0]
       U, s, _ = torch.svd(self.X)
       if stopi is None or stopi <= 0:
-        stopi = min(U.shape)
+        stopi = min(U.shape) + 1
       self.X = U[:, starti:stopi] * s[starti:stopi]
 
     if normalize:

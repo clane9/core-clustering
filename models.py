@@ -66,7 +66,7 @@ class KSubspaceBaseModel(nn.Module):
     self.n_reset_cands = 1 if reset_low_value else k
     self.reset_sigma = reset_sigma
     if reset_cache_size is None or reset_cache_size <= 0:
-      reset_cache_size = 100 * int(np.ceil(d*k*np.log(k) / 100))
+      reset_cache_size = 100 * int(np.ceil(2*d*k*np.log(k) / 100))
     self.reset_cache_size = reset_cache_size
     if cache_subsample_rate is None or cache_subsample_rate <= 0:
       cache_subsample_rate = 1.0 / k
@@ -468,16 +468,28 @@ class KSubspaceBaseModel(nn.Module):
     return reset_rids
 
   def _reset_replicate(self, ridx):
-    """Re-initialize a replicate by executing several steps of greedy
-    hill-climbing over the graph of (rk choose k) subsets of bases."""
+    """Re-initialize a replicate by executing several steps of (approximate
+    steepest descent over the graph of (rk choose k) subsets of bases."""
     cids = np.arange(self.k)
     attempt_cids = []
     resets = []
     successes = 0
 
-    for _ in range(self.reset_max_steps):
-      value, rep_min_assign_obj = self._eval_value(ridx)
+    value, rep_min_assign_obj = self._eval_value(ridx)
 
+    if self.cache_subsample_size is not None:
+      # restrict to a sample of poorly represented data points
+      # NOTE: previously was choosing on every iteration, but this can lead to
+      # a cycle..
+      sub_Idx = torch.multinomial(rep_min_assign_obj,
+          self.cache_subsample_size)
+      old_obj = (rep_min_assign_obj[sub_Idx].mean() +
+          self._batch_reg_out[ridx].sum())
+    else:
+      sub_Idx = None
+      old_obj = (rep_min_assign_obj.mean() + self._batch_reg_out[ridx].sum())
+
+    for _ in range(self.reset_max_steps):
       if self.reset_low_value:
         # find lowest value cluster among those we haven't tried to reset
         avail_cids = np.setdiff1d(cids, attempt_cids)
@@ -488,16 +500,6 @@ class KSubspaceBaseModel(nn.Module):
         attempt_cids.append(cidx)
       else:
         cidx = None
-
-      if self.cache_subsample_size is not None:
-        # restrict to worst represented data points
-        sub_Idx = torch.sort(rep_min_assign_obj, descending=True)[1]
-        sub_Idx = sub_Idx[:self.cache_subsample_size]
-        old_obj = (rep_min_assign_obj[sub_Idx].mean() +
-            self._batch_reg_out[ridx].sum())
-      else:
-        sub_Idx = None
-        old_obj = (rep_min_assign_obj.mean() + self._batch_reg_out[ridx].sum())
 
       # evaluate all alternative objectives
       # either shape (k, rk), or (1, rk) if resetting low value
@@ -538,6 +540,14 @@ class KSubspaceBaseModel(nn.Module):
         self._batch_reg_out[ridx, cidx] = self._batch_reg_out[
             cand_ridx, cand_cidx]
 
+        # re-compute
+        value, rep_min_assign_obj = self._eval_value(ridx)
+        if sub_Idx is not None:
+          old_obj = (rep_min_assign_obj[sub_Idx].mean() +
+              self._batch_reg_out[ridx].sum())
+        else:
+          old_obj = (rep_min_assign_obj.mean() +
+              self._batch_reg_out[ridx].sum())
         successes += 1
       elif not self.reset_low_value:
         # we know we've converged if doing full search
