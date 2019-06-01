@@ -164,12 +164,15 @@ class KSubspaceBaseModel(nn.Module):
     or slice(None)."""
     # don't lose dims
     ii, jj = self._parse_slice(ii, jj)
-    Us = self.Us[ii, jj, :]
-    bs = self.bs[ii, jj, :] if self.affine else None
     if no_grad:
-      Us = Us.data
-      if self.affine:
-        bs = bs.data
+      Us = self.Us.data
+      bs = self.bs.data if self.affine else None
+    else:
+      Us = self.Us
+      bs = self.bs if self.affine else None
+    if not (ii == slice(None) and jj == slice(None)):
+      Us = Us[ii, jj, :]
+      bs = bs[ii, jj, :] if self.affine else None
     return Us, bs
 
   def _parse_slice(self, ii, jj):
@@ -258,20 +261,18 @@ class KSubspaceBaseModel(nn.Module):
     Returns:
       loss: shape (batch_size, r, k)
     """
-    batch_size = x.shape[0]
-    device = x.device
-    loss = torch.zeros(self.r, self.k, batch_size, device=device)
-
     # Note that X[slice(None)] acts the same as X[:]
     rep_range = range(self.r) if 'r' in self.serial_eval else [None]
     cluster_range = range(self.k) if 'k' in self.serial_eval else [None]
 
+    losses = []
     for ii in rep_range:
+      rep_losses = []
       for jj in cluster_range:
         x_ = self.forward(x, ii, jj)
-        slci, slcj = self._parse_slice(ii, jj)
-        loss[slci, slcj, :] = torch.sum((x_ - x)**2, dim=-1).mul(0.5)
-
+        rep_losses.append(torch.sum((x_ - x)**2, dim=-1).mul(0.5))
+      losses.append(torch.cat(rep_losses, dim=1))
+    loss = torch.cat(losses, dim=0)
     loss = loss.permute(2, 0, 1)
     return loss
 
@@ -514,7 +515,7 @@ class KSubspaceBaseModel(nn.Module):
           sample_prob = (obj_decr - self.reset_accept_tol).clamp_(min=0)
           idx = torch.multinomial(sample_prob, 1)[0].item()
         else:
-          idx = obj_decr.view(-1).argmax()
+          idx = obj_decr.view(-1).argmax().item()
       else:
         # only for logging purpose
         idx = obj_decr.argmax().item()
@@ -579,7 +580,7 @@ class KSubspaceBaseModel(nn.Module):
         (top2obj[:, [1]] - top2obj[:, [0]])).mean(dim=0)
     value.sub_(self._batch_reg_out[ridx, :])
     value.div_(max(value.max(), EPS))
-    return value, top2obj[:, 0]
+    return value.cpu().numpy(), top2obj[:, 0]
 
   def _eval_alt_obj(self, ridx, cidx=None, sub_Idx=None):
     """Find the best candidate swap for each of a given replicate's
