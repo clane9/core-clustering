@@ -3,6 +3,7 @@ from __future__ import division
 
 import numpy as np
 import shutil
+import gc
 from scipy.optimize import linear_sum_assignment, bisect
 from scipy.sparse.linalg import svds
 from sklearn.utils.extmath import randomized_svd
@@ -195,12 +196,14 @@ def find_soft_assign(losses, T=1.):
   return c
 
 
-def coherence(U1, U2, normalize=False):
+def coherence(U1, U2, normalize=False, svd=False, sv_tol=None):
   """Compute coherence between U1, U2.
 
   Args:
     U1, U2: (D x d) matrices
     normalize: normalize columns of U1, U2 (default: False)
+    svd: Orthogonalize bases by svd (default: False)
+    sv_tol: Singular value threshold (default: None)
 
   Returns:
     coh: scalar coherence loss
@@ -209,8 +212,36 @@ def coherence(U1, U2, normalize=False):
   if normalize:
     U1 = unit_normalize(U1, p=2, dim=0)
     U2 = unit_normalize(U2, p=2, dim=0)
+  if svd:
+    U1, s1, _ = torch.svd(U1)
+    U2, s2, _ = torch.svd(U2)
+    if sv_tol is not None and sv_tol > 0:
+      U1 = U1[:, (s1 >= sv_tol*s1[0])]
+      U2 = U2[:, (s2 >= sv_tol*s2[0])]
+      d = min(U1.size(1), U2.size(1))
   coh = torch.matmul(U1.t(), U2).pow(2).sum().div(d)
   return coh
+
+
+def eval_cluster_coherence(Us, normalize=False, svd=True, sv_tol=1e-3):
+  """Evaluate coherence for every pair of subspace bases
+
+  Args:
+    Us: subspace bases, shape (k, D, d)
+    normalize: normalize columns of U1, U2 (default: False)
+    svd: Orthogonalize bases by svd (default: True)
+    sv_tol: Singular value threshold (default: 1e-3)
+
+  Returns:
+    coh_mat: coherence matrix, shape (k, k)
+  """
+  with torch.no_grad():
+    k = Us.shape[0]
+    coh_mat = np.array([[
+        coherence(Us[ii, :], Us[jj, :], normalize=False,
+            svd=True, sv_tol=sv_tol).item()
+        for jj in range(k)] for ii in range(k)])
+  return coh_mat
 
 
 def cos_knn(y, X, k, normalize=False):
@@ -255,6 +286,14 @@ def unit_normalize(X, p=2, dim=None):
 
 
 def batch_svd(X, out=None):
+  """Compute batch svd of X
+
+  Args:
+    X: shape (*, m, n)
+
+  Returns:
+    U, s, V: batch svds, shape (*, m, d), (*, d), (*, n, d) (d = min(m, n))
+  """
   shape = X.shape
   if len(shape) < 3:
     raise ValueError("Invalid X value, should have >= 1 batch dim.")
@@ -385,3 +424,33 @@ def reg_pca(X, d, form='proj', lamb=0.0, gamma=0.0, affine=False,
     U[:, nz_mask] *= z
     U[:, nz_mask == 0] = 0.0
   return U, b
+
+
+def print_cuda_tensors():
+  """Print active cuda tensors.
+
+  Adapted from:
+  https://discuss.pytorch.org/t/how-to-debug-causes-of-gpu-memory-leaks/6741
+  """
+  objs = gc.get_objects()
+  obj_counts = {}
+  obj_dev_shapes = []
+  for obj in objs:
+    try:
+      if (torch.is_tensor(obj) or (hasattr(obj, 'data') and
+            torch.is_tensor(obj.data))):
+        device = str(obj.device)
+        shape = tuple(obj.shape)
+        key = (device, shape)
+        if key in obj_counts:
+          obj_counts[key] += 1
+        else:
+          obj_dev_shapes.append(key)
+          obj_counts[key] = 1
+    except:
+      pass
+
+  for key in sorted(obj_dev_shapes):
+    if 'cuda' in key[0]:
+      print('{}: {}'.format(key, obj_counts[key]))
+  return
