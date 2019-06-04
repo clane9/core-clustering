@@ -12,7 +12,7 @@ import utils as ut
 from models import KSubspaceBatchAltBaseModel
 
 EPS = 1e-8
-COPY_OPT_STATE = False
+RESET_NCOL = 8
 
 
 def train_loop(model, data_loader, device, optimizer, out_dir=None, epochs=200,
@@ -153,7 +153,7 @@ def train_loop(model, data_loader, device, optimizer, out_dir=None, epochs=200,
   finally:
     if reset_unused:
       resets = (np.concatenate(resets, axis=0) if len(resets) > 0
-          else np.zeros((0, 7), dtype=object))
+          else np.zeros((0, RESET_NCOL+1), dtype=object))
     if out_dir is not None:
       with open('{}/metrics.npz'.format(out_dir), 'wb') as f:
         np.savez(f, metrics=metrics[:epoch, :])
@@ -214,14 +214,13 @@ def train_epoch(model, data_loader, optimizer, device, eval_rank=False,
     conf_mats.update(batch_conf_mats, 1)
 
     if reset_unused:
-      # cols: ridx, cidx, cand_ridx, cand_cidx, success, obj_decr
+      # cols: ridx, cidx, cand_ridx, cand_cidx, success, obj_decr,
+      # cumu_obj_decr, temp
       batch_resets = model.reset_unused()
-      success_mask = batch_resets[:, 4] == 1
+      success_mask = batch_resets[:, 6] >= model.reset_accept_tol
       if success_mask.sum() > 0:
-        # ridx, cidx, cand_ridx, cand_cidx
-        reset_ids = batch_resets[success_mask, :][:, :4].astype(np.int64)
-        ut.reset_optimizer_state(model, optimizer, reset_ids,
-            copy=COPY_OPT_STATE)
+        rIdx = np.unique(batch_resets[success_mask, 0].astype(np.int64))
+        ut.reset_optimizer_state(model, optimizer, rIdx)
       if batch_resets.shape[0] > 0:
         resets.append(batch_resets)
 
@@ -248,7 +247,7 @@ def train_epoch(model, data_loader, optimizer, device, eval_rank=False,
 
   if reset_unused:
     resets = (np.concatenate(resets) if len(resets) > 0
-        else np.zeros((0, 6), dtype=object))
+        else np.zeros((0, RESET_NCOL), dtype=object))
     success_mask = resets[:, 4] == 1
     reset_count = success_mask.sum()
     rep_reset_counts = np.zeros((1, model.r))
@@ -284,7 +283,7 @@ def batch_alt_step(model, eval_rank=False, reset_unused=False):
       for ii in range(model.replicates)])
 
   if reset_unused:
-    # cols: ridx, cidx, cand_ridx, cand_cidx, success, obj_decr
+    # cols: ridx, cidx, cand_ridx, cand_cidx, success, obj_decr, temp
     resets = model.reset_unused()
     success_mask = resets[:, 4] == 1
     reset_count = success_mask.sum()
@@ -294,7 +293,7 @@ def batch_alt_step(model, eval_rank=False, reset_unused=False):
           resets[success_mask, 0].astype(np.int64), return_counts=True)
       rep_reset_counts[0, reset_rids] = success_counts
   else:
-    resets = np.zeros((0, 6), dtype=object)
+    resets = np.zeros((0, RESET_NCOL), dtype=object)
     reset_count = 0
     rep_reset_counts = np.zeros((1, model.r))
 

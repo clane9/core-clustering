@@ -114,19 +114,11 @@ if __name__ == '__main__':
   parser.add_argument('--reset-patience', type=int, default=100,
                       help=('Steps to wait without obj decrease '
                       'before trying to reset [default: 100]'))
-  parser.add_argument('--reset-jitter', type=ut.boolarg, default=False,
-                      help='Jitter reset patience [default: 0]')
-  parser.add_argument('--reset-low-value', type=ut.boolarg, default=True,
-                      help='Choose low value cluster to reset [default: 1]')
-  parser.add_argument('--reset-value-thr', type=float, default=0.2,
-                      help=('Value threshold for low value clusters '
-                      '[default: 0.2]'))
-  parser.add_argument('--reset-stochastic', type=ut.boolarg, default=False,
-                      help=('Choose reset substitution stochastically '
-                      '[default: 0]'))
   parser.add_argument('--reset-try-tol', type=float, default=0.01,
                       help=('Objective decrease tolerance for deciding'
                       'when to reset [default: 0.01]'))
+  parser.add_argument('--reset-max-steps', type=int, default=50,
+                      help='Number of reset SA iterations [default: 50]')
   parser.add_argument('--reset-accept-tol', type=float, default=0.01,
                       help=('Objective decrease tolerance for accepting'
                       'a reset [default: 0.01]'))

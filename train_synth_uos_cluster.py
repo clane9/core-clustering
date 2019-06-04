@@ -82,14 +82,13 @@ def train_synth_uos_cluster(args):
   if args.model_k is None or args.model_k <= 0:
     args.model_k = args.k
   reset_kwargs = dict(reset_patience=args.reset_patience,
-      reset_jitter=args.reset_jitter,
       reset_try_tol=args.reset_try_tol,
+      reset_max_steps=args.reset_max_steps,
       reset_accept_tol=args.reset_accept_tol,
-      reset_stochastic=args.reset_stochastic,
-      reset_low_value=args.reset_low_value,
-      reset_value_thr=args.reset_value_thr,
       reset_sigma=args.reset_sigma,
-      reset_cache_size=args.reset_cache_size)
+      reset_cache_size=args.reset_cache_size,
+      temp_scheduler=mod.GeoTempScheduler(init_temp=0.1, replicates=args.reps,
+          patience=1, gamma=0.9))
 
   if args.serial_eval is None or args.serial_eval.lower() == 'none':
     args.serial_eval = []
@@ -280,19 +279,11 @@ if __name__ == '__main__':
   parser.add_argument('--reset-patience', type=int, default=100,
                       help=('Steps to wait without obj decrease '
                       'before trying to reset [default: 100]'))
-  parser.add_argument('--reset-jitter', type=ut.boolarg, default=False,
-                      help='Jitter reset patience [default: 0]')
-  parser.add_argument('--reset-low-value', type=ut.boolarg, default=True,
-                      help='Choose low value cluster to reset [default: 1]')
-  parser.add_argument('--reset-value-thr', type=float, default=0.2,
-                      help=('Value threshold for low value clusters '
-                      '[default: 0.2]'))
-  parser.add_argument('--reset-stochastic', type=ut.boolarg, default=False,
-                      help=('Choose reset substitution stochastically '
-                      '[default: 0]'))
   parser.add_argument('--reset-try-tol', type=float, default=0.01,
                       help=('Objective decrease tolerance for deciding'
                       'when to reset [default: 0.01]'))
+  parser.add_argument('--reset-max-steps', type=int, default=50,
+                      help='Number of reset SA iterations [default: 50]')
   parser.add_argument('--reset-accept-tol', type=float, default=0.01,
                       help=('Objective decrease tolerance for accepting'
                       'a reset [default: 0.01]'))

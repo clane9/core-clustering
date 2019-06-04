@@ -38,20 +38,9 @@ def boolarg(arg):
   return bool(int(arg))
 
 
-def reset_optimizer_state(model, optimizer, reset_ids, copy=False):
+def reset_optimizer_state(model, optimizer, rIdx):
   """Reset optimizer states to zero for re-initialized replicates &
   clusters. Or, if copy=True, copy states from duplicated clusters."""
-  if copy:
-    # choose last occurrence of each ridx, cidx pair
-    revIdx = np.arange(reset_ids.shape[0] - 1, -1, -1)
-    _, uniqIdx = np.unique(reset_ids[revIdx, :][:, [0, 1]], axis=0,
-        return_index=True)
-    uniqIdx = revIdx[uniqIdx]
-    rIdx, cIdx = reset_ids[uniqIdx, 0], reset_ids[uniqIdx, 1]
-    cand_rIdx, cand_cIdx = reset_ids[uniqIdx, 2], reset_ids[uniqIdx, 3]
-  else:
-    rIdx = np.unique(reset_ids[:, 0])
-
   for p in model.parameters():
     if not p.requires_grad:
       continue
@@ -59,10 +48,7 @@ def reset_optimizer_state(model, optimizer, reset_ids, copy=False):
     for key, val in state.items():
       if isinstance(val, torch.Tensor) and val.shape == p.shape:
         # assuming all parameters have (r, k) as first dims.
-        if copy:
-          val[rIdx, cIdx, :] = val[cand_rIdx, cand_cIdx, :]
-        else:
-          val[rIdx, :] = 0.0
+        val[rIdx, :] = 0.0
   return
 
 
