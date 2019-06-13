@@ -12,6 +12,7 @@ import utils as ut
 from models import KSubspaceBatchAltBaseModel
 
 EPS = 1e-8
+# ridx,  cidx, cand_ridx, cand_cidx, success, obj_decr, cumu_obj_decr, temp
 RESET_NCOL = 8
 
 
@@ -153,13 +154,10 @@ def train_loop(model, data_loader, device, optimizer, out_dir=None, epochs=200,
   finally:
     if reset_unused:
       resets = (np.concatenate(resets, axis=0) if len(resets) > 0
-          else np.zeros((0, RESET_NCOL+1), dtype=object))
+          else np.zeros((0, RESET_NCOL+2), dtype=object))
     if out_dir is not None:
       with open('{}/metrics.npz'.format(out_dir), 'wb') as f:
         np.savez(f, metrics=metrics[:epoch, :])
-      if reset_unused:
-        with open('{}/resets.npz'.format(out_dir), 'wb') as f:
-          np.savez(f, resets=resets)
       if save_data:
         save_conf_mats = conf_mats[:epoch, :]
         save_svs = svs[:epoch, :] if eval_rank else None
@@ -171,6 +169,13 @@ def train_loop(model, data_loader, device, optimizer, out_dir=None, epochs=200,
       if eval_rank:
         with open('{}/svs.npz'.format(out_dir), 'wb') as f:
           np.savez(f, svs=save_svs)
+      if reset_unused:
+        if save_data:
+          with open('{}/resets.npz'.format(out_dir), 'wb') as f:
+            np.savez(f, resets=resets)
+        reset_summary = ut.aggregate_resets(resets)
+        reset_summary.to_csv('{}/reset_summary.csv'.format(out_dir),
+            index=False)
 
     if err is not None:
       raise err
@@ -184,6 +189,7 @@ def train_epoch(model, data_loader, optimizer, device, eval_rank=False,
   metrics = None
   resets = []
   conf_mats, sampsec = [ut.AverageMeter() for _ in range(2)]
+  itr = 1
   tic = time.time()
   for x, groups in data_loader:
     x = x.to(device)
@@ -214,16 +220,16 @@ def train_epoch(model, data_loader, optimizer, device, eval_rank=False,
     conf_mats.update(batch_conf_mats, 1)
 
     if reset_unused:
-      # cols: ridx, cidx, cand_ridx, cand_cidx, success, obj_decr,
-      # cumu_obj_decr, temp
       batch_resets = model.reset_unused()
-      success_mask = batch_resets[:, 6] >= model.reset_accept_tol
+      success_mask = batch_resets[:, 4] == 1
       if success_mask.sum() > 0:
         rIdx = np.unique(batch_resets[success_mask, 0].astype(np.int64))
         ut.reset_optimizer_state(model, optimizer, rIdx)
       if batch_resets.shape[0] > 0:
+        batch_resets = np.insert(batch_resets, 0, itr, axis=1)
         resets.append(batch_resets)
 
+    itr += 1
     toc = time.time()
     batch_time = toc - tic
     tic = toc
@@ -247,13 +253,13 @@ def train_epoch(model, data_loader, optimizer, device, eval_rank=False,
 
   if reset_unused:
     resets = (np.concatenate(resets) if len(resets) > 0
-        else np.zeros((0, RESET_NCOL), dtype=object))
-    success_mask = resets[:, 4] == 1
+        else np.zeros((0, RESET_NCOL+1), dtype=object))
+    success_mask = resets[:, 5] == 1
     reset_count = success_mask.sum()
     rep_reset_counts = np.zeros((1, model.r))
     if reset_count > 0:
       reset_rids, success_counts = np.unique(
-          resets[success_mask, 0].astype(np.int64), return_counts=True)
+          resets[success_mask, 1].astype(np.int64), return_counts=True)
       rep_reset_counts[0, reset_rids] = success_counts
   else:
     reset_count = 0
@@ -283,7 +289,6 @@ def batch_alt_step(model, eval_rank=False, reset_unused=False):
       for ii in range(model.replicates)])
 
   if reset_unused:
-    # cols: ridx, cidx, cand_ridx, cand_cidx, success, obj_decr, temp
     resets = model.reset_unused()
     success_mask = resets[:, 4] == 1
     reset_count = success_mask.sum()
@@ -292,8 +297,9 @@ def batch_alt_step(model, eval_rank=False, reset_unused=False):
       reset_rids, success_counts = np.unique(
           resets[success_mask, 0].astype(np.int64), return_counts=True)
       rep_reset_counts[0, reset_rids] = success_counts
+    resets = np.insert(resets, 0, 1, axis=1)
   else:
-    resets = np.zeros((0, RESET_NCOL), dtype=object)
+    resets = np.zeros((0, RESET_NCOL+1), dtype=object)
     reset_count = 0
     rep_reset_counts = np.zeros((1, model.r))
 

@@ -1,14 +1,19 @@
 from __future__ import print_function
 from __future__ import division
 
-import numpy as np
+from collections import OrderedDict
 import shutil
 import gc
+
+import numpy as np
 from scipy.optimize import linear_sum_assignment, bisect
 from scipy.sparse.linalg import svds
 from sklearn.utils.extmath import randomized_svd
 import torch
 import torch.nn.functional as F
+import pandas as pd
+
+import ipdb
 
 EPS = 1e-8
 
@@ -433,10 +438,39 @@ def print_cuda_tensors():
         else:
           obj_dev_shapes.append(key)
           obj_counts[key] = 1
-    except:
+    except Exception:
       pass
 
   for key in sorted(obj_dev_shapes):
     if 'cuda' in key[0]:
       print('{}: {}'.format(key, obj_counts[key]))
   return
+
+
+def unique_resets(reset_cids):
+  """Choose last occurrence of each cidx."""
+  revIdx = np.arange(reset_cids.shape[0] - 1, -1, -1)
+  _, uniqIdx = np.unique(reset_cids[revIdx], axis=0, return_index=True)
+  uniqIdx = revIdx[uniqIdx]
+  return uniqIdx
+
+
+def aggregate_resets(resets):
+  """Aggregate resets for each epoch and replicate."""
+  ipdb.set_trace()
+  columns = ['epoch', 'itr', 'ridx', 'cidx', 'cand.ridx', 'cand.cidx',
+      'success', 'obj.decr', 'cumu.obj.decr', 'temp']
+  dtypes = 7*[int] + 3*[float]
+  resets_dict = {columns[ii]: resets[:, ii].astype(dtypes[ii])
+      for ii in range(len(columns))}
+  resets = pd.DataFrame(data=resets_dict)
+  resets = resets[resets['success'] == 1]
+  grouped = resets.groupby(['epoch', 'itr', 'ridx'])
+  agg_resets = grouped.agg(OrderedDict([('success', ['count']), ('obj.decr',
+      ['min', 'median', 'max']), ('cumu.obj.decr', ['min', 'median', 'max']),
+      ('temp', ['min'])]))
+  agg_resets.reset_index(inplace=True)
+  agg_resets.columns = (['epoch', 'itr', 'ridx', 'path.length'] +
+      ['{}.{}'.format(met, meas) for met in ['obj.decr', 'cumu.obj.decr']
+          for meas in ['min', 'med', 'max']] + ['temp'])
+  return agg_resets

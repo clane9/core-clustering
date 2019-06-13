@@ -390,6 +390,22 @@ class KSubspaceBaseModel(nn.Module):
       rep_resets = self._reset_replicate(ridx.item())
       resets.append(rep_resets)
     resets = np.concatenate(resets, axis=0)
+
+    # perturb all bases slightly in replicates with resets to make sure we
+    # always have some diversity across replicates
+    success_mask = resets[:, 4] == 1
+    if self.reset_sigma > 0 and success_mask.sum() > 0:
+      rIdx = np.unique(resets[success_mask, 0].astype(np.int64))
+      reset_r = rIdx.shape[0]
+      # (reset_r, k, 1, 1)
+      Unorms = self.Us.data[rIdx, :].pow(2).sum(
+          dim=(2, 3), keepdim=True).sqrt()
+      # scale of perturbation is relative to each basis' norm
+      reset_Sigma = Unorms.mul(
+          self.reset_sigma / np.sqrt(self.D*self.d))
+      Z = torch.randn(reset_r, self.k, self.D, self.d,
+          dtype=Unorms.dtype, device=Unorms.device).mul_(reset_Sigma)
+      self.Us.data[rIdx, :] = self.Us.data[rIdx, :] + Z
     return resets
 
   def _reset_obj_criterion(self):
@@ -419,19 +435,12 @@ class KSubspaceBaseModel(nn.Module):
     temp = self.temp_scheduler.step(ridx)
 
     value, min_assign_obj = self._eval_value()
-    sample_prob = (value.unsqueeze(0) /
+    sample_prob = (value.unsqueeze(0).clamp(min=0) /
         value[ridx, :].view(self.k, 1, 1).clamp(min=EPS))
     sample_prob[:, ridx, :] = 0.0
     rep_obj = (min_assign_obj[:, ridx].mean() +
         self._batch_reg_out[ridx, :].sum()).item()
-
     best_obj = old_obj = rep_obj
-    # first dim: (current, best)
-    rep_Us = torch.zeros(2, self.k, self.D, self.d, device=device).copy_(
-        self.Us.data[[ridx], :])
-    if self.affine:
-      rep_bs = torch.zeros(2, self.k, self.D, device=device).copy_(
-          self.bs.data[[ridx], :])
 
     # first dim: (tmp, current, best)
     rep_assign_obj = torch.zeros(3, self.reset_cache_size, self.k,
@@ -455,27 +464,20 @@ class KSubspaceBaseModel(nn.Module):
 
       if success:
         # update current bases and assign obj
-        # NOTE: could avoid updating bases on every iteration
-        rep_Us[0, cidx, :] = self.Us.data[cand_ridx, cand_cidx, :]
-        if self.affine:
-          rep_bs[0, cidx, :] = self.bs.data[cand_ridx, cand_cidx, :]
         rep_assign_obj[1, :, cidx] = rep_assign_obj[0, :, cidx]
         rep_reg_out[1, cidx] = rep_reg_out[0, cidx]
 
         # update sample prob and replicate obj
         rep_value, rep_min_assign_obj = self._eval_value(
             assign_obj=rep_assign_obj[1, :], reg_out=rep_reg_out[1, :])
-        sample_prob.copy_(value.unsqueeze(0)).div_(
+        sample_prob.copy_(value.unsqueeze(0).clamp(min=0)).div_(
             rep_value.view(self.k, 1, 1).clamp(min=EPS))
         sample_prob[:, ridx, :] = 0.0
         rep_obj = (rep_min_assign_obj.mean() + rep_reg_out[1, :].sum()).item()
 
-        # updae best bases and assign obj
+        # update best assign obj
         if rep_obj < best_obj:
           best_obj = rep_obj
-          rep_Us[1, :] = rep_Us[0, :]
-          if self.affine:
-            rep_bs[1, :] = rep_bs[0, :]
           rep_assign_obj[2, :] = rep_assign_obj[1, :]
           rep_reg_out[2, :] = rep_reg_out[1, :]
       else:
@@ -491,17 +493,17 @@ class KSubspaceBaseModel(nn.Module):
 
     # final updates if objective sufficiently improved
     if (old_obj - best_obj) / old_obj >= self.reset_accept_tol:
-      if self.reset_sigma > 0:
-        Unorm = rep_Us[1, :].pow(2).sum(dim=(1, 2), keepdim=True).sqrt()
-        # scale of perturbation is relative to each basis' norm
-        reset_Sigma = Unorm.mul_(
-            self.reset_sigma / np.sqrt(self.D*self.d))
-        Z = torch.randn_like(rep_Us[1, :]).mul_(reset_Sigma)
-        rep_Us[1, :] = rep_Us[1, :] + Z
+      bestitr = np.argmax(resets[:, 6])
+      resets[bestitr+1:, 4] = 0
 
-      self.Us.data[ridx, :] = rep_Us[1, :]
+      reset_ids = resets[resets[:, 4] == 1, 1:4].astype(np.int64)
+      uniqIdx = ut.unique_resets(reset_ids[:, 0])
+      reset_ids = reset_ids[uniqIdx, :]
+      cIdx, cand_rIdx, cand_cIdx = [reset_ids[:, ii] for ii in range(3)]
+      self.Us.data[ridx, cIdx, :] = self.Us.data[cand_rIdx, cand_cIdx, :]
       if self.affine:
-        self.bs.data[ridx, :] = rep_bs[1, :]
+        self.bs.data[ridx, cIdx, :] = self.bs.data[cand_rIdx, cand_cIdx, :]
+
       self.cache_assign_obj[:, ridx, :] = rep_assign_obj[2, :]
       self._batch_reg_out[ridx, :] = rep_reg_out[2, :]
 
@@ -510,12 +512,8 @@ class KSubspaceBaseModel(nn.Module):
       self.obj[ridx] = self.best_obj[ridx] = np.nan
       self.num_bad_steps[1, ridx] = 0
       self.cooldown_counter[ridx] = self.reset_patience // 2
-
-      # truncate resets
-      bestitr = np.argmax(resets[:, 6])
-      resets = resets[:bestitr+1, :]
     else:
-      resets = np.zeros((0, RESET_NCOL), dtype=object)
+      resets[:, 4] = 0
     return resets
 
   def _eval_value(self, assign_obj=None, reg_out=None):
