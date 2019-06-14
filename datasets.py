@@ -128,7 +128,7 @@ class SynthUoSOnlineDataset(SynthUoSDataset):
   """Synthetic union of subspaces dataset with fresh samples."""
   def __init__(self, n, d, D, N, affine=False, sigma=0., theta=None,
         normalize=False, seed=None):
-    super().__init__(n, d, D, 10, affine, sigma, theta, seed)
+    super().__init__(n, d, D, 10, affine, sigma, theta, normalize, seed)
     self.Us = torch.tensor(self.Us, dtype=torch.float32)
     self.N = N
 
