@@ -2,4 +2,6 @@
 __pycache__
 datasets
 test_results
+test_notebooks
+.DS_Store
 .snips
