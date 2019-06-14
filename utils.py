@@ -13,8 +13,6 @@ import torch
 import torch.nn.functional as F
 import pandas as pd
 
-import ipdb
-
 EPS = 1e-8
 
 
@@ -325,6 +323,40 @@ def batch_svd(X, out=None):
   return U, s, V
 
 
+def batch_ridge(B, A, lamb=0.0):
+  """Solve regularized least-squares problem
+
+      min_X 1/2 || A X - B ||_F^2 + \lambda/2 || X ||_F^2
+
+  by explicitly solving normal equations
+
+      (A^T A + \lambda I) X = A^T B
+
+  Args:
+    B: shape (*, m, n)
+    A: shape (*, m, p)
+
+  Returns:
+    X: shape (*, p, n)
+  """
+  dim = B.dim()
+  m, n = B.shape[dim-2:]
+  p = A.shape[dim-1]
+  assert(A.dim() == dim)
+  assert(A.shape[dim-2] == m)
+
+  At = A.transpose(dim-2, dim-1)
+  AtA = torch.matmul(At, A)
+  AtB = torch.matmul(At, B)
+
+  if lamb > 0:
+    lambeye = torch.eye(p, dtype=A.dtype, device=A.device).mul_(lamb)
+    AtA = AtA.add_(lambeye)
+
+  X, _ = torch.gesv(AtB, AtA)
+  return X
+
+
 def reg_pca(X, d, form='proj', lamb=0.0, gamma=0.0, affine=False,
       solver='randomized'):
   """Solve one of the regularized PCA problems
@@ -457,7 +489,6 @@ def unique_resets(reset_cids):
 
 def aggregate_resets(resets):
   """Aggregate resets for each epoch and replicate."""
-  ipdb.set_trace()
   columns = ['epoch', 'itr', 'ridx', 'cidx', 'cand.ridx', 'cand.cidx',
       'success', 'obj.decr', 'cumu.obj.decr', 'temp']
   dtypes = 7*[int] + 3*[float]

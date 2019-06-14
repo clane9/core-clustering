@@ -20,7 +20,7 @@ class KSubspaceBaseModel(nn.Module):
   def __init__(self, k, d, D, affine=False, replicates=5, reg_params={},
         serial_eval={}, reset_patience=100, reset_try_tol=0.01,
         reset_max_steps=50, reset_accept_tol=1e-3, reset_sigma=0.0,
-        reset_cache_size=None, temp_scheduler=None):
+        reset_cache_size=500, temp_scheduler=None):
 
     if replicates < 1:
       raise ValueError("Invalid replicates parameter {}".format(replicates))
@@ -58,8 +58,6 @@ class KSubspaceBaseModel(nn.Module):
     self.reset_max_steps = reset_max_steps
     self.reset_accept_tol = reset_accept_tol
     self.reset_sigma = reset_sigma
-    if reset_cache_size is None or reset_cache_size <= 0:
-      reset_cache_size = 100 * int(np.ceil(2*d*k*np.log(k) / 100))
     self.reset_cache_size = reset_cache_size
     if temp_scheduler is None:
       temp_scheduler = GeoTempScheduler(init_temp=0.1, replicates=self.r,
@@ -120,7 +118,7 @@ class KSubspaceBaseModel(nn.Module):
     """
     z = self.encode(x, ii, jj)
     x_ = self.decode(z, ii, jj)
-    self._update_forward_cache(ii, jj, (z,))
+    self._update_forward_cache(ii, jj, z)
     return x_
 
   def decode(self, z, ii=None, jj=None):
@@ -176,9 +174,8 @@ class KSubspaceBaseModel(nn.Module):
       ii, jj = slice(None), slice(None)
     return ii, jj
 
-  def _update_forward_cache(self, ii, jj, cache_vals):
+  def _update_forward_cache(self, ii, jj, z):
     """Update any cached values from forward call."""
-    z = cache_vals[0]
     batch_size = z.shape[2]
     device = z.device
 
@@ -267,19 +264,8 @@ class KSubspaceBaseModel(nn.Module):
     Inputs:
       assign_obj: shape (batch_size, r, k)
     """
-    if self.c is None or self.c.shape[0] != assign_obj.shape[0]:
-      self.c = torch.zeros_like(assign_obj.data)
-    else:
-      self.c.zero_()
-
-    top2obj, top2idx = torch.topk(assign_obj, 2, dim=2,
-        largest=False, sorted=True)
-    self.groups = top2idx[:, :, 0]
-    self.c.scatter_(2, self.groups.unsqueeze(2), 1)
-
-    self._batch_c_mean = torch.mean(self.c, dim=0)
-    self._batch_value = torch.mean(self.c *
-        (top2obj[:, :, [1]] - top2obj[:, :, [0]]), dim=0)
+    (self.groups, _, self.c, self._batch_c_mean,
+        self._batch_value) = self._assign_and_value(assign_obj)
 
     nan_mask = torch.isnan(self.c_mean)
     if nan_mask.sum() > 0:
@@ -292,6 +278,32 @@ class KSubspaceBaseModel(nn.Module):
     self.groups = self.groups.cpu()
     self._update_assign_obj_cache(assign_obj)
     return
+
+  def _assign_and_value(self, assign_obj):
+    """Compute assignments and cluster size & values."""
+    batch_size, tmpr = assign_obj.shape[:2]
+    device = assign_obj.device
+
+    if self.k > 1:
+      top2obj, top2idx = torch.topk(assign_obj, 2, dim=2, largest=False,
+          sorted=True)
+      groups = top2idx[:, :, 0]
+      min_assign_obj = top2obj[:, :, 0]
+    else:
+      groups = torch.zeros(batch_size, tmpr, device=device, dtype=torch.int64)
+      min_assign_obj = assign_obj.squeeze(2)
+
+    c = torch.zeros_like(assign_obj)
+    c.scatter_(2, groups.unsqueeze(2), 1)
+    c_mean = c.mean(dim=0)
+
+    if self.k > 1:
+      value = torch.zeros_like(assign_obj)
+      value = value.scatter_(2, groups.unsqueeze(2),
+          (top2obj[:, :, [1]] - top2obj[:, :, [0]])).mean(dim=0)
+    else:
+      value = torch.ones(tmpr, self.k, device=device)
+    return groups, min_assign_obj, c, c_mean, value
 
   def _update_assign_obj_cache(self, assign_obj):
     """Add batch assign obj to a recent cache. Used when resetting unused
@@ -528,15 +540,9 @@ class KSubspaceBaseModel(nn.Module):
       assign_obj = assign_obj.unsqueeze(1)
       reg_out = reg_out.unsqueeze(0)
 
-    top2obj, top2idx = torch.topk(assign_obj, 2, dim=2, largest=False,
-        sorted=True)
-    groups = top2idx[:, :, [0]]
-    value = torch.zeros_like(assign_obj)
-    value = value.scatter_(2, groups,
-        (top2obj[:, :, [1]] - top2obj[:, :, [0]])).mean(dim=0)
+    _, min_assign_obj, _, _, value = self._assign_and_value(assign_obj)
     value.sub_(reg_out)
-    min_assign_obj = top2obj[:, :, 0]
-    return value.squeeze(), min_assign_obj.squeeze()
+    return value.squeeze(0), min_assign_obj.squeeze(1)
 
   def zero(self):
     """Zero out near zero bases.
@@ -561,7 +567,7 @@ class KSubspaceMFModel(KSubspaceBaseModel):
   def __init__(self, k, d, D, affine=False, replicates=5, reg_params={},
         serial_eval={}, reset_patience=100, reset_try_tol=0.01,
         reset_max_steps=50, reset_accept_tol=1e-3, reset_sigma=0.0,
-        reset_cache_size=None, temp_scheduler=None, scale_grad_freq=100,
+        reset_cache_size=500, temp_scheduler=None, scale_grad_freq=100,
         init='random', initX=None, initk=None):
 
     if init.lower() not in {'random', 'pfi', 'pca'}:
@@ -738,30 +744,19 @@ class KSubspaceMFModel(KSubspaceBaseModel):
     Returns:
       z: latent low-dimensional codes (r, k, batch_size, d)
     """
+    # Us shape (r, k, D, d)
+    # bs shape (r, k, D)
     Us, bs = self._slice_Us_bs(ii, jj, no_grad=True)
     batch_size = x.size(0)
 
-    # shape (r, k, d, D)
-    Uts = Us.transpose(2, 3)
-    # (r, k, d, d)
-    A = torch.matmul(Uts, Us)
-    if self.reg_params['z'] > 0:
-      # (d, d)
-      lambeye = torch.eye(self.d,
-          dtype=A.dtype, device=A.device).mul_(self.reg_params['z'])
-      # (r, k, d, d)
-      A.add_(lambeye)
-
     # (1, 1, D, batch_size)
-    B = x.data.t().view(1, 1, self.D, batch_size)
+    x = x.data.t().view(1, 1, self.D, batch_size)
     if self.affine:
-      # bs shape (r, k, D)
-      B = B.sub(bs.unsqueeze(3))
+      # (r, k, D, batch_size)
+      x = x.sub(bs.unsqueeze(3))
     # (r, k, d, batch_size)
-    B = torch.matmul(Uts, B)
+    z = ut.batch_ridge(x, Us, lamb=self.reg_params['z'])
 
-    # (r, k, d, batch_size)
-    z, _ = torch.gesv(B, A)
     # (r, k, batch_size, d)
     z = z.transpose(2, 3)
     return z
@@ -830,7 +825,7 @@ class KSubspaceProjModel(KSubspaceBaseModel):
   def __init__(self, k, d, D, affine=False, replicates=5, reg_params={},
         serial_eval={}, reset_patience=100, reset_try_tol=0.01,
         reset_max_steps=50, reset_accept_tol=1e-3, reset_sigma=0.0,
-        reset_cache_size=None, temp_scheduler=None):
+        reset_cache_size=500, temp_scheduler=None):
 
     super().__init__(k, d, D,
         affine=affine, replicates=replicates, reg_params=reg_params,
@@ -891,7 +886,7 @@ class KSubspaceBatchAltBaseModel(KSubspaceBaseModel):
   def __init__(self, k, d, dataset, affine=False, replicates=5, reg_params={},
         serial_eval={}, reset_patience=2, reset_try_tol=0.01,
         reset_max_steps=50, reset_accept_tol=1e-3, reset_sigma=0.0,
-        reset_cache_size=None, temp_scheduler=None, svd_solver='randomized',
+        reset_cache_size=500, temp_scheduler=None, svd_solver='randomized',
         **kwargs):
 
     if svd_solver not in ('randomized', 'svds', 'svd'):
@@ -940,14 +935,10 @@ class KSubspaceBatchAltBaseModel(KSubspaceBaseModel):
       assign_obj: shape (N, r, k)
     """
     groups_prev = self.groups
-    top2obj, top2idx = torch.topk(assign_obj, 2, dim=2,
-        largest=False, sorted=True)
-    self.groups = top2idx[:, :, 0]
-    self.c.zero_().scatter_(2, self.groups.unsqueeze(2), 1)
-
-    self.c_mean = self._batch_c_mean = self.c.mean(dim=0)
-    self.value = self._batch_value = torch.mean(self.c *
-        (top2obj[:, :, [1]] - top2obj[:, :, [0]]), dim=0)
+    (self.groups, _, self.c, self._batch_c_mean,
+        self._batch_value) = self._assign_and_value(assign_obj)
+    self.c_mean = self._batch_c_mean
+    self.value = self._batch_value
 
     self.groups = self.groups.cpu()
     self._updates = ((self.groups != groups_prev).sum()
@@ -978,7 +969,7 @@ class KSubspaceBatchAltProjModel(KSubspaceBatchAltBaseModel,
   def __init__(self, k, d, dataset, affine=False, replicates=5, reg_params={},
         serial_eval={}, reset_patience=2, reset_try_tol=0.01,
         reset_max_steps=50, reset_accept_tol=1e-3, reset_sigma=0.0,
-        reset_cache_size=None, temp_scheduler=None, svd_solver='randomized'):
+        reset_cache_size=500, temp_scheduler=None, svd_solver='randomized'):
 
     super().__init__(k, d, dataset,
         affine=affine, replicates=replicates, reg_params=reg_params,
@@ -1018,7 +1009,7 @@ class KSubspaceBatchAltMFModel(KSubspaceBatchAltBaseModel, KSubspaceMFModel):
   def __init__(self, k, d, dataset, affine=False, replicates=5, reg_params={},
         serial_eval={}, reset_patience=2, reset_try_tol=0.01,
         reset_max_steps=50, reset_accept_tol=1e-3, reset_sigma=0.0,
-        reset_cache_size=None, temp_scheduler=None, init='random', initX=None,
+        reset_cache_size=500, temp_scheduler=None, init='random', initX=None,
         initk=None, svd_solver='randomized'):
 
     mf_kwargs = {'scale_grad_freq': None, 'init': init, 'initX': initX,
@@ -1110,7 +1101,7 @@ class KMeansBatchAltModel(KSubspaceBatchAltBaseModel):
   def __init__(self, k, dataset, init='random', replicates=5, reg_params={},
         serial_eval={}, reset_patience=2, reset_try_tol=0.01,
         reset_max_steps=50, reset_accept_tol=1e-3, reset_sigma=0.0,
-        reset_cache_size=None, temp_scheduler=None, kpp_n_trials=None):
+        reset_cache_size=500, temp_scheduler=None, kpp_n_trials=None):
 
     if init not in {'k-means++', 'random'}:
       raise ValueError("Invalid init parameter {}".format(init))
@@ -1258,6 +1249,181 @@ class KMeansBatchAltModel(KSubspaceBatchAltBaseModel):
     return
 
 
+class KSubspaceMCModel(KSubspaceMFModel):
+  """K-subspace model where low-dim coefficients are computed in closed
+  form. Adapted to handle missing data."""
+  default_reg_params = {
+      'U_frosqr_in': 0.01,
+      'U_frosqr_out': 1e-4,
+      'z': 0.01,
+      'e': 1.0  # not meaningful in this case
+  }
+  assign_reg_terms = {'U_frosqr_in', 'z', 'e'}
+
+  def __init__(self, k, d, D, affine=False, replicates=5, reg_params={},
+        serial_eval={}, reset_patience=100, reset_try_tol=0.01,
+        reset_max_steps=50, reset_accept_tol=1e-3, reset_sigma=0.0,
+        reset_cache_size=500, temp_scheduler=None, scale_grad_freq=100):
+
+    super().__init__(k, d, D,
+        affine=affine, replicates=replicates, reg_params=reg_params,
+        serial_eval=serial_eval, reset_patience=reset_patience,
+        reset_try_tol=reset_try_tol, reset_max_steps=reset_max_steps,
+        reset_accept_tol=reset_accept_tol, reset_sigma=reset_sigma,
+        reset_cache_size=reset_cache_size, temp_scheduler=temp_scheduler,
+        scale_grad_freq=scale_grad_freq)
+
+    self.omega = None
+    self.cache_z = True
+
+    # denoised x
+    self.cache_x0_ = True
+    self.x0_ = None
+    return
+
+  def forward(self, x, ii=None, jj=None):
+    """Compute representation of x wrt each subspace.
+
+    Input:
+      x: data, shape (batch_size, D)
+      ii, jj: rep, cluster indices. Either int index or None.
+
+    Returns:
+      x_: reconstruction, shape (r, k, batch_size, D)
+    """
+    z = self.encode(x, ii, jj)
+    x0_ = self.decode(z, ii, jj)
+    x_ = x0_ * self.omega.float()
+    self._update_forward_cache(ii, jj, z, x0_.data)
+    return x_
+
+  def encode(self, x, ii=None, jj=None):
+    """Compute subspace coefficients for x in closed form, accounting for
+    missing entries.
+
+    Input:
+      x: shape (batch_size, D)
+      ii, jj: rep, cluster indices. Either int index or None.
+
+    Returns:
+      z: latent low-dimensional codes (r, k, batch_size, d)
+    """
+    # Us shape (r, k, D, d)
+    # bs shape (r, k, D)
+    Us, bs = self._slice_Us_bs(ii, jj, no_grad=True)
+    batch_size = x.size(0)
+
+    z = torch.zeros(self.r, self.k, batch_size, self.d,
+        dtype=Us.dtype, device=Us.device)
+
+    # (1, 1, D, batch_size)
+    x = x.data.t().view(1, 1, self.D, batch_size)
+    if self.affine:
+      # (r, k, D, batch_size)
+      x = x.sub(bs.unsqueeze(3))
+
+    for kk in range(batch_size):
+      omegak = self.omega[kk, :]
+      z[:, :, kk, :] = ut.batch_ridge(x[:, :, omegak, kk:kk+1],
+          Us[:, :, omegak, :], lamb=self.reg_params['z']).squeeze(3)
+    return z
+
+  def _update_forward_cache(self, ii, jj, z, x0_):
+    """Update any cached values from forward call."""
+    batch_size = z.shape[2]
+    device = z.device
+    ii, jj = self._parse_slice(ii, jj)
+
+    if self.z_frosqr is None or self.z_frosqr.shape[2] != batch_size:
+      self.z_frosqr = torch.zeros(self.r, self.k, batch_size, device=device)
+      if self.cache_z:
+        self.z = torch.zeros(self.r, self.k, batch_size, self.d, device=device)
+
+    self.z_frosqr[ii, jj, :] = z.data.pow(2).sum(dim=-1)
+    if self.cache_z:
+      self.z[ii, jj, :] = z
+
+    if self.cache_x0_:
+      if self.x0_ is None or self.x0_.shape[2] != batch_size:
+        self.x0_ = torch.zeros(self.r, self.k, batch_size, self.D,
+            device=device)
+      self.x0_[ii, jj, :] = x0_
+    return
+
+  def objective(self, x_miss):
+    """Evaluate objective function.
+
+    Input:
+      x_miss: data with missing elements coded as nan, shape (batch_size, D).
+
+    Returns:
+      obj_mean: average objective across replicates
+      obj, loss, reg_in, reg_out: metrics per replicate, shape (r,)
+      x_: reconstruction, shape (r, k, batch_size, D)
+    """
+    x = self.parse_x_miss(x_miss)
+    return super().objective(x)
+
+  def eval_shrink(self, x_miss, x_):
+    """measure shrinkage of reconstruction wrt data.
+
+    Inputs:
+      x_miss: data with missing elements coded as nan, shape (batch_size, D).
+      x_: reconstruction, shape (r, k, batch_size, D)
+
+    Returns:
+      norm_x_: average norm of x_ relative to x, shape (r,)
+    """
+    x = self.parse_x_miss(x_miss, update_omega=False)
+    return super().eval_shrink(x, x_)
+
+  def parse_x_miss(self, x_miss, update_omega=True):
+    """Parse x with missing data coded as nan
+
+    Input:
+      x_miss: data with missing elements coded as nan, shape (batch_size, D).
+      update_omega: whether to update omega attribute (default: True).
+
+    Updates:
+      omega: updated with current mask in place.
+
+    Returns:
+      x: masked data x, shape (batch_size, D).
+    """
+    omegac = torch.isnan(x_miss)
+    x = x_miss.clone()
+    x[omegac] = 0.0
+    if update_omega:
+      self.omega = (omegac == 0)
+    return x
+
+  def eval_comp_error(self, x0):
+    """Evaluate completion error over observed entries in x0.
+
+    Input:
+      x0: data with missing elements coded as nan, shape (batch_size, D).
+
+    Returns:
+      comp_err: rmse relative to mean squared magnitude of x0.
+    """
+    omegac = torch.isnan(x0)
+    if not self.cache_x0_ or torch.all(omegac):
+      return torch.zeros(self.r, dtype=x0.dtype, device=x0.device)
+
+    omega = omegac == 0
+    x0 = x0[omega]
+
+    # x0_ shape (r, k, batch_size, D)
+    # c shape (batch_size, r, k)
+    # (r, batch_size, D)
+    x0_ = (self.x0_ * self.c.permute(1, 2, 0).unsqueeze(3)).sum(dim=1)
+    x0_ = x0_[:, omega]
+
+    # (r, )
+    comp_err = ((x0_ - x0).pow(2).mean(dim=1) / x0.pow(2).mean()).sqrt()
+    return comp_err
+
+
 class KSubspaceMFCorruptModel(KSubspaceMFModel):
   """K-subspace model where low-dim coefficients are computed in closed
   form. Adapted to handle corrupted data."""
@@ -1272,7 +1438,7 @@ class KSubspaceMFCorruptModel(KSubspaceMFModel):
   def __init__(self, k, d, D, affine=False, replicates=5, reg_params={},
         serial_eval={}, reset_patience=100, reset_try_tol=0.01,
         reset_max_steps=50, reset_accept_tol=1e-3, reset_sigma=0.0,
-        reset_cache_size=None, temp_scheduler=None, scale_grad_freq=100,
+        reset_cache_size=500, temp_scheduler=None, scale_grad_freq=100,
         encode_max_iter=20, encode_tol=1e-3):
 
     if encode_max_iter <= 0:
@@ -1301,6 +1467,9 @@ class KSubspaceMFCorruptModel(KSubspaceMFModel):
     # denoised x
     self.cache_x0_ = True
     self.x0_ = None
+    # corruption
+    self.cache_e = False
+    self.e = None
     return
 
   def forward(self, x, ii=None, jj=None):
@@ -1352,14 +1521,14 @@ class KSubspaceMFCorruptModel(KSubspaceMFModel):
             (1-EMA_DECAY)*update)
 
     # one more time for tracking gradients.
-    z = self._least_squares(x - e, Us_P, Us_s, Us_Q)
+    # z = self._least_squares(x - e, Us_P, Us_s, Us_Q)
     x_ = torch.matmul(z, Us.transpose(2, 3))
     if self.affine:
       x_ = x_.add(bs.unsqueeze(2))
     x0_ = x_.data.clone()
     x_ = x_.add(e)
 
-    self._update_forward_cache(ii, jj, (z, e, x0_))
+    self._update_forward_cache(ii, jj, z, e, x0_)
     return x_
 
   def encode(self, x, ii=None, jj=None):
@@ -1400,20 +1569,32 @@ class KSubspaceMFCorruptModel(KSubspaceMFModel):
     """Compute proximal operator of e regularizer wrt w."""
     return torch.zeros((), dtype=w.dtype, device=w.device)
 
-  def _update_forward_cache(self, ii, jj, cache_vals):
+  def _update_forward_cache(self, ii, jj, z, e, x0_):
     """Update any cached values from forward call."""
-    z, _, x0_ = cache_vals
     batch_size = z.shape[2]
     device = z.device
-
-    super()._update_forward_cache(ii, jj, (z,))
-
     ii, jj = self._parse_slice(ii, jj)
+
+    if self.z_frosqr is None or self.z_frosqr.shape[2] != batch_size:
+      self.z_frosqr = torch.zeros(self.r, self.k, batch_size, device=device)
+      if self.cache_z:
+        self.z = torch.zeros(self.r, self.k, batch_size, self.d, device=device)
+
+    self.z_frosqr[ii, jj, :] = z.data.pow(2).sum(dim=-1)
+    if self.cache_z:
+      self.z[ii, jj, :] = z
+
     if self.cache_x0_:
       if self.x0_ is None or self.x0_.shape[2] != batch_size:
         self.x0_ = torch.zeros(self.r, self.k, batch_size, self.D,
             device=device)
       self.x0_[ii, jj, :] = x0_
+
+    if self.cache_e:
+      if self.e is None or self.e.shape[2] != batch_size:
+        self.e = torch.zeros(self.r, self.k, batch_size, self.D,
+            device=device)
+      self.e[ii, jj, :] = e
     return
 
   def reg(self):
@@ -1429,7 +1610,7 @@ class KSubspaceMFCorruptModel(KSubspaceMFModel):
     return 0.0
 
 
-class KSubspaceMCModel(KSubspaceMFCorruptModel):
+class KSubspaceMCCorruptModel(KSubspaceMFCorruptModel, KSubspaceMCModel):
   """K-subspace model where low-dim coefficients are computed in closed
   form. Adapted to handle missing data."""
   default_reg_params = {
@@ -1443,7 +1624,7 @@ class KSubspaceMCModel(KSubspaceMFCorruptModel):
   def __init__(self, k, d, D, affine=False, replicates=5, reg_params={},
         serial_eval={}, reset_patience=100, reset_try_tol=0.01,
         reset_max_steps=50, reset_accept_tol=1e-3, reset_sigma=0.0,
-        reset_cache_size=None, temp_scheduler=None, encode_max_iter=20,
+        reset_cache_size=500, temp_scheduler=None, encode_max_iter=20,
         encode_tol=1e-3, scale_grad_freq=100):
 
     super().__init__(k, d, D,
@@ -1454,56 +1635,7 @@ class KSubspaceMCModel(KSubspaceMFCorruptModel):
         reset_cache_size=reset_cache_size, temp_scheduler=temp_scheduler,
         encode_max_iter=encode_max_iter, encode_tol=encode_tol,
         scale_grad_freq=scale_grad_freq)
-
-    self.omega = None
     return
-
-  def objective(self, x_miss):
-    """Evaluate objective function.
-
-    Input:
-      x_miss: data with missing elements coded as nan, shape (batch_size, D).
-
-    Returns:
-      obj_mean: average objective across replicates
-      obj, loss, reg_in, reg_out: metrics per replicate, shape (r,)
-      x_: reconstruction, shape (r, k, batch_size, D)
-    """
-    x = self.parse_x_miss(x_miss)
-    return super().objective(x)
-
-  def eval_shrink(self, x_miss, x_):
-    """measure shrinkage of reconstruction wrt data.
-
-    Inputs:
-      x_miss: data with missing elements coded as nan, shape (batch_size, D).
-      x_: reconstruction, shape (r, k, batch_size, D)
-
-    Returns:
-      norm_x_: average norm of x_ relative to x, shape (r,)
-    """
-    x = self.parse_x_miss(x_miss, update_omega=False)
-    return super().eval_shrink(x, x_)
-
-  def parse_x_miss(self, x_miss, update_omega=True):
-    """Parse x with missing data coded as nan
-
-    Input:
-      x_miss: data with missing elements coded as nan, shape (batch_size, D).
-      update_omega: whether to update omega attribute (default: True).
-
-    Updates:
-      omega: updated with current mask in place.
-
-    Returns:
-      x: masked data x, shape (batch_size, D).
-    """
-    omegac = torch.isnan(x_miss)
-    x = x_miss.clone()
-    x[omegac] = 0.0
-    if update_omega:
-      self.omega = (omegac == 0)
-    return x
 
   def _prox_e(self, w):
     """Compute projection onto *unobserved* entries. Note, operates on w in
@@ -1511,32 +1643,6 @@ class KSubspaceMCModel(KSubspaceMFCorruptModel):
     # w shape (r, k, batch_size, D)
     w[:, :, self.omega] = 0.0
     return w
-
-  def eval_comp_error(self, x0):
-    """Evaluate completion error over observed entries in x0.
-
-    Input:
-      x0: data with missing elements coded as nan, shape (batch_size, D).
-
-    Returns:
-      recovery: relative squared error, averaged over batch.
-    """
-    omegac = torch.isnan(x0)
-    x0 = x0.clone()
-    x0[omegac] = 0.0
-
-    # x0_ shape (r, k, batch_size, D)
-    # c shape (batch_size, r, k)
-    # (r, batch_size, D)
-    # NOTE: could save factor of k by indexing instead but too lazy right now
-    x0_ = (self.x0_ * self.c.permute(1, 2, 0).unsqueeze(3)).sum(dim=1)
-    x0_[omegac] = 0.0
-
-    # (r, batch_size)
-    recovery = (x0_ - x0).pow(2).sum(dim=2).div(x0.pow(2).sum(dim=1))
-    # (r,)
-    recovery = recovery.mean(dim=1)
-    return recovery
 
 
 class KSubspaceMFOutlierModel(KSubspaceMFCorruptModel):
@@ -1553,7 +1659,7 @@ class KSubspaceMFOutlierModel(KSubspaceMFCorruptModel):
   def __init__(self, k, d, D, affine=False, replicates=5, reg_params={},
         serial_eval={}, reset_patience=100, reset_try_tol=0.01,
         reset_max_steps=50, reset_accept_tol=1e-3, reset_sigma=0.0,
-        reset_cache_size=None, temp_scheduler=None,
+        reset_cache_size=500, temp_scheduler=None,
         encode_max_iter=20, encode_tol=1e-3, scale_grad_freq=100):
 
     super().__init__(k, d, D,
@@ -1564,6 +1670,8 @@ class KSubspaceMFOutlierModel(KSubspaceMFCorruptModel):
         reset_cache_size=reset_cache_size, temp_scheduler=temp_scheduler,
         encode_max_iter=encode_max_iter, encode_tol=encode_tol,
         scale_grad_freq=scale_grad_freq)
+
+    self.cache_e = True
     return
 
   def _prox_e(self, w):
@@ -1576,14 +1684,7 @@ class KSubspaceMFOutlierModel(KSubspaceMFCorruptModel):
 
   def reg_e(self):
     """Compute regularizer wrt e."""
-    return self.enorm
-
-  def _update_forward_cache(self, ii, jj, cache_vals):
-    """Update any cached values from forward call."""
-    super()._update_forward_cache(ii, jj, cache_vals)
-    _, e, _ = cache_vals
-    self.enorm = torch.norm(e, dim=3).permute(2, 0, 1)
-    return
+    return torch.norm(self.e, dim=3).permute(2, 0, 1)
 
 
 class TempScheduler(object):

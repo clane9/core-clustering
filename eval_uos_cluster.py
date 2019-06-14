@@ -243,9 +243,8 @@ if __name__ == '__main__':
   parser.add_argument('--reset-sigma', type=float, default=0.0,
                       help=('Scale of perturbation to add after reset '
                       '[default: 0.0]'))
-  parser.add_argument('--reset-cache-size', type=int, default=None,
-                      help=('Num samples for reset assign obj '
-                      '[default: 4 k log k]'))
+  parser.add_argument('--reset-cache-size', type=int, default=500,
+                      help='Num samples for reset assign obj [default: 500]')
   parser.add_argument('--serial-eval', type=str, default=None,
                       help=('Serial evaluation mode, one of '
                       '(none, r, k, r,k) [default: None]'))

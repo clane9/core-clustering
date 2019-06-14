@@ -9,7 +9,7 @@ import torch
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 
 import utils as ut
-from models import KSubspaceBatchAltBaseModel
+from models import KSubspaceBatchAltBaseModel, KSubspaceMCModel
 
 EPS = 1e-8
 # ridx,  cidx, cand_ridx, cand_cidx, success, obj_decr, cumu_obj_decr, temp
@@ -41,6 +41,9 @@ def train_loop(model, data_loader, device, optimizer, out_dir=None, epochs=200,
       'err={:.3f},{:.3f},{:.3f} obj={:.2e},{:.2e},{:.2e} '
       'loss={:.1e},{:.1e},{:.1e} reg.in={:.1e},{:.1e},{:.1e} '
       'reg.out={:.1e},{:.1e},{:.1e} ')
+  mc_mode = isinstance(model, KSubspaceMCModel)
+  if mc_mode:
+    printformstr += 'comp.err={:.2f},{:.2f},{:.2f} '
   if eval_rank:
     printformstr += 'rank={:.0f},{:.0f},{:.0f} '
   printformstr += 'resets={:d} samp/s={:.0f} rtime={:.2f}'
@@ -49,6 +52,8 @@ def train_loop(model, data_loader, device, optimizer, out_dir=None, epochs=200,
     logheader = ('Epoch,LR,' + ','.join(['{}.{}'.format(met, meas)
         for met in ['Err', 'Obj', 'Loss', 'Reg.in', 'Reg.out']
         for meas in ['min', 'med', 'max']]) + ',')
+    if mc_mode:
+      logheader += 'Comp.err.min,Comp.err.med,Comp.err.max,'
     if eval_rank:
       logheader += 'Rank.min,Rank.med,Rank.max,'
     logheader += 'Resets,Samp.s,RT'
@@ -56,6 +61,8 @@ def train_loop(model, data_loader, device, optimizer, out_dir=None, epochs=200,
     logformstr = ('{:d},{:.9e},{:.9f},{:.9f},{:.9f},'
         '{:.9e},{:.9e},{:.9e},{:.9e},{:.9e},{:.9e},'
         '{:.9e},{:.9e},{:.9e},{:.9e},{:.9e},{:.9e},')
+    if mc_mode:
+      logformstr += '{:.9f},{:.9f},{:.9f},'
     if eval_rank:
       logformstr += '{:.0f},{:.9f},{:.0f},'
     logformstr += '{:d},{:.0f},{:.9f}'
@@ -68,8 +75,9 @@ def train_loop(model, data_loader, device, optimizer, out_dir=None, epochs=200,
 
   batch_alt_mode = isinstance(model, KSubspaceBatchAltBaseModel)
 
-  # dim 1: err, obj, loss, reg.in, reg.out, resets
-  metrics = np.zeros((epochs, 6, model.r), dtype=np.float32)
+  # dim 1: err, obj, loss, reg.in, reg.out, (comp.err), resets
+  nmet = 7 if mc_mode else 6
+  metrics = np.zeros((epochs, nmet, model.r), dtype=np.float32)
   true_n = (model.true_classes.size if batch_alt_mode
       else data_loader.dataset.classes.size)
   conf_mats = np.zeros((epochs, model.r, model.k, true_n), dtype=np.int64)
@@ -188,10 +196,18 @@ def train_epoch(model, data_loader, optimizer, device, eval_rank=False,
   epoch_tic = time.time()
   metrics = None
   resets = []
-  conf_mats, sampsec = [ut.AverageMeter() for _ in range(2)]
+  mc_mode = isinstance(model, KSubspaceMCModel)
+  conf_mats, sampsec, comp_err = [ut.AverageMeter() for _ in range(3)]
   itr = 1
   tic = time.time()
-  for x, groups in data_loader:
+  for data_tup in data_loader:
+    if len(data_tup) == 3:
+      x, groups, x0 = data_tup
+      if x0 is not None:
+        x0 = x0.to(device)
+    else:
+      x, groups = data_tup
+      x0 = None
     x = x.to(device)
 
     # opt step
@@ -212,12 +228,19 @@ def train_epoch(model, data_loader, optimizer, device, eval_rank=False,
             model.k, true_classes=data_loader.dataset.classes))
         for ii in range(model.replicates)])
 
+    # eval batch completion if in missing data setting
+    if mc_mode and x0 is not None:
+      batch_comp_err = model.eval_comp_error(x0).cpu()
+    else:
+      batch_comp_err = torch.ones(model.r) * np.nan
+
     batch_size = x.size(0)
     if metrics is None:
       metrics = [ut.AverageMeter() for _ in range(len(batch_metrics))]
     for kk in range(len(batch_metrics)):
       metrics[kk].update(batch_metrics[kk].cpu(), batch_size)
     conf_mats.update(batch_conf_mats, 1)
+    comp_err.update(batch_comp_err, batch_size)
 
     if reset_unused:
       batch_resets = model.reset_unused()
@@ -265,13 +288,23 @@ def train_epoch(model, data_loader, optimizer, device, eval_rank=False,
     reset_count = 0
     rep_reset_counts = np.zeros((1, model.r))
 
+  if mc_mode:
+    comp_err = comp_err.avg.view(1, -1)
+    comp_err_stats = [comp_err.min().item(), comp_err.median().item(),
+        comp_err.max().item()]
+    comp_err = comp_err.numpy()
+  else:
+    comp_err_stats = []
+
   metrics = torch.stack([errors] + [met.avg for met in metrics])
   metrics_summary = torch.stack([metrics.min(dim=1)[0],
       metrics.median(dim=1)[0], metrics.max(dim=1)[0]], dim=1)
   metrics = metrics.numpy()
-  metrics = np.concatenate((metrics, rep_reset_counts))
+  metrics = ((metrics, comp_err, rep_reset_counts) if mc_mode
+      else (metrics, rep_reset_counts))
+  metrics = np.concatenate(metrics)
   metrics_summary = metrics_summary.view(-1).numpy().tolist()
-  metrics_summary = (metrics_summary + rank_stats +
+  metrics_summary = (metrics_summary + comp_err_stats + rank_stats +
       [reset_count, sampsec.avg, rtime])
   return metrics_summary, metrics, conf_mats, svs, resets
 
