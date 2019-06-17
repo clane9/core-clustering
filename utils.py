@@ -339,11 +339,8 @@ def batch_ridge(B, A, lamb=0.0):
   Returns:
     X: shape (*, p, n)
   """
-  dim = B.dim()
-  m, n = B.shape[dim-2:]
-  p = A.shape[dim-1]
-  assert(A.dim() == dim)
-  assert(A.shape[dim-2] == m)
+  dim = A.dim()
+  p = A.shape[-1]
 
   At = A.transpose(dim-2, dim-1)
   AtA = torch.matmul(At, A)

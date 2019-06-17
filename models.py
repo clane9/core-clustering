@@ -1263,7 +1263,8 @@ class KSubspaceMCModel(KSubspaceMFModel):
   def __init__(self, k, d, D, affine=False, replicates=5, reg_params={},
         serial_eval={}, reset_patience=100, reset_try_tol=0.01,
         reset_max_steps=50, reset_accept_tol=1e-3, reset_sigma=0.0,
-        reset_cache_size=500, temp_scheduler=None, scale_grad_freq=100):
+        reset_cache_size=500, temp_scheduler=None, scale_grad_freq=100,
+        sparse_encode=True):
 
     super().__init__(k, d, D,
         affine=affine, replicates=replicates, reg_params=reg_params,
@@ -1273,7 +1274,9 @@ class KSubspaceMCModel(KSubspaceMFModel):
         reset_cache_size=reset_cache_size, temp_scheduler=temp_scheduler,
         scale_grad_freq=scale_grad_freq)
 
+    self.sparse_encode = sparse_encode
     self.omega = None
+    self.maskUs = None
     self.cache_z = True
 
     # denoised x
@@ -1308,19 +1311,57 @@ class KSubspaceMCModel(KSubspaceMFModel):
     Returns:
       z: latent low-dimensional codes (r, k, batch_size, d)
     """
+    if self.sparse_encode:
+      z = self._sprs_encode(x, ii, jj)
+    else:
+      z = self._dense_encode(x, ii, jj)
+    return z
+
+  def _dense_encode(self, x, ii=None, jj=None):
+    """Encode x by vectorized (hence parallelizable)(r*k*batch_zie ) O(D)
+    least-squares problems."""
     # Us shape (r, k, D, d)
     # bs shape (r, k, D)
     Us, bs = self._slice_Us_bs(ii, jj, no_grad=True)
+    slcr, slck = Us.shape[:2]
     batch_size = x.size(0)
+    if (self.maskUs is None or self.maskUs.shape[:3] != (slcr, slck,
+          batch_size)):
+      self.maskUs = torch.zeros(slcr, slck, batch_size, self.D, self.d,
+          device=Us.device)
 
-    z = torch.zeros(self.r, self.k, batch_size, self.d,
-        dtype=Us.dtype, device=Us.device)
+    # ideally we would us sparsity to save on O(D) operations
+    self.maskUs.copy_(Us.unsqueeze(2))
+    self.maskUs.mul_(self.omega.float().view(1, 1, batch_size, self.D, 1))
+
+    if self.affine:
+      # (r, k, batch_size, D, 1)
+      x = x.sub(bs.unsqueeze(2)).unsqueeze(4)
+    else:
+      # (batch_size, D, 1)
+      x = x.unsqueeze(2)
+
+    # (r, k, batch_size, d, 1)
+    z = ut.batch_ridge(x, self.maskUs, lamb=self.reg_params['z']).squeeze(4)
+    return z
+
+  def _sprs_encode(self, x, ii=None, jj=None):
+    """Encode x in a serial for-loop of (r*k*batch_zie) O(nnz)
+    least-squares problems."""
+    # Us shape (r, k, D, d)
+    # bs shape (r, k, D)
+    Us, bs = self._slice_Us_bs(ii, jj, no_grad=True)
+    slcr, slck = Us.shape[:2]
+    batch_size = x.size(0)
 
     # (1, 1, D, batch_size)
     x = x.data.t().view(1, 1, self.D, batch_size)
     if self.affine:
       # (r, k, D, batch_size)
       x = x.sub(bs.unsqueeze(3))
+
+    z = torch.zeros(slcr, slck, batch_size, self.d, dtype=Us.dtype,
+        device=Us.device)
 
     for kk in range(batch_size):
       omegak = self.omega[kk, :]
