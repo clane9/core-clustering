@@ -44,6 +44,9 @@ def train_synth_uos_cluster(args):
     # Ng takes precedent if both given
     args.N = args.k * args.Ng
 
+  kwargs = {'num_workers': args.num_workers}
+  sparse_miss_format = True
+
   if args.online:
     if batch_alt_mode:
       raise ValueError(("Online mode not compatible with "
@@ -51,7 +54,10 @@ def train_synth_uos_cluster(args):
     if args.miss_rate > 0:
       synth_dataset = dat.SynthUoSMissOnlineDataset(args.k, args.d, args.D,
           args.N, args.affine, args.sigma, args.theta, args.miss_rate,
-          args.normalize, args.data_seed)
+          args.normalize, sparse_format=sparse_miss_format,
+          seed=args.data_seed)
+      if sparse_miss_format:
+        kwargs['collate_fn'] = dat.sparse_miss_collate
     else:
       synth_dataset = dat.SynthUoSOnlineDataset(args.k, args.d, args.D,
           args.N, args.affine, args.sigma, args.theta, args.normalize,
@@ -61,12 +67,13 @@ def train_synth_uos_cluster(args):
     if args.miss_rate > 0:
       synth_dataset = dat.SynthUoSMissDataset(args.k, args.d, args.D, args.Ng,
           args.affine, args.sigma, args.theta, args.miss_rate, args.normalize,
-          args.data_seed)
+          sparse_format=sparse_miss_format, seed=args.data_seed)
+      if sparse_miss_format:
+        kwargs['collate_fn'] = dat.sparse_miss_collate
     else:
       synth_dataset = dat.SynthUoSDataset(args.k, args.d, args.D, args.Ng,
           args.affine, args.sigma, args.theta, args.normalize, args.data_seed)
     shuffle_data = True
-  kwargs = {'num_workers': args.num_workers}
   if use_cuda:
     kwargs['pin_memory'] = True
   if batch_alt_mode:
@@ -142,8 +149,7 @@ def train_synth_uos_cluster(args):
       MCModel = (mod.KSubspaceMCModel if args.mc_exact else
           mod.KSubspaceMCCorruptModel)
       model = MCModel(args.model_k, args.model_d, args.D, affine=args.affine,
-          replicates=args.reps, reg_params=reg_params,
-          serial_eval=args.serial_eval, **reset_kwargs)
+          replicates=args.reps, reg_params=reg_params, **reset_kwargs)
     else:
       reg_params = {
           'U_frosqr_in': args.U_frosqr_in_lamb / args.z_lamb,

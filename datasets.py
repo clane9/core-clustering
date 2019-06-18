@@ -104,24 +104,48 @@ class SynthUoSDataset(Dataset):
 class SynthUoSMissDataset(SynthUoSDataset):
   """Synthetic union of subspaces dataset with missing data."""
   def __init__(self, n, d, D, Ng, affine=False, sigma=0., theta=None,
-        miss_rate=0.0, normalize=False, seed=None):
+        miss_rate=0.0, normalize=False, sparse_format=False, test_frac=0.05,
+        seed=None):
     if miss_rate >= 1 or miss_rate < 0:
       raise ValueError("Invalid miss_rate {}".format(miss_rate))
 
     super().__init__(n, d, D, Ng, affine, sigma, theta, normalize, seed)
 
-    # sample observed entries uniformly
     self.miss_rate = miss_rate
+    self.test_frac = test_frac
+    self.sparse_format = sparse_format
+
+    # sample observed entries uniformly
     self.Omega = (torch.tensor(self.rng.rand(self.N, self.D),
         dtype=torch.float32) >= miss_rate)
+    OmegaIdx = self.Omega.nonzero()
+    test_mask = (torch.tensor(self.rng.rand(OmegaIdx.shape[0]),
+        dtype=torch.float32) <= test_frac)
+    self.Omega[OmegaIdx[test_mask, 0], OmegaIdx[test_mask, 1]] = 0
+    self.Omega_test = torch.zeros_like(self.Omega)
+    self.Omega_test[OmegaIdx[test_mask, 0], OmegaIdx[test_mask, 1]] = 1
     return
 
   def __getitem__(self, ii):
-    x, omega, grp = self.X[ii, :], self.Omega[ii, :], self.groups[ii]
-    x0 = x.clone()
-    x[omega == 0] = np.nan
-    x0[omega] = np.nan
-    return x, grp, x0
+    x, omega, omega_test, grp = (self.X[ii, :], self.Omega[ii, :],
+        self.Omega_test[ii, :], self.groups[ii])
+    if self.sparse_format:
+      omegaIdx = omega.nonzero().view(-1)
+      omega_testIdx = omega_test.nonzero().view(-1)
+      if omega_testIdx.shape[0] > 0:
+        omega_testIdx = omega_testIdx.view(1, -1)
+      if omegaIdx.shape[0] > 0:
+        omegaIdx = omegaIdx.view(1, -1)
+      x0 = torch.sparse.FloatTensor(omega_testIdx, x[omega_testIdx].view(-1),
+          (self.D,))
+      x_miss = torch.sparse.FloatTensor(omegaIdx, x[omegaIdx].view(-1),
+          (self.D,))
+    else:
+      x_miss = torch.zeros_like(x).mul_(np.nan)
+      x0 = torch.zeros_like(x).mul_(np.nan)
+      x_miss[omega] = x[omega]
+      x0[omega_test] = x[omega_test]
+    return x_miss, grp, x0
 
 
 class SynthUoSOnlineDataset(SynthUoSDataset):
@@ -162,22 +186,41 @@ class SynthUoSOnlineDataset(SynthUoSDataset):
 class SynthUoSMissOnlineDataset(SynthUoSOnlineDataset):
   """Synthetic union of subspaces dataset with fresh samples."""
   def __init__(self, n, d, D, N, affine=False, sigma=0., theta=None,
-        miss_rate=0.0, normalize=False, seed=None):
+        miss_rate=0.0, normalize=False, sparse_format=False, test_frac=0.05,
+        seed=None):
     if miss_rate >= 1 or miss_rate < 0:
       raise ValueError("Invalid miss_rate {}".format(miss_rate))
 
     super().__init__(n, d, D, N, affine, sigma, theta, normalize, seed)
 
     self.miss_rate = miss_rate
+    self.test_frac = test_frac
+    self.sparse_format = sparse_format
     return
 
   def __getitem__(self, ii):
     x, grp = super().__getitem__(ii)
     omega = (torch.rand(self.D) >= self.miss_rate)
-    x0 = x.clone()
-    x[omega == 0] = np.nan
-    x0[omega] = np.nan
-    return x, grp, x0
+    omegaIdx = omega.nonzero().view(-1)
+    test_mask = (torch.rand(omegaIdx.shape[0]) <= self.test_frac)
+    omega_testIdx = omegaIdx[test_mask]
+    omegaIdx = omegaIdx[test_mask == 0]
+
+    if self.sparse_format:
+      if omega_testIdx.shape[0] > 0:
+        omega_testIdx = omega_testIdx.view(1, -1)
+      if omegaIdx.shape[0] > 0:
+        omegaIdx = omegaIdx.view(1, -1)
+      x0 = torch.sparse.FloatTensor(omega_testIdx, x[omega_testIdx].view(-1),
+          (self.D,))
+      x_miss = torch.sparse.FloatTensor(omegaIdx, x[omegaIdx].view(-1),
+          (self.D,))
+    else:
+      x_miss = torch.zeros_like(x).mul_(np.nan)
+      x0 = torch.zeros_like(x).mul_(np.nan)
+      x_miss[omegaIdx] = x[omegaIdx]
+      x0[omega_testIdx] = x[omega_testIdx]
+    return x_miss, grp, x0
 
 
 class ImageUoSDataset(Dataset):
@@ -282,3 +325,9 @@ class SynthKMeansDataset(Dataset):
 
   def __getitem__(self, ii):
     return self.X[ii, :], self.groups[ii]
+
+
+def sparse_miss_collate(batch):
+  x, grp, x0 = zip(*batch)
+  grp = torch.stack(grp)
+  return x, grp, x0
