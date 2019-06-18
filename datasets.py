@@ -7,6 +7,8 @@ from scipy.io import loadmat
 import torch
 from torch.utils.data import Dataset
 
+import sparse as sprs
+
 CODE_DIR = os.path.dirname(os.path.realpath(__file__))
 
 
@@ -104,8 +106,7 @@ class SynthUoSDataset(Dataset):
 class SynthUoSMissDataset(SynthUoSDataset):
   """Synthetic union of subspaces dataset with missing data."""
   def __init__(self, n, d, D, Ng, affine=False, sigma=0., theta=None,
-        miss_rate=0.0, normalize=False, sparse_format=False, test_frac=0.05,
-        seed=None):
+        miss_rate=0.0, normalize=False, test_frac=0.05, seed=None):
     if miss_rate >= 1 or miss_rate < 0:
       raise ValueError("Invalid miss_rate {}".format(miss_rate))
 
@@ -113,7 +114,6 @@ class SynthUoSMissDataset(SynthUoSDataset):
 
     self.miss_rate = miss_rate
     self.test_frac = test_frac
-    self.sparse_format = sparse_format
 
     # sample observed entries uniformly
     self.Omega = (torch.tensor(self.rng.rand(self.N, self.D),
@@ -129,22 +129,11 @@ class SynthUoSMissDataset(SynthUoSDataset):
   def __getitem__(self, ii):
     x, omega, omega_test, grp = (self.X[ii, :], self.Omega[ii, :],
         self.Omega_test[ii, :], self.groups[ii])
-    if self.sparse_format:
-      omegaIdx = omega.nonzero().view(-1)
-      omega_testIdx = omega_test.nonzero().view(-1)
-      if omega_testIdx.shape[0] > 0:
-        omega_testIdx = omega_testIdx.view(1, -1)
-      if omegaIdx.shape[0] > 0:
-        omegaIdx = omegaIdx.view(1, -1)
-      x0 = torch.sparse.FloatTensor(omega_testIdx, x[omega_testIdx].view(-1),
-          (self.D,))
-      x_miss = torch.sparse.FloatTensor(omegaIdx, x[omegaIdx].view(-1),
-          (self.D,))
-    else:
-      x_miss = torch.zeros_like(x).mul_(np.nan)
-      x0 = torch.zeros_like(x).mul_(np.nan)
-      x_miss[omega] = x[omega]
-      x0[omega_test] = x[omega_test]
+    omegaIdx = omega.nonzero().view(-1)
+    omega_testIdx = omega_test.nonzero().view(-1)
+
+    x_miss = sprs.PadSparseVector(omegaIdx, x[omegaIdx], (self.D,))
+    x0 = sprs.PadSparseVector(omega_testIdx, x[omega_testIdx], (self.D,))
     return x_miss, grp, x0
 
 
@@ -206,20 +195,8 @@ class SynthUoSMissOnlineDataset(SynthUoSOnlineDataset):
     omega_testIdx = omegaIdx[test_mask]
     omegaIdx = omegaIdx[test_mask == 0]
 
-    if self.sparse_format:
-      if omega_testIdx.shape[0] > 0:
-        omega_testIdx = omega_testIdx.view(1, -1)
-      if omegaIdx.shape[0] > 0:
-        omegaIdx = omegaIdx.view(1, -1)
-      x0 = torch.sparse.FloatTensor(omega_testIdx, x[omega_testIdx].view(-1),
-          (self.D,))
-      x_miss = torch.sparse.FloatTensor(omegaIdx, x[omegaIdx].view(-1),
-          (self.D,))
-    else:
-      x_miss = torch.zeros_like(x).mul_(np.nan)
-      x0 = torch.zeros_like(x).mul_(np.nan)
-      x_miss[omegaIdx] = x[omegaIdx]
-      x0[omega_testIdx] = x[omega_testIdx]
+    x_miss = sprs.PadSparseVector(omegaIdx, x[omegaIdx], (self.D,))
+    x0 = sprs.PadSparseVector(omega_testIdx, x[omega_testIdx], (self.D,))
     return x_miss, grp, x0
 
 
@@ -325,9 +302,3 @@ class SynthKMeansDataset(Dataset):
 
   def __getitem__(self, ii):
     return self.X[ii, :], self.groups[ii]
-
-
-def sparse_miss_collate(batch):
-  x, grp, x0 = zip(*batch)
-  grp = torch.stack(grp)
-  return x, grp, x0

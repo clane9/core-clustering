@@ -204,12 +204,12 @@ def train_epoch(model, data_loader, optimizer, device, eval_rank=False,
     if len(data_tup) == 3:
       x, groups, x0 = data_tup
       if x0 is not None:
-        x0 = ut.to_device(x0, device)
+        x0 = x0.to(device)
     else:
       x, groups = data_tup
       x0 = None
-    x = ut.to_device(x, device)
-    batch_size = x.size(0) if torch.is_tensor(x) else len(x)
+    x = x.to(device)
+    batch_size = x.shape[0]
 
     # opt step
     optimizer.zero_grad()

@@ -97,9 +97,6 @@ if __name__ == '__main__':
   parser.add_argument('--min-size', type=float, default=0.0,
                       help=('Minimum cluster size as fraction relative to 1/n'
                       '[default: 0.0]'))
-  parser.add_argument('--mc-exact', type=ut.boolarg, default=True,
-                      help=('Use exact coeff solution in MC setting '
-                          '[default: 1]'))
   # training settings
   parser.add_argument('--batch-size', type=int, default=100,
                       help='Input batch size for training [default: 100]')

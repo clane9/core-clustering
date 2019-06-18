@@ -19,6 +19,7 @@ import datasets as dat
 import models as mod
 import training as tr
 import utils as ut
+import sparse as sprs
 
 
 def train_synth_uos_cluster(args):
@@ -45,7 +46,6 @@ def train_synth_uos_cluster(args):
     args.N = args.k * args.Ng
 
   kwargs = {'num_workers': args.num_workers}
-  sparse_miss_format = True
 
   if args.online:
     if batch_alt_mode:
@@ -54,25 +54,23 @@ def train_synth_uos_cluster(args):
     if args.miss_rate > 0:
       synth_dataset = dat.SynthUoSMissOnlineDataset(args.k, args.d, args.D,
           args.N, args.affine, args.sigma, args.theta, args.miss_rate,
-          args.normalize, sparse_format=sparse_miss_format,
-          seed=args.data_seed)
-      if sparse_miss_format:
-        kwargs['collate_fn'] = dat.sparse_miss_collate
+          args.normalize, seed=args.data_seed)
+      kwargs['collate_fn'] = sprs.pad_sparse_collate
     else:
       synth_dataset = dat.SynthUoSOnlineDataset(args.k, args.d, args.D,
           args.N, args.affine, args.sigma, args.theta, args.normalize,
-          args.data_seed)
+          seed=args.data_seed)
     shuffle_data = False
   else:
     if args.miss_rate > 0:
       synth_dataset = dat.SynthUoSMissDataset(args.k, args.d, args.D, args.Ng,
           args.affine, args.sigma, args.theta, args.miss_rate, args.normalize,
-          sparse_format=sparse_miss_format, seed=args.data_seed)
-      if sparse_miss_format:
-        kwargs['collate_fn'] = dat.sparse_miss_collate
+          seed=args.data_seed)
+      kwargs['collate_fn'] = sprs.pad_sparse_collate
     else:
       synth_dataset = dat.SynthUoSDataset(args.k, args.d, args.D, args.Ng,
-          args.affine, args.sigma, args.theta, args.normalize, args.data_seed)
+          args.affine, args.sigma, args.theta, args.normalize,
+          seed=args.data_seed)
     shuffle_data = True
   if use_cuda:
     kwargs['pin_memory'] = True
@@ -146,10 +144,9 @@ def train_synth_uos_cluster(args):
               else 0.0),
           'e': 1.0
       }
-      MCModel = (mod.KSubspaceMCModel if args.mc_exact else
-          mod.KSubspaceMCCorruptModel)
-      model = MCModel(args.model_k, args.model_d, args.D, affine=args.affine,
-          replicates=args.reps, reg_params=reg_params, **reset_kwargs)
+      model = mod.KSubspaceMCModel(args.model_k, args.model_d, args.D,
+          affine=args.affine, replicates=args.reps, reg_params=reg_params,
+          **reset_kwargs)
     else:
       reg_params = {
           'U_frosqr_in': args.U_frosqr_in_lamb / args.z_lamb,
@@ -270,9 +267,6 @@ if __name__ == '__main__':
   parser.add_argument('--z-lamb', type=float, default=0.01,
                       help=('L2 squared coefficient reg parameter, '
                       'inside assignment [default: 0.01]'))
-  parser.add_argument('--mc-exact', type=ut.boolarg, default=True,
-                      help=('Use exact coeff solution in MC setting '
-                          '[default: 1]'))
   # training settings
   parser.add_argument('--batch-size', type=int, default=100,
                       help='Input batch size for training [default: 100]')

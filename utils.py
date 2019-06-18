@@ -502,11 +502,3 @@ def aggregate_resets(resets):
       ['{}.{}'.format(met, meas) for met in ['obj.decr', 'cumu.obj.decr']
           for meas in ['min', 'med', 'max']] + ['temp'])
   return agg_resets
-
-
-def to_device(x, device):
-  if torch.is_tensor(x):
-    x = x.to(device)
-  else:
-    x = list(map(lambda xk: xk.to(device), x))
-  return x

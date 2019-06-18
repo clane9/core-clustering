@@ -1273,14 +1273,10 @@ class KSubspaceMCModel(KSubspaceMFModel):
         temp_scheduler=temp_scheduler, scale_grad_freq=scale_grad_freq)
 
     self.norm_comp_error = norm_comp_error
-    self.sparse_eval = None
-    self.omega = None
     self.maskUs = None
 
     self.cache_z = True
     self.z = None
-    self.cache_x0_ = True
-    self.x0_ = None
     return
 
   def loss(self, x):
@@ -1293,28 +1289,12 @@ class KSubspaceMCModel(KSubspaceMFModel):
     Returns:
       loss: shape (batch_size, r, k)
     """
-    x = self.parse_x_miss(x)
+    # (r, k, batch_size, max_nnz)
     x_ = self(x)
-    if self.sparse_eval:
-      loss = self._sprs_loss(x, x_)
-    else:
-      loss = self._dense_loss(x, x_)
-    return loss
-
-  def _dense_loss(self, x, x_):
-    """Compute loss in a vectorized (parallelizable) way, but O(D) cost."""
     # (r, k, batch_size)
-    loss = torch.sum((x_ - x)**2, dim=-1).mul(0.5)
+    loss = torch.sum((x_ - x.values)**2, dim=-1).mul(0.5)
+    # (batch_size, r, k)
     loss = loss.permute(2, 0, 1)
-    return loss
-
-  def _sprs_loss(self, x, x_):
-    """Compute loss in a serial for-loop, each iteration O(nnz)."""
-    batch_size = len(x)
-    loss = torch.zeros(batch_size, self.r, self.k, device=x[0].device)
-    for kk in range(batch_size):
-      if x[kk]._nnz() > 0:
-        loss[kk, :] = torch.sum((x_[kk] - x[kk]._values())**2, dim=-1).mul(0.5)
     return loss
 
   def forward(self, x):
@@ -1326,151 +1306,61 @@ class KSubspaceMCModel(KSubspaceMFModel):
     Returns:
       x_: reconstruction, shape (r, k, batch_size, D)
     """
-    if self.sparse_eval:
-      z = self._sprs_encode(x)
-      x_, x0_ = self._sprs_decode(z, x)
-    else:
-      z = self._dense_encode(x)
-      x_, x0_ = self._dense_decode(z)
-    self._update_forward_cache(z, x0_)
+    z = self.encode(x)
+    x_ = self.decode(z, x)
+    self._update_forward_cache(z)
     return x_
 
   def encode(self, x):
-    raise NotImplementedError
-
-  def decode(self, z):
-    raise NotImplementedError
-
-  def _dense_encode(self, x):
-    """Encode x by vectorized (hence parallelizable) (r*k*batch_size) O(D)
-    least-squares problems."""
+    """Encode x by vectorized (hence parallelizable) (r*k*batch_size)
+    O(max_nnz) least-squares problems."""
     # Us shape (r, k, D, d)
     # bs shape (r, k, D)
-    batch_size = x.size(0)
-    if self.maskUs is None or self.maskUs.shape[2] != batch_size:
-      self.maskUs = torch.zeros(self.r, self.k, batch_size, self.D, self.d,
-          device=self.Us.device)
+    batch_size = x.shape[0]
+    max_nnz = x.max_nnz
 
-    # ideally we would us sparsity to save on O(D) operations
-    self.maskUs.copy_(self.Us.data.unsqueeze(2))
-    self.maskUs.mul_(self.omega.float().view(1, 1, batch_size, self.D, 1))
-
+    # (r, k, batch_size, max_nnz, d)
+    repUs = self.Us.data[:, :, x.indices, :]
+    repUs.mul_(x.omega.float().view(1, 1, batch_size, max_nnz, 1))
+    # (batch_size, max_nnz)
+    xval = x.values
     if self.affine:
-      # (r, k, batch_size, D, 1)
-      x = x.sub(self.bs.data.unsqueeze(2)).unsqueeze(4)
+      # (r, k, batch_size, max_nnz)
+      repbs = self.bs.data[:, :, x.indices]
+      # (r, k, batch_size, max_nnz, 1)
+      xval = xval.sub(repbs).unsqueeze(4)
     else:
-      # (batch_size, D, 1)
-      x = x.unsqueeze(2)
+      # (batch_size, max_nnz, 1)
+      xval = xval.unsqueeze(2)
 
-    # (r, k, batch_size, d, 1)
-    z = ut.batch_ridge(x, self.maskUs, lamb=self.reg_params['z']).squeeze(4)
+    # (r, k, batch_size, d)
+    z = ut.batch_ridge(xval, repUs, lamb=self.reg_params['z']).squeeze(4)
     return z
 
-  def _sprs_encode(self, x):
-    """Encode x in a serial for-loop of (r*k*batch_size) O(nnz)
-    least-squares problems."""
-    # Us shape (r, k, D, d)
-    # bs shape (r, k, D)
-    batch_size = len(x)
-    z = torch.zeros(self.r, self.k, batch_size, self.d, dtype=self.Us.dtype,
-        device=self.Us.device)
-
-    for kk in range(batch_size):
-      if x[kk]._nnz() == 0:
-        continue
-      Idxk = x[kk]._indices().view(-1)
-      xk = x[kk]._values()
-      if self.affine:
-        # (r, k, |omega_k|, 1)
-        xk = xk.sub(self.bs.data[:, :, Idxk]).unsqueeze(3)
-      else:
-        # (|omega_k|, 1)
-        xk = xk.unsqueeze(1)
-      # (r, k, d, 1)
-      zk = ut.batch_ridge(xk, self.Us.data[:, :, Idxk, :],
-          lamb=self.reg_params['z'])
-      z[:, :, kk, :] = zk.squeeze(3)
-    return z
-
-  def _dense_decode(self, z):
-    """Encode x by vectorized (hence parallelizable) (r*k*batch_size) O(D)
-    mat-vec produces."""
+  def decode(self, z, x):
+    """Encode x by vectorized (hence parallelizable) (r*k*batch_size)
+    O(max_nnz) mat-vec products."""
     # x_ = U z + b
-    # shape (r, k, batch_size, D)
-    x0_ = torch.matmul(z, self.Us.transpose(2, 3))
+    # (r, k, batch_size, max_nnz, d)
+    repUs = self.Us[:, :, x.indices, :]
+    # (r, k, batch_size, max_nnz)
+    x0_ = torch.matmul(repUs, z.unsqueeze(4)).squeeze(4)
     if self.affine:
-      x0_ = x0_.add(self.bs.unsqueeze(2))
-    x_ = x0_ * self.omega.float()
-    return x_, x0_.data
+      # (r, k, batch_size, max_nnz)
+      repbs = self.bs[:, :, x.indices]
+      x0_ = x0_.add(repbs)
+    x_ = x0_ * x.omega.float()
+    return x_
 
-  def _sprs_decode(self, z, x):
-    """Decode z in a serial for-loop of (r*k*batch_size) O(nnz) mat-vec
-    products."""
-    batch_size = len(x)
-    z = z.unsqueeze(4)
-    x_ = []
-
-    for kk in range(batch_size):
-      if x[kk]._nnz() == 0:
-        x_k = None
-      else:
-        # (r, k, d, 1)
-        Idxk = x[kk]._indices().view(-1)
-        zk = z[:, :, kk, :, :]
-        Uk = torch.index_select(self.Us, 2, Idxk)
-        # (r, k, D)
-        x_k = torch.matmul(Uk, zk).squeeze(3)
-        if self.affine:
-          bk = torch.index_select(self.bs, 2, Idxk)
-          x_k = x_k.add(bk)
-      x_.append(x_k)
-    return x_, None
-
-  def _update_forward_cache(self, z, x0_):
+  def _update_forward_cache(self, z):
     """Update any cached values from forward call."""
     self.z_frosqr = z.data.pow(2).sum(dim=-1)
     if self.cache_z:
       self.z = z.data
-    if self.cache_x0_:
-      self.x0_ = x0_
     return
 
   def eval_shrink(self, x, x_):
     raise NotImplementedError("eval_shrink not implemented.")
-
-  def parse_x_miss(self, x, update_omega=True):
-    """Parse x with missing data coded as nan
-
-    Input:
-      x: either sparse format (list of sparse tensors), or dense format (tensor
-        with missing elements coded as nan, shape (batch_size, D)).
-      update_omega: whether to update omega attribute when x in dense format
-        (default: True).
-
-    Updates:
-      omega: updated with current mask in place.
-      sparse_eval: True if x in sparse format
-
-    Returns:
-      x: parsed data x.
-    """
-    if (type(x) is list and len(x) > 0 and isinstance(x[0],
-          torch.sparse.FloatTensor)):
-      self.sparse_eval = True
-    elif torch.is_tensor(x) and x.dim() == 2:
-      self.sparse_eval = False
-    else:
-      raise ValueError("x format unrecognized")
-
-    if not self.sparse_eval:
-      omegac = torch.isnan(x)
-      x = x.clone()
-      x[omegac] = 0.0
-      if update_omega:
-        self.omega = (omegac == 0)
-    else:
-      self.omega = None
-    return x
 
   def eval_comp_error(self, x0):
     """Evaluate completion error over observed entries in x0.
@@ -1483,34 +1373,21 @@ class KSubspaceMCModel(KSubspaceMFModel):
       comp_err: rmse relative to mean squared magnitude of x0.
     """
     with torch.no_grad():
-      x0 = self.parse_x_miss(x0)
-      rIdx = torch.arange(self.r)
+      batch_size = x0.shape[0]
+      assert(batch_size == self.groups.shape[0])
+      if x0.max_nnz == 0:
+        return torch.zeros(self.r, device=x0.device)
 
-      if self.sparse_eval:
-        batch_size = len(x0)
-        assert(batch_size == self.groups.shape[0])
-        if sum([x0[kk]._nnz() for kk in range(batch_size)]) == 0:
-          return torch.zeros(self.r, device=x0.device)
-
-        x0_, _ = self._sprs_decode(self.z, x0)
-        # (r, nnz)
-        x0_ = torch.cat([x0_[kk][rIdx, self.groups[kk, :], :]
-            for kk in range(batch_size) if x0[kk]._nnz() > 0], dim=1)
-        x0 = torch.cat([x0[kk]._values() for kk in range(batch_size)
-            if x0[kk]._nnz() > 0], dim=0)
-      else:
-        batch_size = x0.shape[0]
-        assert(batch_size == self.groups.shape[0])
-        if not torch.any(self.omega):
-          return torch.zeros(self.r, device=x0.device)
-
-        # (r, k, batch_size, D)
-        x0_ = self.x0_ if self.x0_ is not None else self._dense_decode(self.z)
-        # (r, batch_size, D)
-        x0_ = x0_[rIdx.view(-1, 1), self.groups.t(),
-            torch.arange(batch_size), :]
-        x0_ = x0_[:, self.omega]
-        x0 = x0[self.omega]
+      # (r, k, batch_size, max_nnz)
+      x0_ = self.decode(self.z, x0)
+      # (r, batch_size, max_nnz)
+      rIdx = torch.arange(self.r).view(-1, 1)
+      batchIdx = torch.arange(batch_size).view(1, -1)
+      x0_ = x0_[rIdx, self.groups.t(), batchIdx, :]
+      # (r, total_nnz)
+      x0_ = x0_[:, x0.omega]
+      # (total_nnz,)
+      x0 = x0.values[x0.omega]
 
       # (r, )
       denom = x0.pow(2).mean() if self.norm_comp_error else 1.0
@@ -1702,72 +1579,6 @@ class KSubspaceMFCorruptModel(KSubspaceMFModel):
   def reg_e(self):
     """Compute regularizer wrt e."""
     return 0.0
-
-
-class KSubspaceMCCorruptModel(KSubspaceMFCorruptModel, KSubspaceMCModel):
-  """K-subspace model where low-dim coefficients are computed in closed
-  form. Adapted to handle missing data."""
-  default_reg_params = {
-      'U_frosqr_in': 0.01,
-      'U_frosqr_out': 1e-4,
-      'z': 0.01,
-      'e': 1.0  # not meaningful in this case
-  }
-  assign_reg_terms = {'U_frosqr_in', 'z', 'e'}
-
-  def __init__(self, k, d, D, affine=False, replicates=5, reg_params={},
-        serial_eval={}, reset_patience=100, reset_try_tol=0.01,
-        reset_max_steps=50, reset_accept_tol=1e-3, reset_sigma=0.0,
-        reset_cache_size=500, temp_scheduler=None, encode_max_iter=20,
-        encode_tol=1e-3, scale_grad_freq=100):
-
-    super().__init__(k, d, D,
-        affine=affine, replicates=replicates, reg_params=reg_params,
-        serial_eval=serial_eval, reset_patience=reset_patience,
-        reset_try_tol=reset_try_tol, reset_max_steps=reset_max_steps,
-        reset_accept_tol=reset_accept_tol, reset_sigma=reset_sigma,
-        reset_cache_size=reset_cache_size, temp_scheduler=temp_scheduler,
-        encode_max_iter=encode_max_iter, encode_tol=encode_tol,
-        scale_grad_freq=scale_grad_freq)
-    return
-
-  def _prox_e(self, w):
-    """Compute projection onto *unobserved* entries. Note, operates on w in
-    place."""
-    # w shape (r, k, batch_size, D)
-    w[:, :, self.omega] = 0.0
-    return w
-
-  def parse_x_miss(self, x, update_omega=True):
-    """Parse x with missing data coded as nan
-
-    Input:
-      x: dense format (tensor with missing elements coded as nan, shape
-        (batch_size, D)).
-      update_omega: whether to update omega attribute when x in dense format
-        (default: True).
-
-    Updates:
-      omega: updated with current mask in place.
-      sparse_eval: True if x in sparse format
-
-    Returns:
-      x: parsed data x.
-    """
-    if (type(x) is list and len(x) > 0 and isinstance(x[0],
-          torch.sparse.FloatTensor)):
-      raise ValueError("sparse x format not supported.")
-    elif torch.is_tensor(x) and x.dim() == 2:
-      self.sparse_eval = False
-    else:
-      raise ValueError("x format unrecognized.")
-
-    omegac = torch.isnan(x)
-    x = x.clone()
-    x[omegac] = 0.0
-    if update_omega:
-      self.omega = (omegac == 0)
-    return x
 
 
 class KSubspaceMFOutlierModel(KSubspaceMFCorruptModel):
