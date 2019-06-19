@@ -10,6 +10,7 @@ import utils as ut
 EPS = 1e-8
 EMA_DECAY = 0.99
 RESET_NCOL = 8
+EVAL_RANK_CPU = True
 
 
 class KSubspaceBaseModel(nn.Module):
@@ -355,14 +356,9 @@ class KSubspaceBaseModel(nn.Module):
       svs: singular values (r, k, d)
     """
     # svd is ~1000x faster on cpu for small matrices, e.g. (100, 10).
-    Us = self.Us.data.cpu() if self.D <= 1000 else self.Us.data
-    # ideally there would be a batched svd instead of this loop, but at least
-    # k, r should be "small"
-    # (rk, d)
-    svs = torch.stack([torch.svd(Us[ii, jj, :])[1] for ii in range(self.r)
-        for jj in range(self.k)])
-    svs = svs.view(self.r, self.k, self.d)
-    # (r, 1, 1)
+    Us = self.Us.data.cpu() if EVAL_RANK_CPU else self.Us.data
+    # (r, k, d)
+    svs = ut.batch_svd(Us)[1]
     tol = svs[:, :, 0].max(dim=1)[0].mul(tol).view(self.r, 1, 1)
     # (r, k)
     ranks = (svs > tol).sum(dim=2)
@@ -448,7 +444,7 @@ class KSubspaceBaseModel(nn.Module):
 
     value, min_assign_obj = self._eval_value()
     sample_prob = (value.unsqueeze(0).clamp(min=0) /
-        value[ridx, :].view(self.k, 1, 1).clamp(min=EPS))
+        value[ridx, :].view(self.k, 1, 1).clamp(min=EPS)).cpu()
     sample_prob[:, ridx, :] = 0.0
     rep_obj = (min_assign_obj[:, ridx].mean() +
         self._batch_reg_out[ridx, :].sum()).item()
@@ -482,7 +478,7 @@ class KSubspaceBaseModel(nn.Module):
         # update sample prob and replicate obj
         rep_value, rep_min_assign_obj = self._eval_value(
             assign_obj=rep_assign_obj[1, :], reg_out=rep_reg_out[1, :])
-        sample_prob.copy_(value.unsqueeze(0).clamp(min=0)).div_(
+        sample_prob.copy_(value.unsqueeze(0).clamp(min=0) /
             rep_value.view(self.k, 1, 1).clamp(min=EPS))
         sample_prob[:, ridx, :] = 0.0
         rep_obj = (rep_min_assign_obj.mean() + rep_reg_out[1, :].sum()).item()

@@ -39,10 +39,7 @@ def set_args(args):
       (args.sigma_hat**2 / args.D))
   args.U_frosqr_out_lamb = ((args.min_size / args.k) *
       (1.0 / args.d + args.sigma_hat**2 / args.D))
-
-  # other fixed args
   args.z_lamb = 0.01
-  args.eval_rank = True
   return args
 
 
@@ -138,6 +135,8 @@ if __name__ == '__main__':
                       help='Number of workers for data loading [default: 1]')
   parser.add_argument('--seed', type=int, default=2018,
                       help='Training random seed [default: 2018]')
+  parser.add_argument('--eval-rank', type=ut.boolarg, default=False,
+                      help='Evaluate ranks of subspace models [default: 0]')
   parser.add_argument('--chkp-freq', type=int, default=None,
                       help='How often to save checkpoints [default: None]')
   parser.add_argument('--stop-freq', type=int, default=None,

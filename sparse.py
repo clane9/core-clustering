@@ -47,9 +47,6 @@ class StackedPadSparseVector(object):
 
 class PadSparseVector(object):
   def __init__(self, indices, values, shape):
-    indices = torch.tensor(indices, dtype=torch.int64)
-    values = torch.tensor(values, dtype=torch.float32)
-
     if max(indices.dim(), values.dim(), len(shape)) > 1:
       raise ValueError("inputs must be vectors.")
     if values.shape[0] != indices.shape[0]:
@@ -68,7 +65,7 @@ class PadSparseVector(object):
     else:
       sortIdx = torch.sort(indices)[1]
       self.indices = indices[sortIdx]
-      self.values = values[sortIdx]
+      self.values = values[sortIdx].float()
       self.omega = torch.ones(self.nnz, dtype=torch.uint8)
       self.pad_nnz = self.nnz
     return
