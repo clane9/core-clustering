@@ -17,8 +17,8 @@ RESET_NCOL = 8
 
 
 def train_loop(model, data_loader, device, optimizer, out_dir=None, epochs=200,
-      chkp_freq=50, stop_freq=-1, scheduler=None, eval_rank=False,
-      reset_unused=False, save_data=True, init_time=0.0):
+      chkp_freq=50, stop_freq=-1, scheduler=None, epoch_steps=None,
+      eval_rank=False, reset_unused=False, save_data=True, init_time=0.0):
   """Train k-subspace model for series of epochs.
 
   Args:
@@ -31,6 +31,7 @@ def train_loop(model, data_loader, device, optimizer, out_dir=None, epochs=200,
     chkp_freq: how often to save checkpoint (default: 50)
     stop_freq: how often to stop for debugging (default: -1)
     scheduler: lr scheduler. If None, use reduce on plateau (default: None)
+    epoch_steps: maximum steps per "epoch" (default: len(dataset))
     eval_rank: evaluate ranks of group models, only implemented for subspace
       models (default: False)
     reset_unused: whether to reset unused clusters (default: False)
@@ -74,13 +75,20 @@ def train_loop(model, data_loader, device, optimizer, out_dir=None, epochs=200,
     val_logf = None
 
   batch_alt_mode = isinstance(model, KSubspaceBatchAltBaseModel)
+  if batch_alt_mode:
+    eval_cluster_error = model.true_classes is not None
+  else:
+    eval_cluster_error = data_loader.dataset.classes is not None
 
   # dim 1: err, obj, loss, reg.in, reg.out, (comp.err), resets
   nmet = 7 if mc_mode else 6
   metrics = np.zeros((epochs, nmet, model.r), dtype=np.float32)
-  true_n = (model.true_classes.size if batch_alt_mode
-      else data_loader.dataset.classes.size)
-  conf_mats = np.zeros((epochs, model.r, model.k, true_n), dtype=np.int64)
+  if eval_cluster_error:
+    true_n = (model.true_classes.size if batch_alt_mode
+        else data_loader.dataset.classes.size)
+    conf_mats = np.zeros((epochs, model.r, model.k, true_n), dtype=np.int64)
+  else:
+    conf_mats = None
   svs = (np.zeros((epochs, model.r, model.k, model.d), dtype=np.float32)
       if eval_rank else None)
   resets = [] if reset_unused else None
@@ -96,22 +104,28 @@ def train_loop(model, data_loader, device, optimizer, out_dir=None, epochs=200,
   # training loop
   err = None
   lr = float('inf')
+  data_iter = None
   model.train()
   try:
     for epoch in range(1, epochs+1):
       if batch_alt_mode:
-        (metrics_summary, metrics[epoch-1, :], conf_mats[epoch-1, :],
-            epoch_svs, epoch_resets) = batch_alt_step(model, eval_rank,
-                reset_unused)
+        (metrics_summary, metrics[epoch-1, :], epoch_conf_mats, epoch_svs,
+            epoch_resets) = batch_alt_step(model, eval_rank=eval_rank,
+                reset_unused=reset_unused,
+                eval_cluster_error=eval_cluster_error)
       else:
-        (metrics_summary, metrics[epoch-1, :], conf_mats[epoch-1, :],
-            epoch_svs, epoch_resets) = train_epoch(model, data_loader,
-                optimizer, device, eval_rank, reset_unused)
+        (metrics_summary, metrics[epoch-1, :], epoch_conf_mats, epoch_svs,
+            epoch_resets, data_iter) = train_epoch(model, data_loader,
+                data_iter, optimizer, device, epoch_steps=epoch_steps,
+                eval_rank=eval_rank, reset_unused=reset_unused,
+                mc_mode=mc_mode, eval_cluster_error=eval_cluster_error)
         lr = ut.get_learning_rate(optimizer)
 
       if epoch == 1:
         metrics_summary[-1] += init_time
 
+      if eval_cluster_error:
+        conf_mats[epoch-1, :] = epoch_conf_mats
       if eval_rank:
         svs[epoch-1, :] = epoch_svs
       if reset_unused and epoch_resets.shape[0] > 0:
@@ -167,13 +181,16 @@ def train_loop(model, data_loader, device, optimizer, out_dir=None, epochs=200,
       with open('{}/metrics.npz'.format(out_dir), 'wb') as f:
         np.savez(f, metrics=metrics[:epoch, :])
       if save_data:
-        save_conf_mats = conf_mats[:epoch, :]
+        save_conf_mats = (conf_mats[:epoch, :]
+            if eval_cluster_error else None)
         save_svs = svs[:epoch, :] if eval_rank else None
       else:
-        save_conf_mats = conf_mats[[epoch-1], :]
+        save_conf_mats = (conf_mats[[epoch-1], :]
+            if eval_cluster_error else None)
         save_svs = svs[[epoch-1], :] if eval_rank else None
-      with open('{}/conf_mats.npz'.format(out_dir), 'wb') as f:
-        np.savez(f, conf_mats=save_conf_mats)
+      if eval_cluster_error:
+        with open('{}/conf_mats.npz'.format(out_dir), 'wb') as f:
+          np.savez(f, conf_mats=save_conf_mats)
       if eval_rank:
         with open('{}/svs.npz'.format(out_dir), 'wb') as f:
           np.savez(f, svs=save_svs)
@@ -190,17 +207,32 @@ def train_loop(model, data_loader, device, optimizer, out_dir=None, epochs=200,
   return conf_mats, svs, resets
 
 
-def train_epoch(model, data_loader, optimizer, device, eval_rank=False,
-      reset_unused=False):
+def train_epoch(model, data_loader, data_iter, optimizer, device,
+      epoch_steps=None, eval_rank=False, reset_unused=False, mc_mode=False,
+      eval_cluster_error=True):
   """train model for one epoch and record convergence measures."""
   epoch_tic = time.time()
   metrics = None
   resets = []
-  mc_mode = isinstance(model, KSubspaceMCModel)
   conf_mats, sampsec, comp_err = [ut.AverageMeter() for _ in range(3)]
   itr = 1
+  epoch_stop = False
+  if data_iter is None:
+    data_iter = iter(data_loader)
   tic = time.time()
-  for data_tup in data_loader:
+  while not epoch_stop:
+    try:
+      data_tup = next(data_iter)
+    except StopIteration:
+      if epoch_steps is None or epoch_steps == itr:
+        data_iter = None
+        epoch_stop = True
+        break
+      else:
+        data_iter = iter(data_loader)
+    if itr == epoch_steps:
+      epoch_stop = True
+
     if len(data_tup) == 3:
       x, groups, x0 = data_tup
       if x0 is not None:
@@ -224,23 +256,24 @@ def train_epoch(model, data_loader, optimizer, device, eval_rank=False,
     batch_metrics = [batch_obj, batch_loss, batch_reg_in, batch_reg_out]
 
     # eval batch cluster confusion
-    batch_conf_mats = torch.stack([
-        torch.from_numpy(ut.eval_confusion(model.groups[:, ii], groups,
-            model.k, true_classes=data_loader.dataset.classes))
-        for ii in range(model.replicates)])
+    if eval_cluster_error:
+      batch_conf_mats = torch.stack([
+          torch.from_numpy(ut.eval_confusion(model.groups[:, ii], groups,
+              model.k, true_classes=data_loader.dataset.classes))
+          for ii in range(model.replicates)])
 
     # eval batch completion if in missing data setting
     if mc_mode and x0 is not None:
       batch_comp_err = model.eval_comp_error(x0).cpu()
-    else:
-      batch_comp_err = torch.ones(model.r) * np.nan
 
     if metrics is None:
       metrics = [ut.AverageMeter() for _ in range(len(batch_metrics))]
     for kk in range(len(batch_metrics)):
       metrics[kk].update(batch_metrics[kk].cpu(), batch_size)
-    conf_mats.update(batch_conf_mats, 1)
-    comp_err.update(batch_comp_err, batch_size)
+    if eval_cluster_error:
+      conf_mats.update(batch_conf_mats, 1)
+    if mc_mode:
+      comp_err.update(batch_comp_err, batch_size)
 
     if reset_unused:
       batch_resets = model.reset_unused()
@@ -260,11 +293,13 @@ def train_epoch(model, data_loader, optimizer, device, eval_rank=False,
     if torch.isnan(batch_obj_mean):
       raise RuntimeError('Divergence! NaN objective.')
 
-  rtime = time.time() - epoch_tic
-
-  errors = torch.tensor([ut.eval_cluster_error(conf_mats.sum[ii, :])[0]
-      for ii in range(model.replicates)])
-  conf_mats = conf_mats.sum.numpy()
+  if eval_cluster_error:
+    errors = torch.tensor([ut.eval_cluster_error(conf_mats.sum[ii, :])[0]
+        for ii in range(model.replicates)])
+    conf_mats = conf_mats.sum.numpy()
+  else:
+    errors = torch.ones(model.replicates).mul_(np.nan)
+    conf_mats = None
 
   if eval_rank:
     ranks, svs = model.eval_rank()
@@ -295,6 +330,9 @@ def train_epoch(model, data_loader, optimizer, device, eval_rank=False,
     comp_err = comp_err.numpy()
   else:
     comp_err_stats = []
+    comp_err = np.nan * np.ones((model.replicates,))
+
+  rtime = time.time() - epoch_tic
 
   metrics = torch.stack([errors] + [met.avg for met in metrics])
   metrics_summary = torch.stack([metrics.min(dim=1)[0],
@@ -306,20 +344,24 @@ def train_epoch(model, data_loader, optimizer, device, eval_rank=False,
   metrics_summary = metrics_summary.view(-1).numpy().tolist()
   metrics_summary = (metrics_summary + comp_err_stats + rank_stats +
       [reset_count, sampsec.avg, rtime])
-  return metrics_summary, metrics, conf_mats, svs, resets
+  return metrics_summary, metrics, conf_mats, svs, resets, data_iter
 
 
-def batch_alt_step(model, eval_rank=False, reset_unused=False):
+def batch_alt_step(model, eval_rank=False, reset_unused=False,
+      eval_cluster_error=True):
   """Take one full batch alt min step and record convergence measures."""
   epoch_tic = time.time()
   _, obj, loss, reg_in, reg_out = model.objective()
   model.step()
 
   # eval cluster confusion
-  conf_mats = torch.stack([
-      torch.from_numpy(ut.eval_confusion(model.groups[:, ii],
-          model.true_groups, model.k))
-      for ii in range(model.replicates)])
+  if eval_cluster_error:
+    conf_mats = torch.stack([
+        torch.from_numpy(ut.eval_confusion(model.groups[:, ii],
+            model.true_groups, model.k))
+        for ii in range(model.replicates)])
+  else:
+    conf_mats = None
 
   if reset_unused:
     resets = model.reset_unused()
@@ -336,12 +378,14 @@ def batch_alt_step(model, eval_rank=False, reset_unused=False):
     reset_count = 0
     rep_reset_counts = np.zeros((1, model.r))
 
-  rtime = time.time() - epoch_tic
-  sampsec = model.N / rtime
+  sampsec = model.N / (time.time() - epoch_tic)
 
-  errors = torch.tensor([ut.eval_cluster_error(conf_mats[ii, :])[0]
-      for ii in range(model.replicates)])
-  conf_mats = conf_mats.numpy()
+  if eval_cluster_error:
+    errors = torch.tensor([ut.eval_cluster_error(conf_mats.sum[ii, :])[0]
+        for ii in range(model.replicates)])
+    conf_mats = conf_mats.sum.numpy()
+  else:
+    errors = torch.ones(model.replicates).mul_(np.nan)
 
   if eval_rank:
     ranks, svs = model.eval_rank()
@@ -350,6 +394,8 @@ def batch_alt_step(model, eval_rank=False, reset_unused=False):
     svs = svs.cpu().numpy()
   else:
     rank_stats, svs = [], None
+
+  rtime = (time.time() - epoch_tic)
 
   metrics = torch.stack([errors, obj.cpu(), loss.cpu(), reg_in.cpu(),
       reg_out.cpu()])

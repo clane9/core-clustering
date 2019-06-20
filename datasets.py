@@ -302,3 +302,50 @@ class SynthKMeansDataset(Dataset):
 
   def __getitem__(self, ii):
     return self.X[ii, :], self.groups[ii]
+
+
+class NetflixDataset(Dataset):
+  def __init__(self, fname='nf_prize_446460x16885', center=True,
+        normalize=False):
+    fpath = '{}/datasets/nf_prize_preprocessed/{}.npz'.format(CODE_DIR, fname)
+    with open(fpath, 'rb') as f:
+      f = np.load(f)
+      # tolist required since np.savez doesn't know how to properly handle
+      # sparse matrices. there is probably a better way.
+      self.X = f['nf_train_mat'].tolist().astype(np.float32)
+      self.X_test = f['nf_test_mat'].tolist().astype(np.float32)
+    if center:
+      train_mean = self.X.data.mean()
+      self.X.data -= train_mean
+      self.X_test.data -= train_mean
+
+    self.fname = fname
+    self.center = center
+    self.normalize = normalize
+    self.N, self.D = self.X.shape
+    self.groups, self.classes = None, None
+    return
+
+  def __len__(self):
+    return self.N
+
+  def __getitem__(self, ii):
+    x_miss = self.X[ii, :]
+    x0 = self.X_test[ii, :]
+
+    if self.normalize:
+      xnorm = np.sqrt(self.D * (x_miss.data ** 2).mean())
+      x_miss = x_miss / xnorm
+      x0 = x0 / xnorm
+
+    x_miss = sprs.PadSparseVector(
+        torch.from_numpy(x_miss.indices),
+        torch.from_numpy(x_miss.data),
+        (self.D,))
+    x0 = sprs.PadSparseVector(
+        torch.from_numpy(x0.indices),
+        torch.from_numpy(x0.data),
+        (self.D,))
+
+    grp = torch.tensor(0)
+    return x_miss, grp, x0
