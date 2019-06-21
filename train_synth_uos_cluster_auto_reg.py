@@ -39,10 +39,7 @@ def set_args(args):
       (args.sigma_hat**2 / args.D))
   args.U_frosqr_out_lamb = ((args.min_size / args.k) *
       (1.0 / args.d + args.sigma_hat**2 / args.D))
-
-  # other fixed args
   args.z_lamb = 0.01
-  args.eval_rank = True
   return args
 
 
@@ -97,9 +94,6 @@ if __name__ == '__main__':
   parser.add_argument('--min-size', type=float, default=0.0,
                       help=('Minimum cluster size as fraction relative to 1/n'
                       '[default: 0.0]'))
-  parser.add_argument('--mc-exact', type=ut.boolarg, default=True,
-                      help=('Use exact coeff solution in MC setting '
-                          '[default: 1]'))
   # training settings
   parser.add_argument('--batch-size', type=int, default=100,
                       help='Input batch size for training [default: 100]')
@@ -112,6 +106,10 @@ if __name__ == '__main__':
   parser.add_argument('--scale-grad-freq', type=int, default=20,
                       help=('How often to re-compute local Lipschitz for MF '
                       'formulation [default: 20]'))
+  parser.add_argument('--mc-sparse-encode', type=ut.boolarg, default=True,
+                      help='Sparse encoding in MC setting [default: 1]')
+  parser.add_argument('--mc-sparse-decode', type=ut.boolarg, default=True,
+                      help='Sparse decoding in MC setting  [default: 1]')
   parser.add_argument('--reset-unused', type=ut.boolarg, default=True,
                       help='Reset nearly unused clusters [default: 1]')
   parser.add_argument('--reset-patience', type=int, default=100,
@@ -141,6 +139,8 @@ if __name__ == '__main__':
                       help='Number of workers for data loading [default: 1]')
   parser.add_argument('--seed', type=int, default=2018,
                       help='Training random seed [default: 2018]')
+  parser.add_argument('--eval-rank', type=ut.boolarg, default=False,
+                      help='Evaluate ranks of subspace models [default: 0]')
   parser.add_argument('--chkp-freq', type=int, default=None,
                       help='How often to save checkpoints [default: None]')
   parser.add_argument('--stop-freq', type=int, default=None,

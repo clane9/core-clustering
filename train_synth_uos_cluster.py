@@ -44,6 +44,10 @@ def train_synth_uos_cluster(args):
     # Ng takes precedent if both given
     args.N = args.k * args.Ng
 
+  kwargs = {'num_workers': args.num_workers}
+  # for missing data only
+  store_dense = not (args.mc_sparse_encode and args.mc_sparse_decode)
+  store_sparse = args.mc_sparse_encode or args.mc_sparse_decode
   if args.online:
     if batch_alt_mode:
       raise ValueError(("Online mode not compatible with "
@@ -51,22 +55,26 @@ def train_synth_uos_cluster(args):
     if args.miss_rate > 0:
       synth_dataset = dat.SynthUoSMissOnlineDataset(args.k, args.d, args.D,
           args.N, args.affine, args.sigma, args.theta, args.miss_rate,
-          args.normalize, args.data_seed)
+          args.normalize, store_sparse=store_sparse, store_dense=store_dense,
+          seed=args.data_seed)
+      kwargs['collate_fn'] = dat.missing_data_collate
     else:
       synth_dataset = dat.SynthUoSOnlineDataset(args.k, args.d, args.D,
           args.N, args.affine, args.sigma, args.theta, args.normalize,
-          args.data_seed)
+          seed=args.data_seed)
     shuffle_data = False
   else:
     if args.miss_rate > 0:
       synth_dataset = dat.SynthUoSMissDataset(args.k, args.d, args.D, args.Ng,
           args.affine, args.sigma, args.theta, args.miss_rate, args.normalize,
-          args.data_seed)
+          store_sparse=store_sparse, store_dense=store_dense,
+          seed=args.data_seed)
+      kwargs['collate_fn'] = dat.missing_data_collate
     else:
       synth_dataset = dat.SynthUoSDataset(args.k, args.d, args.D, args.Ng,
-          args.affine, args.sigma, args.theta, args.normalize, args.data_seed)
+          args.affine, args.sigma, args.theta, args.normalize,
+          seed=args.data_seed)
     shuffle_data = True
-  kwargs = {'num_workers': args.num_workers}
   if use_cuda:
     kwargs['pin_memory'] = True
   if batch_alt_mode:
@@ -107,6 +115,8 @@ def train_synth_uos_cluster(args):
     initX = None
 
   tic = time.time()
+  if args.z_lamb is None or args.z_lamb <= 0:
+    args.z_lamb = 0.01
   if args.form == 'batch-alt-proj':
     reg_params = {
         'U_frosqr_in': args.U_frosqr_in_lamb,
@@ -136,14 +146,12 @@ def train_synth_uos_cluster(args):
           'U_frosqr_out': args.U_frosqr_out_lamb / args.z_lamb,
           'z': (args.z_lamb if
               max(args.U_frosqr_in_lamb, args.U_frosqr_out_lamb) > 0
-              else 0.0),
-          'e': 1.0
-      }
-      MCModel = (mod.KSubspaceMCModel if args.mc_exact else
-          mod.KSubspaceMCCorruptModel)
-      model = MCModel(args.model_k, args.model_d, args.D, affine=args.affine,
-          replicates=args.reps, reg_params=reg_params,
-          serial_eval=args.serial_eval, **reset_kwargs)
+              else 0.0)}
+      model = mod.KSubspaceMCModel(args.model_k, args.model_d, args.D,
+          affine=args.affine, replicates=args.reps, reg_params=reg_params,
+          scale_grad_freq=args.scale_grad_freq,
+          sparse_encode=args.mc_sparse_encode,
+          sparse_decode=args.mc_sparse_decode, **reset_kwargs)
     else:
       reg_params = {
           'U_frosqr_in': args.U_frosqr_in_lamb / args.z_lamb,
@@ -264,9 +272,6 @@ if __name__ == '__main__':
   parser.add_argument('--z-lamb', type=float, default=0.01,
                       help=('L2 squared coefficient reg parameter, '
                       'inside assignment [default: 0.01]'))
-  parser.add_argument('--mc-exact', type=ut.boolarg, default=True,
-                      help=('Use exact coeff solution in MC setting '
-                          '[default: 1]'))
   # training settings
   parser.add_argument('--batch-size', type=int, default=100,
                       help='Input batch size for training [default: 100]')
@@ -279,6 +284,10 @@ if __name__ == '__main__':
   parser.add_argument('--scale-grad-freq', type=int, default=20,
                       help=('How often to re-compute local Lipschitz for MF '
                       'formulation [default: 20]'))
+  parser.add_argument('--mc-sparse-encode', type=ut.boolarg, default=True,
+                      help='Sparse encoding in MC setting [default: 1]')
+  parser.add_argument('--mc-sparse-decode', type=ut.boolarg, default=True,
+                      help='Sparse decoding in MC setting  [default: 1]')
   parser.add_argument('--reset-unused', type=ut.boolarg, default=True,
                       help='Reset nearly unused clusters [default: 1]')
   parser.add_argument('--reset-patience', type=int, default=100,
