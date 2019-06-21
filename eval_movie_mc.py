@@ -19,7 +19,6 @@ import datasets as dat
 import models as mod
 import training as tr
 import utils as ut
-import sparse as sprs
 
 
 def main():
@@ -39,15 +38,18 @@ def main():
   torch.manual_seed(args.seed)
 
   # load dataset
+  store_dense = not (args.sparse_encode and args.sparse_decode)
+  store_sparse = args.sparse_encode or args.sparse_decode
   if args.dataset in {'nf_17k', 'nf_1k'}:
     fname = {'nf_17k': 'nf_prize_446460x16885',
         'nf_1k': 'nf_prize_422889x889'}[args.dataset]
     dataset = dat.NetflixDataset(fname=fname, center=args.center,
-        normalize=args.normalize)
+        normalize=args.normalize, store_sparse=store_sparse,
+        store_dense=store_dense)
   kwargs = {
       'num_workers': args.num_workers,
       'batch_size': args.batch_size,
-      'collate_fn': sprs.pad_sparse_collate,
+      'collate_fn': dat.missing_data_collate,
       'shuffle': True,
       'drop_last': True}
   if use_cuda:
@@ -81,19 +83,19 @@ def main():
         (1.0 / args.model_d + args.sigma_hat**2 / dataset.D))
     args.z_lamb = 0.01
 
-  if min(max(args.U_frosqr_in_lamb, args.U_frosqr_out_lamb), args.z_lamb) > 0:
-    reg_params = {
-        'U_frosqr_in': args.U_frosqr_in_lamb / args.z_lamb,
-        'U_frosqr_out': args.U_frosqr_out_lamb / args.z_lamb,
-        'z': (args.z_lamb if
-            max(args.U_frosqr_in_lamb, args.U_frosqr_out_lamb) > 0
-            else 0.0)}
-  else:
-    reg_params = {'U_frosqr_in': 0.0, 'U_frosqr_out': 0.0, 'z': 0.0}
+  if args.z_lamb is None or args.z_lamb <= 0:
+    args.z_lamb = 0.01
+  reg_params = {
+      'U_frosqr_in': args.U_frosqr_in_lamb / args.z_lamb,
+      'U_frosqr_out': args.U_frosqr_out_lamb / args.z_lamb,
+      'z': (args.z_lamb if
+          max(args.U_frosqr_in_lamb, args.U_frosqr_out_lamb) > 0
+          else 0.0)}
 
   model = mod.KSubspaceMCModel(args.model_k, args.model_d, dataset.D,
       affine=args.affine, replicates=args.reps, reg_params=reg_params,
-      scale_grad_freq=args.scale_grad_freq, norm_comp_error=args.normalize,
+      scale_grad_freq=args.scale_grad_freq, sparse_encode=args.sparse_encode,
+      sparse_decode=args.sparse_decode, norm_comp_error=args.normalize,
       **reset_kwargs)
   model = model.to(device)
 
@@ -186,6 +188,10 @@ if __name__ == '__main__':
   parser.add_argument('--scale-grad-freq', type=int, default=20,
                       help=('How often to re-compute local Lipschitz for MF '
                       'formulation [default: 20]'))
+  parser.add_argument('--sparse-encode', type=ut.boolarg, default=True,
+                      help='Sparse encoding [default: 1]')
+  parser.add_argument('--sparse-decode', type=ut.boolarg, default=True,
+                      help='Sparse decoding [default: 1]')
   parser.add_argument('--reset-unused', type=ut.boolarg, default=True,
                       help='Reset nearly unused clusters [default: 1]')
   parser.add_argument('--reset-patience', type=int, default=100,

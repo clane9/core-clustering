@@ -106,6 +106,10 @@ if __name__ == '__main__':
   parser.add_argument('--scale-grad-freq', type=int, default=20,
                       help=('How often to re-compute local Lipschitz for MF '
                       'formulation [default: 20]'))
+  parser.add_argument('--mc-sparse-encode', type=ut.boolarg, default=True,
+                      help='Sparse encoding in MC setting [default: 1]')
+  parser.add_argument('--mc-sparse-decode', type=ut.boolarg, default=True,
+                      help='Sparse decoding in MC setting  [default: 1]')
   parser.add_argument('--reset-unused', type=ut.boolarg, default=True,
                       help='Reset nearly unused clusters [default: 1]')
   parser.add_argument('--reset-patience', type=int, default=100,

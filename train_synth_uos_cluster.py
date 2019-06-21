@@ -19,7 +19,6 @@ import datasets as dat
 import models as mod
 import training as tr
 import utils as ut
-import sparse as sprs
 
 
 def train_synth_uos_cluster(args):
@@ -46,7 +45,9 @@ def train_synth_uos_cluster(args):
     args.N = args.k * args.Ng
 
   kwargs = {'num_workers': args.num_workers}
-
+  # for missing data only
+  store_dense = not (args.mc_sparse_encode and args.mc_sparse_decode)
+  store_sparse = args.mc_sparse_encode or args.mc_sparse_decode
   if args.online:
     if batch_alt_mode:
       raise ValueError(("Online mode not compatible with "
@@ -54,8 +55,9 @@ def train_synth_uos_cluster(args):
     if args.miss_rate > 0:
       synth_dataset = dat.SynthUoSMissOnlineDataset(args.k, args.d, args.D,
           args.N, args.affine, args.sigma, args.theta, args.miss_rate,
-          args.normalize, seed=args.data_seed)
-      kwargs['collate_fn'] = sprs.pad_sparse_collate
+          args.normalize, store_sparse=store_sparse, store_dense=store_dense,
+          seed=args.data_seed)
+      kwargs['collate_fn'] = dat.missing_data_collate
     else:
       synth_dataset = dat.SynthUoSOnlineDataset(args.k, args.d, args.D,
           args.N, args.affine, args.sigma, args.theta, args.normalize,
@@ -65,8 +67,9 @@ def train_synth_uos_cluster(args):
     if args.miss_rate > 0:
       synth_dataset = dat.SynthUoSMissDataset(args.k, args.d, args.D, args.Ng,
           args.affine, args.sigma, args.theta, args.miss_rate, args.normalize,
+          store_sparse=store_sparse, store_dense=store_dense,
           seed=args.data_seed)
-      kwargs['collate_fn'] = sprs.pad_sparse_collate
+      kwargs['collate_fn'] = dat.missing_data_collate
     else:
       synth_dataset = dat.SynthUoSDataset(args.k, args.d, args.D, args.Ng,
           args.affine, args.sigma, args.theta, args.normalize,
@@ -112,6 +115,8 @@ def train_synth_uos_cluster(args):
     initX = None
 
   tic = time.time()
+  if args.z_lamb is None or args.z_lamb <= 0:
+    args.z_lamb = 0.01
   if args.form == 'batch-alt-proj':
     reg_params = {
         'U_frosqr_in': args.U_frosqr_in_lamb,
@@ -141,12 +146,12 @@ def train_synth_uos_cluster(args):
           'U_frosqr_out': args.U_frosqr_out_lamb / args.z_lamb,
           'z': (args.z_lamb if
               max(args.U_frosqr_in_lamb, args.U_frosqr_out_lamb) > 0
-              else 0.0),
-          'e': 1.0
-      }
+              else 0.0)}
       model = mod.KSubspaceMCModel(args.model_k, args.model_d, args.D,
           affine=args.affine, replicates=args.reps, reg_params=reg_params,
-          **reset_kwargs)
+          scale_grad_freq=args.scale_grad_freq,
+          sparse_encode=args.mc_sparse_encode,
+          sparse_decode=args.mc_sparse_decode, **reset_kwargs)
     else:
       reg_params = {
           'U_frosqr_in': args.U_frosqr_in_lamb / args.z_lamb,
@@ -279,6 +284,10 @@ if __name__ == '__main__':
   parser.add_argument('--scale-grad-freq', type=int, default=20,
                       help=('How often to re-compute local Lipschitz for MF '
                       'formulation [default: 20]'))
+  parser.add_argument('--mc-sparse-encode', type=ut.boolarg, default=True,
+                      help='Sparse encoding in MC setting [default: 1]')
+  parser.add_argument('--mc-sparse-decode', type=ut.boolarg, default=True,
+                      help='Sparse decoding in MC setting  [default: 1]')
   parser.add_argument('--reset-unused', type=ut.boolarg, default=True,
                       help='Reset nearly unused clusters [default: 1]')
   parser.add_argument('--reset-patience', type=int, default=100,

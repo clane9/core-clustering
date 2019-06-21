@@ -1251,15 +1251,15 @@ class KSubspaceMCModel(KSubspaceMFModel):
   default_reg_params = {
       'U_frosqr_in': 0.01,
       'U_frosqr_out': 1e-4,
-      'z': 0.01,
-      'e': 1.0  # not meaningful in this case
+      'z': 0.01
   }
   assign_reg_terms = {'U_frosqr_in', 'z', 'e'}
 
   def __init__(self, k, d, D, affine=False, replicates=5, reg_params={},
         reset_patience=100, reset_try_tol=0.01, reset_max_steps=50,
         reset_accept_tol=1e-3, reset_sigma=0.0, reset_cache_size=500,
-        temp_scheduler=None, scale_grad_freq=100, norm_comp_error=True):
+        temp_scheduler=None, scale_grad_freq=100, sparse_encode=True,
+        sparse_decode=False, norm_comp_error=True):
 
     super().__init__(k, d, D,
         affine=affine, replicates=replicates, reg_params=reg_params,
@@ -1268,11 +1268,16 @@ class KSubspaceMCModel(KSubspaceMFModel):
         reset_sigma=reset_sigma, reset_cache_size=reset_cache_size,
         temp_scheduler=temp_scheduler, scale_grad_freq=scale_grad_freq)
 
+    self.sparse_encode = sparse_encode
+    self.sparse_decode = sparse_decode
     self.norm_comp_error = norm_comp_error
-    self.maskUs = None
+    self.repUs = None
+    self.repbs = None
 
     self.cache_z = True
     self.z = None
+    self.cache_x_ = not sparse_decode
+    self.x_ = None
     return
 
   def loss(self, x):
@@ -1285,10 +1290,16 @@ class KSubspaceMCModel(KSubspaceMFModel):
     Returns:
       loss: shape (batch_size, r, k)
     """
-    # (r, k, batch_size, max_nnz)
     x_ = self(x)
-    # (r, k, batch_size)
-    loss = torch.sum((x_ - x.values)**2, dim=-1).mul(0.5)
+    # loss (r, k, batch_size)
+    if self.sparse_decode:
+      # x_ assumed (r, k, batch_size, pad_nnz)
+      loss = torch.sum(((x_ * x.omega_float) - x.values)**2,
+          dim=-1).mul(0.5)
+    else:
+      # x_ assumed (r, k, batch_size, D)
+      loss = torch.sum(((x_ * x.omega_float_dense) - x.values_dense)**2,
+          dim=-1).mul(0.5)
     # (batch_size, r, k)
     loss = loss.permute(2, 0, 1)
     return loss
@@ -1303,56 +1314,81 @@ class KSubspaceMCModel(KSubspaceMFModel):
       x_: reconstruction, shape (r, k, batch_size, D)
     """
     z = self.encode(x)
-    x_ = self.decode(z, x)
-    self._update_forward_cache(z)
+    x_ = self.decode(z, x, compute_repUs=False)
+    self._update_forward_cache(z, x_)
     return x_
 
   def encode(self, x):
     """Encode x by vectorized (hence parallelizable) (r*k*batch_size)
-    O(max_nnz) least-squares problems."""
+    O(pad_nnz) least-squares problems."""
     # Us shape (r, k, D, d)
     # bs shape (r, k, D)
     batch_size = x.shape[0]
-    max_nnz = x.max_nnz
 
-    # (r, k, batch_size, max_nnz, d)
-    repUs = self.Us.data[:, :, x.indices, :]
-    repUs.mul_(x.omega.float().view(1, 1, batch_size, max_nnz, 1))
-    # (batch_size, max_nnz)
-    xval = x.values
-    if self.affine:
-      # (r, k, batch_size, max_nnz)
-      repbs = self.bs.data[:, :, x.indices]
-      # (r, k, batch_size, max_nnz, 1)
-      xval = xval.sub(repbs).unsqueeze(4)
+    if self.sparse_encode:
+      # (r, k, batch_size, pad_nnz, d)
+      # cache before zeroing out
+      self.repUs = self.Us[:, :, x.indices, :]
+      self.repUs = self.repUs.mul(x.omega_float.unsqueeze(2))
     else:
-      # (batch_size, max_nnz, 1)
-      xval = xval.unsqueeze(2)
+      # (r, k, batch_size, D, d)
+      if (self.repUs is None or self.repUs.shape[2] != batch_size):
+        self.repUs = torch.zeros(self.r, self.k, batch_size, self.D, self.d,
+            device=self.Us.device)
+      self.repUs.copy_(self.Us.data.unsqueeze(2))
+      self.repUs.mul_(x.omega_float_dense.unsqueeze(2))
+
+    # (batch_size, *)
+    xval = x.values if self.sparse_encode else x.values_dense
+    if self.affine:
+      if self.sparse_encode:
+        # (r, k, batch_size, pad_nnz)
+        self.repbs = self.bs[:, :, x.indices]
+        # (r, k, batch_size, pad_nnz)
+        xval = xval.sub(self.repbs.detach())
+      else:
+        # (r, k, batch_size, D)
+        xval = xval.sub(self.bs.unsqueeze(2))
+    # (r, k, batch_size, *, 1)
+    xval = xval.unsqueeze(-1)
 
     # (r, k, batch_size, d)
-    z = ut.batch_ridge(xval, repUs, lamb=self.reg_params['z']).squeeze(4)
+    z = ut.batch_ridge(xval, self.repUs.detach(),
+        lamb=self.reg_params['z']).squeeze(4)
     return z
 
-  def decode(self, z, x):
+  def decode(self, z, x, compute_repUs=True):
     """Encode x by vectorized (hence parallelizable) (r*k*batch_size)
-    O(max_nnz) mat-vec products."""
+    O(pad_nnz) mat-vec products."""
     # x_ = U z + b
-    # (r, k, batch_size, max_nnz, d)
-    repUs = self.Us[:, :, x.indices, :]
-    # (r, k, batch_size, max_nnz)
-    x0_ = torch.matmul(repUs, z.unsqueeze(4)).squeeze(4)
-    if self.affine:
-      # (r, k, batch_size, max_nnz)
-      repbs = self.bs[:, :, x.indices]
-      x0_ = x0_.add(repbs)
-    x_ = x0_ * x.omega.float()
+    # Us shape (r, k, D, d)
+    # bs shape (r, k, D)
+    if self.sparse_decode:
+      # repUs (r, k, batch_size, pad_nnz, d)
+      if compute_repUs:
+        self.repUs = self.Us[:, :, x.indices, :]
+      # (r, k, batch_size, pad_nnz)
+      x_ = torch.matmul(self.repUs, z.unsqueeze(4)).squeeze(4)
+
+      if self.affine:
+        # repbs (r, k, batch_size, pad_nnz)
+        if compute_repUs:
+          self.repbs = self.bs[:, :, x.indices]
+        x_ = x_.add(self.repbs)
+    else:
+      # (r, k, batch_size, D)
+      x_ = torch.matmul(z, self.Us.transpose(2, 3))
+      if self.affine:
+        x_ = x_.add(self.bs.unsqueeze(2))
     return x_
 
-  def _update_forward_cache(self, z):
+  def _update_forward_cache(self, z, x_):
     """Update any cached values from forward call."""
     self.z_frosqr = z.data.pow(2).sum(dim=-1)
     if self.cache_z:
       self.z = z.data
+    if self.cache_x_:
+      self.x_ = x_.data
     return
 
   def eval_shrink(self, x, x_):
@@ -1368,22 +1404,30 @@ class KSubspaceMCModel(KSubspaceMFModel):
     Returns:
       comp_err: rmse relative to mean squared magnitude of x0.
     """
-    with torch.no_grad():
-      batch_size = x0.shape[0]
-      assert(batch_size == self.groups.shape[0])
-      if x0.max_nnz == 0:
-        return torch.zeros(self.r, device=x0.device)
+    batch_size = x0.shape[0]
+    assert(batch_size == self.groups.shape[0])
+    if x0.max_nnz == 0:
+      return torch.zeros(self.r, device=x0.device)
 
-      # (r, k, batch_size, max_nnz)
-      x0_ = self.decode(self.z, x0)
-      # (r, batch_size, max_nnz)
+    with torch.no_grad():
+      if self.sparse_decode:
+        # (r, k, batch_size, max_nnz)
+        x0_ = self.decode(self.z, x0)
+      else:
+        # (r, k, batch_size, D)
+        x0_ = self.x_
+
+      # (r, batch_size, *)
       rIdx = torch.arange(self.r).view(-1, 1)
       batchIdx = torch.arange(batch_size).view(1, -1)
       x0_ = x0_[rIdx, self.groups.t(), batchIdx, :]
       # (r, total_nnz)
-      x0_ = x0_[:, x0.omega]
+      x0_ = x0_[:, x0.omega] if self.sparse_decode else x0_[:, x0.omega_dense]
       # (total_nnz,)
-      x0 = x0.values[x0.omega]
+      if x0.store_sparse:
+        x0 = x0.values[x0.omega]
+      else:
+        x0 = x0.values_dense[x0.omega_dense]
 
       # (r, )
       denom = x0.pow(2).mean() if self.norm_comp_error else 1.0
