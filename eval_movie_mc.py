@@ -83,14 +83,13 @@ def main():
         (1.0 / args.model_d + args.sigma_hat**2 / dataset.D))
     args.z_lamb = 0.01
 
-  if args.z_lamb is None or args.z_lamb <= 0:
-    args.z_lamb = 0.01
+  if args.z_lamb > 0:
+    args.U_frosqr_in_lamb /= args.z_lamb
+    args.U_frosqr_out_lamb /= args.z_lamb
   reg_params = {
-      'U_frosqr_in': args.U_frosqr_in_lamb / args.z_lamb,
-      'U_frosqr_out': args.U_frosqr_out_lamb / args.z_lamb,
-      'z': (args.z_lamb if
-          max(args.U_frosqr_in_lamb, args.U_frosqr_out_lamb) > 0
-          else 0.0)}
+      'U_frosqr_in': args.U_frosqr_in_lamb,
+      'U_frosqr_out': args.U_frosqr_out_lamb,
+      'z': args.z_lamb}
 
   model = mod.KSubspaceMCModel(args.model_k, args.model_d, dataset.D,
       affine=args.affine, replicates=args.reps, reg_params=reg_params,

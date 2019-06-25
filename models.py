@@ -802,8 +802,14 @@ class KSubspaceMFModel(KSubspaceBaseModel):
       Lip = np.linalg.norm(Hess.cpu().numpy(), ord=2, axis=(2, 3))
       Lip = torch.from_numpy(Lip).to(device)
       # (r,)
-      self.Lip = Lip.max(dim=1)[0].view(self.r, 1, 1, 1)
-    Grad_scale = Grad.div(self.Lip)
+      Lip = Lip.max(dim=1)[0].view(self.r)
+      if self.Lip is None:
+        self.Lip = Lip
+      else:
+        self.Lip.mul_(EMA_DECAY).add_(1-EMA_DECAY, Lip)
+
+    Grad_scale = Grad.div(self.Lip.view((self.r,) + (Grad.dim()-1) * (1,)))
+    print(self.Lip.shape, Grad.shape, Grad_scale.shape)
     if update:
       self.steps += 1
     return Grad_scale
