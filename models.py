@@ -301,7 +301,7 @@ class KSubspaceBaseModel(nn.Module):
     if self.k > 1:
       value = torch.zeros_like(assign_obj)
       value = value.scatter_(2, groups.unsqueeze(2),
-          (top2obj[:, :, [1]] - top2obj[:, :, [0]])).mean(dim=0)
+          (top2obj[:, :, 1] - top2obj[:, :, 0]).unsqueeze(2)).mean(dim=0)
     else:
       value = torch.ones(tmpr, self.k, device=device)
     return groups, min_assign_obj, c, c_mean, value
@@ -809,7 +809,6 @@ class KSubspaceMFModel(KSubspaceBaseModel):
         self.Lip.mul_(EMA_DECAY).add_(1-EMA_DECAY, Lip)
 
     Grad_scale = Grad.div(self.Lip.view((self.r,) + (Grad.dim()-1) * (1,)))
-    print(self.Lip.shape, Grad.shape, Grad_scale.shape)
     if update:
       self.steps += 1
     return Grad_scale

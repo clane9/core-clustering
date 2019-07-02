@@ -115,25 +115,26 @@ def train_synth_uos_cluster(args):
     initX = None
 
   tic = time.time()
-  if args.z_lamb is None or args.z_lamb <= 0:
-    args.z_lamb = 0.01
-  if args.form == 'batch-alt-proj':
+
+  if 'mf' in args.form:
+    if args.z_lamb > 0:
+      args.U_frosqr_in_lamb /= args.z_lamb
+      args.U_frosqr_out_lamb /= args.z_lamb
     reg_params = {
         'U_frosqr_in': args.U_frosqr_in_lamb,
-        'U_frosqr_out': args.U_frosqr_out_lamb
-    }
+        'U_frosqr_out': args.U_frosqr_out_lamb,
+        'z': args.z_lamb}
+  else:
+    reg_params = {
+        'U_frosqr_in': args.U_frosqr_in_lamb,
+        'U_frosqr_out': args.U_frosqr_out_lamb}
+
+  if args.form == 'batch-alt-proj':
     model = mod.KSubspaceBatchAltProjModel(args.model_k, args.model_d,
         synth_dataset, affine=args.affine, replicates=args.reps,
         reg_params=reg_params, serial_eval=args.serial_eval,
         svd_solver='randomized', **reset_kwargs)
   elif args.form == 'batch-alt-mf':
-    reg_params = {
-        'U_frosqr_in': args.U_frosqr_in_lamb / args.z_lamb,
-        'U_frosqr_out': args.U_frosqr_out_lamb / args.z_lamb,
-        'z': (args.z_lamb if
-            max(args.U_frosqr_in_lamb, args.U_frosqr_out_lamb) > 0
-            else 0.0)
-    }
     model = mod.KSubspaceBatchAltMFModel(args.model_k, args.model_d,
         synth_dataset, affine=args.affine, replicates=args.reps,
         reg_params=reg_params, serial_eval=args.serial_eval,
@@ -141,34 +142,17 @@ def train_synth_uos_cluster(args):
         initk=args.init_k, **reset_kwargs)
   elif args.form == 'mf':
     if args.miss_rate > 0:
-      reg_params = {
-          'U_frosqr_in': args.U_frosqr_in_lamb / args.z_lamb,
-          'U_frosqr_out': args.U_frosqr_out_lamb / args.z_lamb,
-          'z': (args.z_lamb if
-              max(args.U_frosqr_in_lamb, args.U_frosqr_out_lamb) > 0
-              else 0.0)}
       model = mod.KSubspaceMCModel(args.model_k, args.model_d, args.D,
           affine=args.affine, replicates=args.reps, reg_params=reg_params,
           scale_grad_freq=args.scale_grad_freq,
           sparse_encode=args.mc_sparse_encode,
           sparse_decode=args.mc_sparse_decode, **reset_kwargs)
     else:
-      reg_params = {
-          'U_frosqr_in': args.U_frosqr_in_lamb / args.z_lamb,
-          'U_frosqr_out': args.U_frosqr_out_lamb / args.z_lamb,
-          'z': (args.z_lamb if
-              max(args.U_frosqr_in_lamb, args.U_frosqr_out_lamb) > 0
-              else 0.0)
-      }
       model = mod.KSubspaceMFModel(args.model_k, args.model_d, args.D,
           affine=args.affine, replicates=args.reps, reg_params=reg_params,
           serial_eval=args.serial_eval, scale_grad_freq=args.scale_grad_freq,
           init=args.init, initX=initX, initk=args.init_k, **reset_kwargs)
   elif args.form == 'proj':
-    reg_params = {
-        'U_frosqr_in': args.U_frosqr_in_lamb,
-        'U_frosqr_out': args.U_frosqr_out_lamb
-    }
     model = mod.KSubspaceProjModel(args.model_k, args.model_d, args.D,
         affine=args.affine, replicates=args.reps, reg_params=reg_params,
         serial_eval=args.serial_eval, **reset_kwargs)
