@@ -514,29 +514,26 @@ class MissingDataSample(object):
       raise ValueError("pad_nnz > D")
     if self.nnz > pad_nnz:
       raise ValueError("sparse vector nnz > pad_nnz.")
-    if self.pad_nnz == pad_nnz or not self.store_sparse:
+
+    # do nothing if not storing sparse format
+    if not self.store_sparse:
       return
 
-    indices = self.indices.cpu().numpy()
-    values = self.values.cpu().numpy()
-    omega = self.omega.cpu().numpy() > 0
-    if self.pad_nnz > self.nnz:
-      indices = indices[omega]
-      values = values[omega]
-
-    # these set operations are probably inefficient, the approach could be
-    # improved
-    pad_indices = np.setdiff1d(np.arange(pad_nnz), indices, assume_unique=True)
-    pad_indices = pad_indices[:pad_nnz - self.nnz]
-    pad_indices = np.union1d(pad_indices, indices)
-    pad_omega = np.isin(pad_indices, indices, assume_unique=True)
-    pad_values = np.zeros(pad_indices.shape, dtype=values.dtype)
-    pad_values[pad_omega] = values
-
-    self.pad_nnz = pad_nnz
-    self.indices = torch.from_numpy(pad_indices)
-    self.values = torch.from_numpy(pad_values)
-    self.omega = torch.from_numpy(pad_omega.astype(np.uint8))
+    if self.pad_nnz > pad_nnz:
+      # strip leading padded values
+      nstrip = self.pad_nnz - pad_nnz
+      self.indices = self.indices[nstrip:]
+      self.values = self.values[nstrip:]
+      self.omega = self.omega[nstrip:]
+    elif self.pad_nnz < pad_nnz:
+      # pad with leading zeros
+      npad = pad_nnz - self.pad_nnz
+      self.indices = torch.cat([torch.zeros(npad, dtype=torch.int64),
+          self.indices])
+      self.values = torch.cat([torch.zeros(npad, dtype=torch.float32),
+          self.values])
+      self.omega = torch.cat([torch.zeros(npad, dtype=torch.uint8),
+          self.omega])
     return
 
 
