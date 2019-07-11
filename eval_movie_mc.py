@@ -59,9 +59,9 @@ def main():
   # construct model
   reset_kwargs = dict(reset_patience=args.reset_patience,
       reset_try_tol=args.reset_try_tol,
+      reset_cand_metric=args.reset_metric,
       reset_max_steps=args.reset_max_steps,
       reset_accept_tol=args.reset_accept_tol,
-      reset_sigma=args.reset_sigma,
       reset_cache_size=args.reset_cache_size,
       temp_scheduler=mod.GeoTempScheduler(init_temp=0.1, replicates=args.reps,
           patience=1, gamma=0.9))
@@ -93,12 +93,16 @@ def main():
 
   model = mod.KSubspaceMCModel(args.model_k, args.model_d, dataset.D,
       affine=args.affine, replicates=args.reps, reg_params=reg_params,
-      scale_grad_freq=args.scale_grad_freq, sparse_encode=args.sparse_encode,
-      sparse_decode=args.sparse_decode, norm_comp_error=args.normalize,
-      **reset_kwargs)
+      scale_grad_mode=args.scale_grad_mode,
+      scale_grad_update_freq=args.scale_grad_update_freq,
+      sparse_encode=args.sparse_encode, sparse_decode=args.sparse_decode,
+      norm_comp_error=args.normalize, **reset_kwargs)
   model = model.to(device)
 
-  if args.optim == 'SGD':
+  if args.form == 'mf' and args.scale_grad_mode == 'newton':
+    optimizer = torch.optim.SGD(model.parameters(), lr=args.init_lr,
+        momentum=0.0)
+  elif args.optim == 'SGD':
     optimizer = torch.optim.SGD(model.parameters(), lr=args.init_lr,
         momentum=0.9, nesterov=True)
   elif args.optim == 'Adam':
@@ -184,8 +188,11 @@ if __name__ == '__main__':
                       help='Optimizer [default: SGD]')
   parser.add_argument('--init-lr', type=float, default=0.5,
                       help='Initial learning rate [default: 0.5]')
-  parser.add_argument('--scale-grad-freq', type=int, default=20,
-                      help=('How often to re-compute local Lipschitz for MF '
+  parser.add_argument('--scale-grad-mode', type=str, default=None,
+                      help=('Gradient scaling mode (none, lip, newton) '
+                      '[default: None]'))
+  parser.add_argument('--scale-grad-update-freq', type=int, default=20,
+                      help=('How often to re-compute gradient scaling for MF '
                       'formulation [default: 20]'))
   parser.add_argument('--sparse-encode', type=ut.boolarg, default=True,
                       help='Sparse encoding [default: 1]')
@@ -193,6 +200,9 @@ if __name__ == '__main__':
                       help='Sparse decoding [default: 1]')
   parser.add_argument('--reset-unused', type=ut.boolarg, default=True,
                       help='Reset nearly unused clusters [default: 1]')
+  parser.add_argument('--reset-metric', type=str, default='obj_decr',
+                      help=('Metric used to sample swap candidates '
+                      '(obj_decr, value) [default: obj_decr]'))
   parser.add_argument('--reset-patience', type=int, default=100,
                       help=('Steps to wait without obj decrease '
                       'before trying to reset [default: 100]'))
@@ -201,12 +211,9 @@ if __name__ == '__main__':
                       'when to reset [default: 0.01]'))
   parser.add_argument('--reset-max-steps', type=int, default=50,
                       help='Number of reset SA iterations [default: 50]')
-  parser.add_argument('--reset-accept-tol', type=float, default=0.01,
+  parser.add_argument('--reset-accept-tol', type=float, default=0.001,
                       help=('Objective decrease tolerance for accepting'
-                      'a reset [default: 0.01]'))
-  parser.add_argument('--reset-sigma', type=float, default=0.0,
-                      help=('Scale of perturbation to add after reset '
-                      '[default: 0.0]'))
+                      'a reset [default: 0.001]'))
   parser.add_argument('--reset-cache-size', type=int, default=500,
                       help='Num samples for reset assign obj [default: 500]')
   parser.add_argument('--cuda', type=ut.boolarg, default=False,

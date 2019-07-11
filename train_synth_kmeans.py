@@ -43,16 +43,19 @@ def train_synth_kmeans_cluster(args):
   }
   if args.reset_cache_size is not None and args.reset_cache_size <= 0:
     args.reset_cache_size = synth_dataset.N
+  reset_kwargs = dict(reset_patience=args.reset_patience,
+      reset_try_tol=args.reset_try_tol,
+      reset_cand_metric=args.reset_metric,
+      reset_max_steps=args.reset_max_steps,
+      reset_accept_tol=args.reset_accept_tol,
+      reset_cache_size=args.reset_cache_size,
+      temp_scheduler=mod.GeoTempScheduler(init_temp=0.1, replicates=args.reps,
+          patience=1, gamma=0.9))
 
   tic = time.time()
   model = mod.KMeansBatchAltModel(args.model_k, synth_dataset, init=args.init,
       replicates=args.reps, reg_params=reg_params,
-      reset_patience=args.reset_patience, reset_jitter=args.reset_jitter,
-      reset_try_tol=args.reset_try_tol, reset_accept_tol=args.reset_accept_tol,
-      reset_stochastic=args.reset_stochastic,
-      reset_low_value=args.reset_low_value,
-      reset_value_thr=args.reset_value_thr, reset_sigma=args.reset_sigma,
-      reset_cache_size=args.reset_cache_size, kpp_n_trials=args.kpp_n_trials)
+      kpp_n_trials=args.kpp_n_trials, **reset_kwargs)
 
   init_time = time.time() - tic
   model = model.to(device)
@@ -110,28 +113,22 @@ if __name__ == '__main__':
   parser.add_argument('--reset-patience', type=int, default=2,
                       help=('Epochs to wait without obj decrease '
                       'before trying to reset [default: 2]'))
-  parser.add_argument('--reset-jitter', type=ut.boolarg, default=True,
-                      help='Jitter reset patience [default: 1]')
-  parser.add_argument('--reset-low-value', type=ut.boolarg, default=False,
-                      help='Choose low value cluster to reset [default: 0]')
-  parser.add_argument('--reset-value-thr', type=float, default=0.1,
-                      help=('Value threshold for low value clusters '
-                      '[default: 0.1]'))
-  parser.add_argument('--reset-stochastic', type=ut.boolarg, default=True,
-                      help=('Choose reset substitution stochastically '
-                      '[default: 1]'))
+  parser.add_argument('--reset-metric', type=str, default='obj_decr',
+                      help=('Metric used to sample swap candidates '
+                      '(obj_decr, value) [default: obj_decr]'))
+  parser.add_argument('--reset-patience', type=int, default=100,
+                      help=('Steps to wait without obj decrease '
+                      'before trying to reset [default: 100]'))
   parser.add_argument('--reset-try-tol', type=float, default=0.01,
                       help=('Objective decrease tolerance for deciding'
                       'when to reset [default: 0.01]'))
-  parser.add_argument('--reset-accept-tol', type=float, default=0.01,
+  parser.add_argument('--reset-max-steps', type=int, default=50,
+                      help='Number of reset SA iterations [default: 50]')
+  parser.add_argument('--reset-accept-tol', type=float, default=0.001,
                       help=('Objective decrease tolerance for accepting'
-                      'a reset [default: 1e-3]'))
-  parser.add_argument('--reset-sigma', type=float, default=0.05,
-                      help=('Scale of perturbation to add after reset '
-                      '[default: 0.05]'))
-  parser.add_argument('--reset-cache-size', type=int, default=None,
-                      help=('Num samples for reset assign obj '
-                      '[default: 4 k log k]'))
+                      'a reset [default: 0.001]'))
+  parser.add_argument('--reset-cache-size', type=int, default=500,
+                      help='Num samples for reset assign obj [default: 500]')
   parser.add_argument('--cuda', type=ut.boolarg, default=False,
                       help='Enable CUDA training [default: 0]')
   parser.add_argument('--num-threads', type=int, default=1,

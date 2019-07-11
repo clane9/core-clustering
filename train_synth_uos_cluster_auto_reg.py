@@ -103,8 +103,11 @@ if __name__ == '__main__':
                       help='Optimizer [default: SGD]')
   parser.add_argument('--init-lr', type=float, default=0.5,
                       help='Initial learning rate [default: 0.5]')
-  parser.add_argument('--scale-grad-freq', type=int, default=20,
-                      help=('How often to re-compute local Lipschitz for MF '
+  parser.add_argument('--scale-grad-mode', type=str, default=None,
+                      help=('Gradient scaling mode (none, lip, newton) '
+                      '[default: None]'))
+  parser.add_argument('--scale-grad-update-freq', type=int, default=20,
+                      help=('How often to re-compute gradient scaling for MF '
                       'formulation [default: 20]'))
   parser.add_argument('--mc-sparse-encode', type=ut.boolarg, default=True,
                       help='Sparse encoding in MC setting [default: 1]')
@@ -112,6 +115,9 @@ if __name__ == '__main__':
                       help='Sparse decoding in MC setting  [default: 1]')
   parser.add_argument('--reset-unused', type=ut.boolarg, default=True,
                       help='Reset nearly unused clusters [default: 1]')
+  parser.add_argument('--reset-metric', type=str, default='obj_decr',
+                      help=('Metric used to sample swap candidates '
+                      '(obj_decr, value) [default: obj_decr]'))
   parser.add_argument('--reset-patience', type=int, default=100,
                       help=('Steps to wait without obj decrease '
                       'before trying to reset [default: 100]'))
@@ -120,12 +126,9 @@ if __name__ == '__main__':
                       'when to reset [default: 0.01]'))
   parser.add_argument('--reset-max-steps', type=int, default=50,
                       help='Number of reset SA iterations [default: 50]')
-  parser.add_argument('--reset-accept-tol', type=float, default=0.01,
+  parser.add_argument('--reset-accept-tol', type=float, default=0.001,
                       help=('Objective decrease tolerance for accepting'
-                      'a reset [default: 0.01]'))
-  parser.add_argument('--reset-sigma', type=float, default=0.0,
-                      help=('Scale of perturbation to add after reset '
-                      '[default: 0.0]'))
+                      'a reset [default: 0.001]'))
   parser.add_argument('--reset-cache-size', type=int, default=500,
                       help='Num samples for reset assign obj [default: 500]')
   parser.add_argument('--serial-eval', type=str, default=None,

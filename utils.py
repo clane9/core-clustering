@@ -502,3 +502,26 @@ def aggregate_resets(resets):
       ['{}.{}'.format(met, meas) for met in ['obj.decr', 'cumu.obj.decr']
           for meas in ['min', 'med', 'max']] + ['temp'])
   return agg_resets
+
+
+def set_auto_reg_params(k, d, D, Ng, sigma_hat, min_size=0.0):
+  """Compute "optimal" regularization parameters based on expected singular
+  value distribution.
+
+  Key resource is (Gavish & Donoho, 2014). In general, we know that the noise
+  singular values will have a right bulk edge at:
+      (sqrt{N_j} + sqrt{D - d}) (\sigma / sqrt{D})
+  whereas the data singular values will have a right bulk edge at:
+      (sqrt{N_j} + sqrt{d}) sqrt{1/ d + \sigma^2 / D}
+  The regularization parameters are set so that the "inside reg" will threshold
+  all noise svs, whereas the "outside reg" will threshold all noise + data svs
+  as soon as the cluster becomes too small.
+  """
+  if sigma_hat < 0:
+    raise ValueError("sigma hat {} should be >= 0.".format(sigma_hat))
+  if min_size >= 1 or min_size < 0:
+    raise ValueError("min size {} should be in [0, 1).".format(min_size))
+  U_frosqr_in_lamb = ((1.0 + np.sqrt((D - d)/Ng))**2 * (sigma_hat**2 / D))
+  U_frosqr_out_lamb = ((min_size / k) * (1.0 / d + sigma_hat**2 / D))
+  z_lamb = 0.01
+  return U_frosqr_in_lamb, U_frosqr_out_lamb, z_lamb

@@ -20,8 +20,8 @@ class KSubspaceBaseModel(nn.Module):
 
   def __init__(self, k, d, D, affine=False, replicates=5, reg_params={},
         serial_eval={}, reset_patience=100, reset_try_tol=0.01,
-        reset_max_steps=50, reset_accept_tol=1e-3, reset_sigma=0.0,
-        reset_cache_size=500, temp_scheduler=None):
+        reset_cand_metric='obj_decr', reset_max_steps=50,
+        reset_accept_tol=1e-3, reset_cache_size=500, temp_scheduler=None):
 
     if replicates < 1:
       raise ValueError("Invalid replicates parameter {}".format(replicates))
@@ -38,12 +38,9 @@ class KSubspaceBaseModel(nn.Module):
     if reset_patience <= 0:
       raise ValueError("Invalid reset_patience parameter {}".format(
           reset_patience))
-    if reset_try_tol <= 0:
-      raise ValueError("Invalid reset_try_tol parameter {}".format(
-          reset_try_tol))
-    if reset_sigma < 0:
-      raise ValueError("Invalid reset_sigma parameter {}".format(
-          reset_sigma))
+    if reset_cand_metric not in {'obj_decr', 'value'}:
+      raise ValueError("Invalid reset_cand_metric parameter {}".format(
+          reset_cand_metric))
 
     super().__init__()
     self.k = k  # number of groups
@@ -55,10 +52,13 @@ class KSubspaceBaseModel(nn.Module):
     self.serial_eval = set(serial_eval)
 
     self.reset_patience = reset_patience
+    # no threshold on objective plateau
+    if reset_try_tol <= 0:
+      reset_try_tol = None
     self.reset_try_tol = reset_try_tol
+    self.reset_cand_metric = reset_cand_metric
     self.reset_max_steps = reset_max_steps
     self.reset_accept_tol = reset_accept_tol
-    self.reset_sigma = reset_sigma
     self.reset_cache_size = reset_cache_size
     if temp_scheduler is None:
       temp_scheduler = GeoTempScheduler(init_temp=0.1, replicates=self.r,
@@ -89,8 +89,17 @@ class KSubspaceBaseModel(nn.Module):
     self.register_buffer('best_obj', torch.ones(self.r).mul_(np.nan))
     # 1st row counts since last reset, 2nd since last *successful* reset
     self.register_buffer('num_bad_steps', torch.zeros(2, self.r))
-    self.register_buffer('cooldown_counter',
-        torch.ones(self.r).mul_(reset_patience//2))
+    if reset_try_tol is None:
+      # need to jitter patience when try tol is none to avoid many simultaneous
+      # resets.
+      init_jitter = torch.randint(-reset_patience//2, reset_patience//2 + 1,
+          (self.r,), dtype=torch.float32)
+      init_cooldown_counter = torch.zeros(self.r)
+    else:
+      init_jitter = torch.zeros(self.r)
+      init_cooldown_counter = torch.ones(self.r).mul_(reset_patience//2)
+    self.register_buffer('jitter', init_jitter)
+    self.register_buffer('cooldown_counter', init_cooldown_counter)
 
     self.register_buffer('cache_assign_obj',
         torch.ones(reset_cache_size, self.r, k).mul_(np.nan))
@@ -280,7 +289,7 @@ class KSubspaceBaseModel(nn.Module):
     self._update_assign_obj_cache(assign_obj)
     return
 
-  def _assign_and_value(self, assign_obj):
+  def _assign_and_value(self, assign_obj, compute_c=True):
     """Compute assignments and cluster size & values."""
     batch_size, tmpr = assign_obj.shape[:2]
     device = assign_obj.device
@@ -294,9 +303,12 @@ class KSubspaceBaseModel(nn.Module):
       groups = torch.zeros(batch_size, tmpr, device=device, dtype=torch.int64)
       min_assign_obj = assign_obj.squeeze(2)
 
-    c = torch.zeros_like(assign_obj)
-    c.scatter_(2, groups.unsqueeze(2), 1)
-    c_mean = c.mean(dim=0)
+    if compute_c:
+      c = torch.zeros_like(assign_obj)
+      c.scatter_(2, groups.unsqueeze(2), 1)
+      c_mean = c.mean(dim=0)
+    else:
+      c = c_mean = None
 
     if self.k > 1:
       value = torch.zeros_like(assign_obj)
@@ -382,8 +394,13 @@ class KSubspaceBaseModel(nn.Module):
     if self.r == 1:
       return empty_output
 
+    # allocate buffers to use during resets
+    # NOTE: will cause late OOM error if cache_size, k too large
+    if self.reset_cand_metric == "obj_decr" and self._reset_buffers is None:
+      self._init_reset_buffers()
+
     # identify clusters to reset based on objective decrease
-    reset_rids = self._reset_obj_criterion()
+    reset_rids = self._reset_criterion()
     if reset_rids.shape[0] == 0:
       return empty_output
 
@@ -398,39 +415,45 @@ class KSubspaceBaseModel(nn.Module):
       rep_resets = self._reset_replicate(ridx.item())
       resets.append(rep_resets)
     resets = np.concatenate(resets, axis=0)
-
-    # perturb all bases slightly in replicates with resets to make sure we
-    # always have some diversity across replicates
-    success_mask = resets[:, 4] == 1
-    if self.reset_sigma > 0 and success_mask.sum() > 0:
-      rIdx = np.unique(resets[success_mask, 0].astype(np.int64))
-      reset_r = rIdx.shape[0]
-      # (reset_r, k, 1, 1)
-      Unorms = self.Us.data[rIdx, :].pow(2).sum(
-          dim=(2, 3), keepdim=True).sqrt()
-      # scale of perturbation is relative to each basis' norm
-      reset_Sigma = Unorms.mul(
-          self.reset_sigma / np.sqrt(self.D*self.d))
-      Z = torch.randn(reset_r, self.k, self.D, self.d,
-          dtype=Unorms.dtype, device=Unorms.device).mul_(reset_Sigma)
-      self.Us.data[rIdx, :] = self.Us.data[rIdx, :] + Z
     return resets
 
-  def _reset_obj_criterion(self):
+  def _init_reset_buffers(self):
+    """Allocate large buffers that will be used in resets."""
+    device = self.Us.data.device
+    self._reset_buffers = (
+        # alt_assign_obj
+        torch.zeros((self.reset_cache_size, self.r*self.k, 2),
+            device=device),
+        # alt_obj
+        torch.zeros((self.reset_cache_size, self.r*self.k),
+            device=device),
+        # tmp_Idx
+        torch.zeros((self.reset_cache_size, self.r*self.k),
+            dtype=torch.int64, device=device)
+    )
+    return
+
+  def _reset_criterion(self):
     """Identify replicates to reset based on relative objective decrease."""
     nan_mask = torch.isnan(self.best_obj)
     self.best_obj[nan_mask] = self.obj[nan_mask]
 
-    cooldown_mask = self.cooldown_counter > 0
-    self.cooldown_counter[cooldown_mask] -= 1.0
+    if self.reset_try_tol is not None:
+      cooldown_mask = self.cooldown_counter > 0
+      self.cooldown_counter[cooldown_mask] -= 1.0
 
-    better_or_cooldown = torch.max(cooldown_mask,
-        (self.obj < (1.0 - self.reset_try_tol)*self.best_obj))
-    self.best_obj[better_or_cooldown] = self.obj[better_or_cooldown]
-    self.num_bad_steps[:, better_or_cooldown] = 0.0
-    self.num_bad_steps[:, better_or_cooldown == 0] += 1.0
+      better_or_cooldown = torch.max(cooldown_mask,
+          (self.obj < (1.0 - self.reset_try_tol)*self.best_obj))
+      self.best_obj[better_or_cooldown] = self.obj[better_or_cooldown]
+      self.num_bad_steps[:, better_or_cooldown] = 0.0
+      self.num_bad_steps[:, better_or_cooldown == 0] += 1.0
+    else:
+      # no threshold on objective plateau
+      better_mask = self.obj < self.best_obj
+      self.best_obj[better_mask] = self.obj[better_mask]
+      self.num_bad_steps += 1.0
 
-    reset_mask = self.num_bad_steps[0, :] > self.reset_patience
+    reset_mask = self.num_bad_steps[0, :] > (self.reset_patience + self.jitter)
     reset_rids = reset_mask.nonzero().view(-1)
     return reset_rids
 
@@ -443,9 +466,6 @@ class KSubspaceBaseModel(nn.Module):
     temp = self.temp_scheduler.step(ridx)
 
     value, min_assign_obj = self._eval_value()
-    sample_prob = (value.unsqueeze(0).clamp(min=0) /
-        value[ridx, :].view(self.k, 1, 1).clamp(min=EPS)).cpu()
-    sample_prob[:, ridx, :] = 0.0
     rep_obj = (min_assign_obj[:, ridx].mean() +
         self._batch_reg_out[ridx, :].sum()).item()
     best_obj = old_obj = rep_obj
@@ -454,47 +474,50 @@ class KSubspaceBaseModel(nn.Module):
     rep_assign_obj = torch.zeros(3, self.reset_cache_size, self.k,
         device=device).copy_(self.cache_assign_obj[:, ridx, :].unsqueeze(0))
     rep_reg_out = torch.zeros(3, self.k, device=device).copy_(
-        self._batch_reg_out[[ridx], :])
+        self._batch_reg_out[ridx, :])
 
     for _ in range(self.reset_max_steps):
-      idx = torch.multinomial(sample_prob.view(-1), 1)[0].item()
-      cidx, cand_ridx, cand_cidx = np.unravel_index(idx,
-          (self.k, self.r, self.k))
+      swap_sample_prob = 1.0 / value[ridx, :].clamp(min=EPS)
+      cidx = torch.multinomial(swap_sample_prob, 1)[0].item()
+      cand_ridx, cand_cidx = self._sample_swap_cand(ridx, cidx, value, rep_obj,
+          rep_assign_obj[0, :], rep_reg_out[0, :])
+
+      # update temp assign obj
       rep_assign_obj[0, :, cidx] = self.cache_assign_obj[:,
           cand_ridx, cand_cidx]
       rep_reg_out[0, cidx] = self._batch_reg_out[cand_ridx, cand_cidx]
-
       cand_obj = (rep_assign_obj[0, :].min(dim=1)[0].mean() +
           rep_reg_out[0, :].sum()).item()
       obj_decr = (rep_obj - cand_obj) / rep_obj
+
+      # accept with probability decaying exponentially in obj increase, as in
+      # simulated annealing.
       accept_prob = np.exp(min(obj_decr - self.reset_accept_tol, 0) / temp)
       success = torch.rand(1)[0].item() <= accept_prob
 
       if success:
-        # update current bases and assign obj
+        # copy assign obj from temp to current
         rep_assign_obj[1, :, cidx] = rep_assign_obj[0, :, cidx]
         rep_reg_out[1, cidx] = rep_reg_out[0, cidx]
+        rep_obj = cand_obj
 
-        # update sample prob and replicate obj
-        rep_value, rep_min_assign_obj = self._eval_value(
+        # update replicate value
+        value[ridx, :], _ = self._eval_value(
             assign_obj=rep_assign_obj[1, :], reg_out=rep_reg_out[1, :])
-        sample_prob.copy_(value.unsqueeze(0).clamp(min=0) /
-            rep_value.view(self.k, 1, 1).clamp(min=EPS))
-        sample_prob[:, ridx, :] = 0.0
-        rep_obj = (rep_min_assign_obj.mean() + rep_reg_out[1, :].sum()).item()
 
-        # update best assign obj
+        # update best assign obj and copy assign obj from current to best
         if rep_obj < best_obj:
           best_obj = rep_obj
           rep_assign_obj[2, :] = rep_assign_obj[1, :]
           rep_reg_out[2, :] = rep_reg_out[1, :]
       else:
+        # revert temp assign obj to previous
         rep_assign_obj[0, :, cidx] = rep_assign_obj[1, :, cidx]
         rep_reg_out[0, cidx] = rep_reg_out[1, cidx]
 
       cumu_obj_decr = (old_obj - rep_obj) / old_obj
-      resets.append([ridx, cidx, cand_ridx, cand_cidx,
-          int(success), obj_decr, cumu_obj_decr, temp])
+      resets.append([ridx, cidx, cand_ridx, cand_cidx, int(success), obj_decr,
+          cumu_obj_decr, temp])
 
     resets = np.array(resets, dtype=object)
     self.num_bad_steps[0, ridx] = 0
@@ -502,26 +525,13 @@ class KSubspaceBaseModel(nn.Module):
     # final updates if objective sufficiently improved
     if (old_obj - best_obj) / old_obj >= self.reset_accept_tol:
       bestitr = np.argmax(resets[:, 6])
-      resets[bestitr+1:, 4] = 0
-
+      # code reset successes after best as -1
+      # NOTE: possibly need to be careful about negative values elsewhere.
+      resets[bestitr+1:, 4] *= -1
       reset_ids = resets[resets[:, 4] == 1, 1:4].astype(np.int64)
-      uniqIdx = ut.unique_resets(reset_ids[:, 0])
-      reset_ids = reset_ids[uniqIdx, :]
-      cIdx, cand_rIdx, cand_cIdx = [reset_ids[:, ii] for ii in range(3)]
-      self.Us.data[ridx, cIdx, :] = self.Us.data[cand_rIdx, cand_cIdx, :]
-      if self.affine:
-        self.bs.data[ridx, cIdx, :] = self.bs.data[cand_rIdx, cand_cIdx, :]
-
-      self.cache_assign_obj[:, ridx, :] = rep_assign_obj[2, :]
-      self._batch_reg_out[ridx, :] = rep_reg_out[2, :]
-
-      self.c_mean[ridx, :] = np.nan
-      self.value[ridx, :] = np.nan
-      self.obj[ridx] = self.best_obj[ridx] = np.nan
-      self.num_bad_steps[1, ridx] = 0
-      self.cooldown_counter[ridx] = self.reset_patience // 2
+      self._post_reset_updates(ridx, reset_ids, rep_assign_obj, rep_reg_out)
     else:
-      resets[:, 4] = 0
+      resets[:, 4] *= -1
     return resets
 
   def _eval_value(self, assign_obj=None, reg_out=None):
@@ -529,16 +539,92 @@ class KSubspaceBaseModel(nn.Module):
     assert((assign_obj is None) == (reg_out is None))
     if assign_obj is None:
       assign_obj = self.cache_assign_obj
-    if reg_out is None:
       reg_out = self._batch_reg_out
+
     assert(reg_out.dim() == assign_obj.dim() - 1)
+
+    # in this case assign obj/reg_out correspond to a fixed replicate.
+    # unsqueeze rep dimension.
     if assign_obj.dim() == 2:
       assign_obj = assign_obj.unsqueeze(1)
       reg_out = reg_out.unsqueeze(0)
 
-    _, min_assign_obj, _, _, value = self._assign_and_value(assign_obj)
+    _, min_assign_obj, _, _, value = self._assign_and_value(assign_obj,
+        compute_c=False)
     value.sub_(reg_out)
     return value.squeeze(0), min_assign_obj.squeeze(1)
+
+  def _sample_swap_cand(self, ridx, cidx, value, rep_obj, rep_assign_obj,
+        rep_reg_out):
+    """Sample a candidate replicate, cluster to swap for given ridx, cidx."""
+    if self.reset_cand_metric == 'value':
+      cand_sample_prob = value.clamp(min=EPS)
+    else:
+      # obj_decr
+      alt_obj = self._eval_alt_obj(ridx, cidx, rep_assign_obj, rep_reg_out)
+      alt_obj_decr = (rep_obj - alt_obj) / rep_obj
+      # clamp so objective increase steps have some small non-zero probability
+      cand_sample_prob = alt_obj_decr.clamp(min=EPS)
+    cand_sample_prob[ridx, :] = 0.0
+
+    idx = torch.multinomial(cand_sample_prob.view(-1), 1)[0].item()
+    cand_ridx, cand_cidx = np.unravel_index(idx, (self.r, self.k))
+    return cand_ridx, cand_cidx
+
+  def _eval_alt_obj(self, ridx, cidx, rep_assign_obj, rep_reg_out):
+    """Find the best candidate swap for given ridx, cidx."""
+    # (cache_size, rk, 2), (cache_size, rk), (cache_size, rk)
+    alt_assign_obj, alt_obj, tmp_Idx = self._reset_buffers
+
+    # (cache_size,) of min assign objs with cidx dropped.
+    drop_assign_obj = rep_assign_obj.clone()
+    drop_assign_obj[:, cidx] = np.inf
+    drop_assign_obj = drop_assign_obj.min(dim=1)[0]
+
+    # scalar reg value for single dropped cluster cidx
+    drop_reg_out = rep_reg_out.sum() - rep_reg_out[cidx]
+
+    # (cache_size, rk, 2)
+    alt_assign_obj[:, :, 0] = drop_assign_obj.unsqueeze(1)
+    # the values corresponding to ridx are not valid, but we will zero out the
+    # corresponding probabilities later anyway.
+    alt_assign_obj[:, :, 1] = self.cache_assign_obj.view(-1, self.r*self.k)
+
+    # (cache_size, rk)
+    alt_obj, _ = torch.min(alt_assign_obj, dim=2, out=(alt_obj, tmp_Idx))
+
+    # average over cache and add regularization, (rk,)
+    alt_obj = alt_obj.mean(dim=0)
+    alt_obj.add_(drop_reg_out)
+    alt_obj.add_(self._batch_reg_out.view(-1))
+    alt_obj = alt_obj.view(self.r, self.k)
+    return alt_obj
+
+  def _post_reset_updates(self, ridx, reset_ids, rep_assign_obj, rep_reg_out):
+    """Duplicate bases from (cand_rIdx, cand_cIdx) to (rIdx, cIdx), and other
+    re-initializations."""
+    # reset_ids = cIdx, cand_rIdx, cand_cIdx
+    uniqIdx = ut.unique_resets(reset_ids[:, 0])
+    reset_ids = reset_ids[uniqIdx, :]
+    cIdx, cand_rIdx, cand_cIdx = [reset_ids[:, ii] for ii in range(3)]
+
+    self.Us.data[ridx, cIdx, :] = self.Us.data[cand_rIdx, cand_cIdx, :]
+    if self.affine:
+      self.bs.data[ridx, cIdx, :] = self.bs.data[cand_rIdx, cand_cIdx, :]
+
+    self.cache_assign_obj[:, ridx, :] = rep_assign_obj[2, :]
+    self._batch_reg_out[ridx, :] = rep_reg_out[2, :]
+
+    self.c_mean[ridx, :] = np.nan
+    self.value[ridx, :] = np.nan
+    self.obj[ridx] = self.best_obj[ridx] = np.nan
+    self.num_bad_steps[1, ridx] = 0
+    if self.reset_try_tol is None:
+      self.jitter[ridx].random_(-self.reset_patience//2,
+          self.reset_patience//2 + 1)
+    else:
+      self.cooldown_counter[ridx] = self.reset_patience // 2
+    return
 
   def zero(self):
     """Zero out near zero bases.
@@ -547,6 +633,11 @@ class KSubspaceBaseModel(nn.Module):
     """
     Unorms = self.Us.data.pow(2).sum(dim=(2, 3)).sqrt()
     self.Us.data[(Unorms < EPS*max(1, Unorms.max())), :, :] = 0.0
+    return
+
+  def epoch_init(self):
+    """Initialization at the start of an epoch."""
+    self.zero()
     return
 
 
@@ -562,9 +653,16 @@ class KSubspaceMFModel(KSubspaceBaseModel):
 
   def __init__(self, k, d, D, affine=False, replicates=5, reg_params={},
         serial_eval={}, reset_patience=100, reset_try_tol=0.01,
-        reset_max_steps=50, reset_accept_tol=1e-3, reset_sigma=0.0,
-        reset_cache_size=500, temp_scheduler=None, scale_grad_freq=100,
-        init='random', initX=None, initk=None):
+        reset_cand_metric='obj_decr', reset_max_steps=50,
+        reset_accept_tol=1e-3, reset_cache_size=500, temp_scheduler=None,
+        scale_grad_mode=None, scale_grad_update_freq=20, init='random',
+        initX=None, initk=None):
+
+    if not (scale_grad_mode is None or scale_grad_mode == 'none'):
+      if affine:
+        raise ValueError("gradient scaling not supported in affine setting.")
+      if scale_grad_mode not in {'lip', 'newton'}:
+        raise ValueError("Invalid scale grad mode {}.".format(scale_grad_mode))
 
     if init.lower() not in {'random', 'pfi', 'pca'}:
       raise ValueError("Invalid init mode {}".format(init))
@@ -579,19 +677,19 @@ class KSubspaceMFModel(KSubspaceBaseModel):
     super().__init__(k, d, D,
         affine=affine, replicates=replicates, reg_params=reg_params,
         serial_eval=serial_eval, reset_patience=reset_patience,
-        reset_try_tol=reset_try_tol, reset_max_steps=reset_max_steps,
-        reset_accept_tol=reset_accept_tol, reset_sigma=reset_sigma,
+        reset_try_tol=reset_try_tol, reset_cand_metric=reset_cand_metric,
+        reset_max_steps=reset_max_steps, reset_accept_tol=reset_accept_tol,
         reset_cache_size=reset_cache_size, temp_scheduler=temp_scheduler)
 
-    if scale_grad_freq is not None and scale_grad_freq >= 0:
-      self.scale_grad_freq = scale_grad_freq
-      self.Lip = None
-      self.steps = 0
+    if scale_grad_mode == 'none':
+      scale_grad_mode = None
+    self.scale_grad_mode = scale_grad_mode
+    self.scale_grad_update_freq = scale_grad_update_freq
+    if scale_grad_mode is not None:
+      # ultimate shape (2, r, k, d, d)
+      self.Hess = None
       self.cache_z = True
       self.Us.register_hook(lambda UGrad: self._scale_grad(UGrad))
-      if self.affine:
-        self.bs.register_hook(lambda bGrad: self._scale_grad(bGrad,
-            update=False))
 
     self.init = init.lower()
     self.initX = initX
@@ -780,38 +878,88 @@ class KSubspaceMFModel(KSubspaceBaseModel):
       regs['z'] = self.z_frosqr.permute(2, 0, 1).mul(self.reg_params['z']*0.5)
     return regs
 
-  def _scale_grad(self, Grad, update=True):
+  def _scale_grad(self, Grad, update_accum=True):
     """Divide gradients by an estimate of the Lipschitz constant, per
     replicate."""
-    if self.Lip is None or (update and self.steps % self.scale_grad_freq == 0):
+    update_grad_scale = (self.scale_grad_steps %
+        self.scale_grad_update_freq == 0)
+
+    if update_accum:
       device = self.z.device
       batch_size = self.c.shape[0]
       z_zero = self.c.permute(1, 2, 0).unsqueeze(3) * self.z
-      Hess = torch.matmul(z_zero.transpose(2, 3), z_zero).div_(batch_size)
+      Hess = torch.matmul(z_zero.transpose(2, 3), z_zero)
 
       # (r, k)
       batch_cluster_sizes = self.c.sum(dim=0)
-      lamb = ((self.reg_params['U_frosqr_in']/batch_size) *
-          batch_cluster_sizes + self.reg_params['U_frosqr_out']).to(device)
+      # 1e-3 added to avoid singularity (huge steps)
+      lamb = (self.reg_params['U_frosqr_in'] * batch_cluster_sizes).add_(
+          (self.reg_params['U_frosqr_out'] + 1e-3) * batch_size)
       # (r, k, d, d)
       Id = torch.eye(self.d, device=device).mul(
           lamb.view(self.r, self.k, 1, 1))
-      Hess.add_(Id)
+      Hess = Hess.add_(Id)
+      self.Hess = self.Hess.add_(Hess)
+      self.HessN += batch_size
+      self.scale_grad_steps += 1
 
-      # (r, k)
-      Lip = np.linalg.norm(Hess.cpu().numpy(), ord=2, axis=(2, 3))
-      Lip = torch.from_numpy(Lip).to(device)
-      # (r,)
-      Lip = Lip.max(dim=1)[0].view(self.r)
-      if self.Lip is None:
-        self.Lip = Lip
-      else:
-        self.Lip.mul_(EMA_DECAY).add_(1-EMA_DECAY, Lip)
+    if update_grad_scale:
+      HessN = self.HessN[0, :].view(self.r, 1, 1, 1)
+      Hess = (self.Hess[0, :] / HessN).cpu().numpy()
 
-    Grad_scale = Grad.div(self.Lip.view((self.r,) + (Grad.dim()-1) * (1,)))
-    if update:
-      self.steps += 1
+    if self.scale_grad_mode == 'lip':
+      if update_grad_scale:
+        # spectral norm for each rep, cluster
+        # (r, k)
+        Lip = np.linalg.norm(Hess, ord=2, axis=(2, 3))
+        # (r,)
+        self.Lip = torch.from_numpy(Lip).to(device).max(dim=1)[0]
+      Grad_scale = Grad.div(self.Lip.view(
+          self.Lip.shape + (Grad.dim() - self.Lip.dim()) * (1,)))
+    else:
+      # newton
+      if update_grad_scale:
+        # pseudo-inverse of hessian for each rep, cluster
+        # (r, k, d, d)
+        Hessinv = np.linalg.pinv(Hess)
+        self.Hessinv = torch.from_numpy(Hessinv).to(device)
+      Grad_scale = torch.matmul(Grad, self.Hessinv)
     return Grad_scale
+
+  def epoch_init(self):
+    """Initialization at the start of an epoch."""
+    super().epoch_init()
+    if self.scale_grad_mode is not None:
+      if self.Hess is None:
+        self.Hess = torch.eye(self.d, device=self.Us.device).repeat(
+            2, self.r, self.k, 1, 1)
+        self.HessN = torch.zeros((2, self.r), device=self.Us.device)
+      else:
+        self.Hess = self._shift_and_zero(self.Hess)
+        self.HessN = self._shift_and_zero(self.HessN)
+      self.scale_grad_steps = 0
+    return
+
+  def _shift_and_zero(self, buf):
+    """Shift 1 -> 0, zero 1."""
+    buf[0, :] = buf[1, :]
+    buf[1, :] = 0.0
+    return buf
+
+  def _post_reset_updates(self, ridx, reset_ids, rep_assign_obj, rep_reg_out):
+    """Duplicate bases from (cand_rIdx, cand_cIdx) to (rIdx, cIdx), and other
+    re-initializations."""
+    super()._post_reset_updates(ridx, reset_ids, rep_assign_obj, rep_reg_out)
+    if self.scale_grad_mode is not None:
+      # re-initialize hessian estimate with identity.
+      # NOTE: would using the candidate's hessian be a better choice? I think
+      # probably not, since there is some dependence on the "sibling clusters",
+      # through the assignment.
+      self.Hess[:, ridx, :] = torch.eye(self.d, device=self.Us.device)
+      self.HessN[:, ridx] = 0.0
+      # be sure to update grad scale on next iter
+      self.scale_grad_steps = 0
+    return
 
 
 class KSubspaceProjModel(KSubspaceBaseModel):
@@ -825,14 +973,14 @@ class KSubspaceProjModel(KSubspaceBaseModel):
 
   def __init__(self, k, d, D, affine=False, replicates=5, reg_params={},
         serial_eval={}, reset_patience=100, reset_try_tol=0.01,
-        reset_max_steps=50, reset_accept_tol=1e-3, reset_sigma=0.0,
-        reset_cache_size=500, temp_scheduler=None):
+        reset_cand_metric='obj_decr', reset_max_steps=50,
+        reset_accept_tol=1e-3, reset_cache_size=500, temp_scheduler=None):
 
     super().__init__(k, d, D,
         affine=affine, replicates=replicates, reg_params=reg_params,
         serial_eval=serial_eval, reset_patience=reset_patience,
-        reset_try_tol=reset_try_tol, reset_max_steps=reset_max_steps,
-        reset_accept_tol=reset_accept_tol, reset_sigma=reset_sigma,
+        reset_try_tol=reset_try_tol, reset_cand_metric=reset_cand_metric,
+        reset_max_steps=reset_max_steps, reset_accept_tol=reset_accept_tol,
         reset_cache_size=reset_cache_size, temp_scheduler=temp_scheduler)
 
     self.reset_parameters()
@@ -886,9 +1034,9 @@ class KSubspaceBatchAltBaseModel(KSubspaceBaseModel):
 
   def __init__(self, k, d, dataset, affine=False, replicates=5, reg_params={},
         serial_eval={}, reset_patience=2, reset_try_tol=0.01,
-        reset_max_steps=50, reset_accept_tol=1e-3, reset_sigma=0.0,
-        reset_cache_size=500, temp_scheduler=None, svd_solver='randomized',
-        **kwargs):
+        reset_cand_metric='obj_decr', reset_max_steps=50,
+        reset_accept_tol=1e-3, reset_cache_size=500, temp_scheduler=None,
+        svd_solver='randomized', **kwargs):
 
     if svd_solver not in ('randomized', 'svds', 'svd'):
       raise ValueError("Invalid svd solver {}".format(svd_solver))
@@ -898,8 +1046,8 @@ class KSubspaceBatchAltBaseModel(KSubspaceBaseModel):
     super().__init__(k, d, D,
         affine=affine, replicates=replicates, reg_params=reg_params,
         serial_eval=serial_eval, reset_patience=reset_patience,
-        reset_try_tol=reset_try_tol, reset_max_steps=reset_max_steps,
-        reset_accept_tol=reset_accept_tol, reset_sigma=reset_sigma,
+        reset_try_tol=reset_try_tol, reset_cand_metric=reset_cand_metric,
+        reset_max_steps=reset_max_steps, reset_accept_tol=reset_accept_tol,
         reset_cache_size=reset_cache_size, temp_scheduler=temp_scheduler,
         **kwargs)
 
@@ -969,14 +1117,15 @@ class KSubspaceBatchAltProjModel(KSubspaceBatchAltBaseModel,
 
   def __init__(self, k, d, dataset, affine=False, replicates=5, reg_params={},
         serial_eval={}, reset_patience=2, reset_try_tol=0.01,
-        reset_max_steps=50, reset_accept_tol=1e-3, reset_sigma=0.0,
-        reset_cache_size=500, temp_scheduler=None, svd_solver='randomized'):
+        reset_cand_metric='obj_decr', reset_max_steps=50,
+        reset_accept_tol=1e-3, reset_cache_size=500, temp_scheduler=None,
+        svd_solver='randomized'):
 
     super().__init__(k, d, dataset,
         affine=affine, replicates=replicates, reg_params=reg_params,
         serial_eval=serial_eval, reset_patience=reset_patience,
-        reset_try_tol=reset_try_tol, reset_max_steps=reset_max_steps,
-        reset_accept_tol=reset_accept_tol, reset_sigma=reset_sigma,
+        reset_try_tol=reset_try_tol, reset_cand_metric=reset_cand_metric,
+        reset_max_steps=reset_max_steps, reset_accept_tol=reset_accept_tol,
         reset_cache_size=reset_cache_size, temp_scheduler=temp_scheduler,
         svd_solver=svd_solver)
     return
@@ -1009,17 +1158,17 @@ class KSubspaceBatchAltMFModel(KSubspaceBatchAltBaseModel, KSubspaceMFModel):
 
   def __init__(self, k, d, dataset, affine=False, replicates=5, reg_params={},
         serial_eval={}, reset_patience=2, reset_try_tol=0.01,
-        reset_max_steps=50, reset_accept_tol=1e-3, reset_sigma=0.0,
-        reset_cache_size=500, temp_scheduler=None, init='random', initX=None,
-        initk=None, svd_solver='randomized'):
+        reset_cand_metric='obj_decr', reset_max_steps=50,
+        reset_accept_tol=1e-3, reset_cache_size=500, temp_scheduler=None,
+        init='random', initX=None, initk=None, svd_solver='randomized'):
 
-    mf_kwargs = {'scale_grad_freq': None, 'init': init, 'initX': initX,
+    mf_kwargs = {'scale_grad_mode': None, 'init': init, 'initX': initX,
         'initk': initk}
     super().__init__(k, d, dataset,
         affine=affine, replicates=replicates, reg_params=reg_params,
         serial_eval=serial_eval, reset_patience=reset_patience,
-        reset_try_tol=reset_try_tol, reset_max_steps=reset_max_steps,
-        reset_accept_tol=reset_accept_tol, reset_sigma=reset_sigma,
+        reset_try_tol=reset_try_tol, reset_cand_metric=reset_cand_metric,
+        reset_max_steps=reset_max_steps, reset_accept_tol=reset_accept_tol,
         reset_cache_size=reset_cache_size, temp_scheduler=temp_scheduler,
         svd_solver=svd_solver, **mf_kwargs)
 
@@ -1099,22 +1248,23 @@ class KMeansBatchAltModel(KSubspaceBatchAltBaseModel):
   }
   assign_reg_terms = {}
 
-  def __init__(self, k, dataset, init='random', replicates=5, reg_params={},
-        serial_eval={}, reset_patience=2, reset_try_tol=0.01,
-        reset_max_steps=50, reset_accept_tol=1e-3, reset_sigma=0.0,
-        reset_cache_size=500, temp_scheduler=None, kpp_n_trials=None):
+  def __init__(self, k, dataset, replicates=5, reg_params={},
+        reset_patience=2, reset_try_tol=0.01, reset_cand_metric='obj_decr',
+        reset_max_steps=50, reset_accept_tol=1e-3, reset_cache_size=500,
+        temp_scheduler=None, init='random', kpp_n_trials=None):
 
-    if init not in {'k-means++', 'random'}:
+    if init not in {'pfi', 'random'}:
       raise ValueError("Invalid init parameter {}".format(init))
 
     d = 1  # Us not used, but retained for consistency/out of laziness
     affine = True
+    serial_eval = {}  # not supported
 
     super().__init__(k, d, dataset,
         affine=affine, replicates=replicates, reg_params=reg_params,
         serial_eval=serial_eval, reset_patience=reset_patience,
-        reset_try_tol=reset_try_tol, reset_max_steps=reset_max_steps,
-        reset_accept_tol=reset_accept_tol, reset_sigma=reset_sigma,
+        reset_try_tol=reset_try_tol, reset_cand_metric=reset_cand_metric,
+        reset_max_steps=reset_max_steps, reset_accept_tol=reset_accept_tol,
         reset_cache_size=reset_cache_size, temp_scheduler=temp_scheduler)
 
     self.init = init
@@ -1134,7 +1284,7 @@ class KMeansBatchAltModel(KSubspaceBatchAltBaseModel):
     """Initialize bs with random data points."""
     self.Us.data.zero_()
     self.bs.data.zero_()
-    if self.init == 'k-means++':
+    if self.init == 'pfi':
       # pick first randomly
       Idx = torch.randint(0, self.N, (self.r,), dtype=torch.int64)
       self.bs.data[:, 0, :] = self.X[Idx, :]
@@ -1261,17 +1411,18 @@ class KSubspaceMCModel(KSubspaceMFModel):
   assign_reg_terms = {'U_frosqr_in', 'z', 'e'}
 
   def __init__(self, k, d, D, affine=False, replicates=5, reg_params={},
-        reset_patience=100, reset_try_tol=0.01, reset_max_steps=50,
-        reset_accept_tol=1e-3, reset_sigma=0.0, reset_cache_size=500,
-        temp_scheduler=None, scale_grad_freq=100, sparse_encode=True,
-        sparse_decode=False, norm_comp_error=True):
+        reset_patience=100, reset_try_tol=0.01, reset_cand_metric='obj_decr',
+        reset_max_steps=50, reset_accept_tol=1e-3, reset_cache_size=500,
+        temp_scheduler=None, scale_grad_mode=None, scale_grad_update_freq=20,
+        sparse_encode=True, sparse_decode=False, norm_comp_error=True):
 
     super().__init__(k, d, D,
         affine=affine, replicates=replicates, reg_params=reg_params,
         reset_patience=reset_patience, reset_try_tol=reset_try_tol,
-        reset_max_steps=reset_max_steps, reset_accept_tol=reset_accept_tol,
-        reset_sigma=reset_sigma, reset_cache_size=reset_cache_size,
-        temp_scheduler=temp_scheduler, scale_grad_freq=scale_grad_freq)
+        reset_cand_metric=reset_cand_metric, reset_max_steps=reset_max_steps,
+        reset_accept_tol=reset_accept_tol, reset_cache_size=reset_cache_size,
+        temp_scheduler=temp_scheduler, scale_grad_mode=scale_grad_mode,
+        scale_grad_update_freq=scale_grad_update_freq)
 
     self.sparse_encode = sparse_encode
     self.sparse_decode = sparse_decode
@@ -1453,9 +1604,10 @@ class KSubspaceMFCorruptModel(KSubspaceMFModel):
 
   def __init__(self, k, d, D, affine=False, replicates=5, reg_params={},
         serial_eval={}, reset_patience=100, reset_try_tol=0.01,
-        reset_max_steps=50, reset_accept_tol=1e-3, reset_sigma=0.0,
-        reset_cache_size=500, temp_scheduler=None, scale_grad_freq=100,
-        encode_max_iter=20, encode_tol=1e-3):
+        reset_cand_metric='obj_decr', reset_max_steps=50,
+        reset_accept_tol=1e-3, reset_cache_size=500, temp_scheduler=None,
+        scale_grad_mode=None, scale_grad_update_freq=20, encode_max_iter=20,
+        encode_tol=1e-3):
 
     if encode_max_iter <= 0:
       raise ValueError(("Invalid encode_max_iter parameter {}").format(
@@ -1464,10 +1616,11 @@ class KSubspaceMFCorruptModel(KSubspaceMFModel):
     super().__init__(k, d, D,
         affine=affine, replicates=replicates, reg_params=reg_params,
         serial_eval=serial_eval, reset_patience=reset_patience,
-        reset_try_tol=reset_try_tol, reset_max_steps=reset_max_steps,
-        reset_accept_tol=reset_accept_tol, reset_sigma=reset_sigma,
+        reset_try_tol=reset_try_tol, reset_cand_metric=reset_cand_metric,
+        reset_max_steps=reset_max_steps, reset_accept_tol=reset_accept_tol,
         reset_cache_size=reset_cache_size, temp_scheduler=temp_scheduler,
-        scale_grad_freq=scale_grad_freq)
+        scale_grad_mode=scale_grad_mode,
+        scale_grad_update_freq=scale_grad_update_freq)
 
     # when e reg parameter is set to zero we disable the corruption term,
     # although strictly speaking it should give the trivial solution e = full
@@ -1639,15 +1792,15 @@ class KSubspaceMFOutlierModel(KSubspaceMFCorruptModel):
 
   def __init__(self, k, d, D, affine=False, replicates=5, reg_params={},
         serial_eval={}, reset_patience=100, reset_try_tol=0.01,
-        reset_max_steps=50, reset_accept_tol=1e-3, reset_sigma=0.0,
-        reset_cache_size=500, temp_scheduler=None,
+        reset_cand_metric='obj_decr', reset_max_steps=50,
+        reset_accept_tol=1e-3, reset_cache_size=500, temp_scheduler=None,
         encode_max_iter=20, encode_tol=1e-3, scale_grad_freq=100):
 
     super().__init__(k, d, D,
         affine=affine, replicates=replicates, reg_params=reg_params,
         serial_eval=serial_eval, reset_patience=reset_patience,
-        reset_try_tol=reset_try_tol, reset_max_steps=reset_max_steps,
-        reset_accept_tol=reset_accept_tol, reset_sigma=reset_sigma,
+        reset_try_tol=reset_try_tol, reset_cand_metric=reset_cand_metric,
+        reset_max_steps=reset_max_steps, reset_accept_tol=reset_accept_tol,
         reset_cache_size=reset_cache_size, temp_scheduler=temp_scheduler,
         encode_max_iter=encode_max_iter, encode_tol=encode_tol,
         scale_grad_freq=scale_grad_freq)
@@ -1680,17 +1833,26 @@ class TempScheduler(object):
     return
 
   def step(self, ridx=None):
-    if ridx is None:
+    if ridx is None or self.r is None:
       self.steps += 1
     else:
       self.steps[ridx] += 1
     temp = self.get_temp()
-    if ridx is not None:
+    if ridx is not None and self.r is not None:
       temp = temp[ridx]
     return temp
 
   def get_temp(self):
     raise NotImplementedError
+
+
+class ConstantTempScheduler(TempScheduler):
+  def __init__(self, init_temp=1.0, replicates=None):
+    super().__init__(init_temp, replicates)
+    return
+
+  def get_temp(self):
+    return self.init_temp
 
 
 class GeoTempScheduler(TempScheduler):

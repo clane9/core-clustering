@@ -309,9 +309,15 @@ class SynthKMeansDataset(Dataset):
 
 
 class NetflixDataset(Dataset):
-  def __init__(self, fname='nf_prize_446460x16885', center=True,
-        normalize=False, store_sparse=True, store_dense=False):
+  def __init__(self, dataset='nf_17k', center=True, normalize=False,
+        store_sparse=True, store_dense=False):
+    if dataset not in {'nf_17k', 'nf_1k'}:
+      raise ValueError("Dataset {} not supported".format(dataset))
+
+    fname = {'nf_17k': 'nf_prize_446460x16885.npz',
+        'nf_1k': 'nf_prize_422889x889.npz'}[dataset]
     fpath = '{}/datasets/nf_prize_preprocessed/{}.npz'.format(CODE_DIR, fname)
+
     with open(fpath, 'rb') as f:
       f = np.load(f)
       # tolist required since np.savez doesn't know how to properly handle
@@ -323,6 +329,7 @@ class NetflixDataset(Dataset):
       self.X.data -= train_mean
       self.X_test.data -= train_mean
 
+    self.dataset = dataset
     self.fname = fname
     self.center = center
     self.normalize = normalize
@@ -535,6 +542,62 @@ class MissingDataSample(object):
       self.omega = torch.cat([torch.zeros(npad, dtype=torch.uint8),
           self.omega])
     return
+
+
+def generate_synth_uos_dataset(k, d, D, Ng, N=None, affine=False, sigma=0.0,
+      theta=None, miss_rate=0.0, normalize=False, online=False,
+      comp_test_frac=0.05, miss_store_sparse=True, miss_store_dense=False,
+      seed=None):
+  """Generate synthetic UoS dataset.
+
+  Args:
+    k: number of subspaces.
+    d: subspace dimension.
+    D: ambient dimension.
+    Ng: points per group.
+    N: total num data points, takes precedent over Ng (default: None).
+    affine: affine setting (default: False).
+    sigma: gaussian noise sigma (default: 0.0).
+    theta: principal angle between subspaces in radians (default: None).
+    miss_rate: missing data rate (default: 0.0).
+    online: online data setting (default: False).
+    normalize: project data onto unit sphere (default: False).
+    comp_test_frac: fraction of observed entries to hold out as test in missing
+      data setting (default: 0.05).
+    miss_store_sparse: store sparse representation of missing data (default:
+      True).
+    miss_store_dense: store dense representation of missing data (default:
+      False).
+    seed: random seed (default: None).
+
+  Returns:
+    dataset: Synthetic UoS dataset instance.
+  """
+  # N takes precedent if provided.
+  if N is not None and N > 0:
+    Ng = N // k
+  else:
+    N = k * Ng
+
+  if miss_rate <= 0:
+    if not online:
+      dataset = SynthUoSDataset(k, d, D, Ng, affine=affine, sigma=sigma,
+          theta=theta, normalize=normalize, seed=seed)
+    else:
+      dataset = SynthUoSOnlineDataset(k, d, D, N, affine=affine, sigma=sigma,
+          theta=theta, normalize=normalize, seed=seed)
+  else:
+    if not online:
+      dataset = SynthUoSMissDataset(k, d, D, Ng, affine=affine, sigma=sigma,
+          theta=theta, miss_rate=miss_rate, normalize=normalize,
+          store_sparse=miss_store_sparse, store_dense=miss_store_dense,
+          test_frac=comp_test_frac, seed=seed)
+    else:
+      dataset = SynthUoSMissOnlineDataset(k, d, D, N, affine=affine,
+          sigma=sigma, theta=theta, miss_rate=miss_rate, normalize=normalize,
+          store_sparse=miss_store_sparse, store_dense=miss_store_dense,
+          test_frac=comp_test_frac, seed=seed)
+  return dataset
 
 
 def missing_data_collate(batch):

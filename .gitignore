@@ -3,5 +3,6 @@ __pycache__
 datasets
 test_results
 test_notebooks
+test_scripts
 .DS_Store
 .snips

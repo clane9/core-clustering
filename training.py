@@ -47,7 +47,8 @@ def train_loop(model, data_loader, device, optimizer, out_dir=None, epochs=200,
     printformstr += 'comp.err={:.2f},{:.2f},{:.2f} '
   if eval_rank:
     printformstr += 'rank={:.0f},{:.0f},{:.0f} '
-  printformstr += 'resets={:d} samp/s={:.0f} rtime={:.2f} data.frac={:.2f}'
+  printformstr += ('resets={:d} samp/s={:.0f} rtime={:.2f} '
+      'data.rt={:.2f} reset.rt={:.2f}')
 
   if out_dir is not None:
     logheader = ('Epoch,LR,' + ','.join(['{}.{}'.format(met, meas)
@@ -57,7 +58,7 @@ def train_loop(model, data_loader, device, optimizer, out_dir=None, epochs=200,
       logheader += 'Comp.err.min,Comp.err.med,Comp.err.max,'
     if eval_rank:
       logheader += 'Rank.min,Rank.med,Rank.max,'
-    logheader += 'Resets,Samp.s,RT,Data.RT'
+    logheader += 'Resets,Samp.s,RT,Data.RT,Reset.RT'
 
     logformstr = ('{:d},{:.9e},{:.9f},{:.9f},{:.9f},'
         '{:.9e},{:.9e},{:.9e},{:.9e},{:.9e},{:.9e},'
@@ -66,7 +67,7 @@ def train_loop(model, data_loader, device, optimizer, out_dir=None, epochs=200,
       logformstr += '{:.9f},{:.9f},{:.9f},'
     if eval_rank:
       logformstr += '{:.0f},{:.9f},{:.0f},'
-    logformstr += '{:d},{:.0f},{:.9f},{:.9f}'
+    logformstr += '{:d},{:.0f},{:.9f},{:.9f},{:.9f}'
 
     val_logf = '{}/val_log.csv'.format(out_dir)
     with open(val_logf, 'w') as f:
@@ -122,7 +123,7 @@ def train_loop(model, data_loader, device, optimizer, out_dir=None, epochs=200,
         lr = ut.get_learning_rate(optimizer)
 
       if epoch == 1:
-        metrics_summary[-1] += init_time
+        metrics_summary[-3] += init_time
 
       if eval_cluster_error:
         conf_mats[epoch-1, :] = epoch_conf_mats
@@ -174,52 +175,55 @@ def train_loop(model, data_loader, device, optimizer, out_dir=None, epochs=200,
         print('{}: {}'.format(type(err), err), file=f)
 
   finally:
+    metrics = metrics[:epoch, :]
+    conf_mats = conf_mats[:epoch, :] if eval_cluster_error else None
+    svs = svs[:epoch, :] if eval_rank else None
+
     if reset_unused:
       resets = (np.concatenate(resets, axis=0) if len(resets) > 0
           else np.zeros((0, RESET_NCOL+2), dtype=object))
+      reset_summary = ut.aggregate_resets(resets)
+    else:
+      resets = reset_summary = None
+
     if out_dir is not None:
       with open('{}/metrics.npz'.format(out_dir), 'wb') as f:
-        np.savez(f, metrics=metrics[:epoch, :])
-      if save_data:
-        save_conf_mats = (conf_mats[:epoch, :]
-            if eval_cluster_error else None)
-        save_svs = svs[:epoch, :] if eval_rank else None
-      else:
-        save_conf_mats = (conf_mats[[epoch-1], :]
-            if eval_cluster_error else None)
-        save_svs = svs[[epoch-1], :] if eval_rank else None
+        np.savez(f, metrics=metrics)
       if eval_cluster_error:
+        save_conf_mats = conf_mats if save_data else conf_mats[[epoch-1], :]
         with open('{}/conf_mats.npz'.format(out_dir), 'wb') as f:
           np.savez(f, conf_mats=save_conf_mats)
       if eval_rank:
+        save_svs = svs if save_data else svs[[epoch-1], :]
         with open('{}/svs.npz'.format(out_dir), 'wb') as f:
           np.savez(f, svs=save_svs)
       if reset_unused:
         if save_data:
           with open('{}/resets.npz'.format(out_dir), 'wb') as f:
             np.savez(f, resets=resets)
-        reset_summary = ut.aggregate_resets(resets)
         reset_summary.to_csv('{}/reset_summary.csv'.format(out_dir),
             index=False)
 
     if err is not None:
       raise err
-  return conf_mats, svs, resets
+  return metrics, conf_mats, svs, resets, reset_summary
+
 
 def train_epoch(model, data_loader, data_iter, optimizer, device,
       epoch_steps=None, eval_rank=False, reset_unused=False, mc_mode=False,
       eval_cluster_error=True):
   """train model for one epoch and record convergence measures."""
-  epoch_tic = time.time()
-  data_tic = epoch_tic
+  data_tic = epoch_tic = time.time()
   data_rtime = 0.0
+  reset_rtime = 0.0
   metrics = None
   resets = []
   conf_mats, comp_err = ut.AverageMeter(), ut.AverageMeter()
-  itr = 1
+  itr = epochN = 0
   epoch_stop = False
   if data_iter is None:
     data_iter = iter(data_loader)
+  model.epoch_init()
   while not epoch_stop:
     try:
       data_tup = next(data_iter)
@@ -230,6 +234,7 @@ def train_epoch(model, data_loader, data_iter, optimizer, device,
         break
       else:
         data_iter = iter(data_loader)
+        data_tup = next(data_iter)
     if itr == epoch_steps:
       epoch_stop = True
 
@@ -242,6 +247,8 @@ def train_epoch(model, data_loader, data_iter, optimizer, device,
       x0 = None
     x = x.to(device)
     batch_size = x.shape[0]
+    epochN += batch_size
+    itr += 1
     data_rtime += time.time() - data_tic
 
     # opt step
@@ -254,9 +261,6 @@ def train_epoch(model, data_loader, data_iter, optimizer, device,
 
     batch_obj_mean.backward()
     optimizer.step()
-
-    # zero out near zero bases to improve numerical performance
-    model.zero()
 
     batch_metrics = [batch_obj, batch_loss, batch_reg_in, batch_reg_out]
 
@@ -281,6 +285,7 @@ def train_epoch(model, data_loader, data_iter, optimizer, device,
       comp_err.update(batch_comp_err, batch_size)
 
     if reset_unused:
+      reset_tic = time.time()
       batch_resets = model.reset_unused()
       success_mask = batch_resets[:, 4] == 1
       if success_mask.sum() > 0:
@@ -289,6 +294,7 @@ def train_epoch(model, data_loader, data_iter, optimizer, device,
       if batch_resets.shape[0] > 0:
         batch_resets = np.insert(batch_resets, 0, itr, axis=1)
         resets.append(batch_resets)
+      reset_rtime += time.time() - reset_tic
 
     itr += 1
     data_tic = time.time()
@@ -333,8 +339,7 @@ def train_epoch(model, data_loader, data_iter, optimizer, device,
     comp_err = np.nan * np.ones((model.replicates,))
 
   rtime = time.time() - epoch_tic
-  sampsec = len(data_loader.dataset) / rtime
-  data_rtime_frac = data_rtime / rtime
+  sampsec = epochN / rtime
 
   metrics = torch.stack([errors] + [met.avg for met in metrics])
   metrics_summary = torch.stack([metrics.min(dim=1)[0],
@@ -345,7 +350,7 @@ def train_epoch(model, data_loader, data_iter, optimizer, device,
   metrics = np.concatenate(metrics)
   metrics_summary = metrics_summary.view(-1).numpy().tolist()
   metrics_summary = (metrics_summary + comp_err_stats + rank_stats +
-      [reset_count, sampsec, rtime, data_rtime_frac])
+      [reset_count, sampsec, rtime, data_rtime, reset_rtime])
   return metrics_summary, metrics, conf_mats, svs, resets, data_iter
 
 
@@ -366,6 +371,7 @@ def batch_alt_step(model, eval_rank=False, reset_unused=False,
     conf_mats = None
 
   if reset_unused:
+    reset_tic = time.time()
     resets = model.reset_unused()
     success_mask = resets[:, 4] == 1
     reset_count = success_mask.sum()
@@ -375,10 +381,12 @@ def batch_alt_step(model, eval_rank=False, reset_unused=False,
           resets[success_mask, 0].astype(np.int64), return_counts=True)
       rep_reset_counts[0, reset_rids] = success_counts
     resets = np.insert(resets, 0, 1, axis=1)
+    reset_rtime = time.time() - reset_tic
   else:
     resets = np.zeros((0, RESET_NCOL+1), dtype=object)
     reset_count = 0
     rep_reset_counts = np.zeros((1, model.r))
+    reset_rtime = 0.0
 
   if eval_cluster_error:
     errors = torch.tensor([ut.eval_cluster_error(conf_mats.sum[ii, :])[0]
@@ -395,9 +403,9 @@ def batch_alt_step(model, eval_rank=False, reset_unused=False,
   else:
     rank_stats, svs = [], None
 
-  rtime = (time.time() - epoch_tic)
+  rtime = time.time() - epoch_tic
   sampsec = model.N / rtime
-  data_rtime_frac = 0.0
+  data_rtime = 0.0
 
   metrics = torch.stack([errors, obj.cpu(), loss.cpu(), reg_in.cpu(),
       reg_out.cpu()])
@@ -407,5 +415,5 @@ def batch_alt_step(model, eval_rank=False, reset_unused=False,
   metrics = np.concatenate((metrics, rep_reset_counts))
   metrics_summary = metrics_summary.view(-1).numpy().tolist()
   metrics_summary = (metrics_summary + rank_stats +
-      [reset_count, sampsec, rtime, data_rtime_frac])
+      [reset_count, sampsec, rtime, data_rtime, reset_rtime])
   return metrics_summary, metrics, conf_mats, svs, resets

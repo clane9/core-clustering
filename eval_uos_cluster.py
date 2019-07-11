@@ -68,9 +68,9 @@ def main():
   # construct model
   reset_kwargs = dict(reset_patience=args.reset_patience,
       reset_try_tol=args.reset_try_tol,
+      reset_cand_metric=args.reset_metric,
       reset_max_steps=args.reset_max_steps,
       reset_accept_tol=args.reset_accept_tol,
-      reset_sigma=args.reset_sigma,
       reset_cache_size=args.reset_cache_size,
       temp_scheduler=mod.GeoTempScheduler(init_temp=0.1, replicates=args.reps,
           patience=1, gamma=0.9))
@@ -91,58 +91,56 @@ def main():
   else:
     initX = None
 
-  tic = time.time()
-  if args.form == 'batch-alt-proj':
+  if 'mf' in args.form:
+    if args.z_lamb > 0:
+      args.U_frosqr_in_lamb /= args.z_lamb
+      args.U_frosqr_out_lamb /= args.z_lamb
     reg_params = {
         'U_frosqr_in': args.U_frosqr_in_lamb,
-        'U_frosqr_out': args.U_frosqr_out_lamb
-    }
+        'U_frosqr_out': args.U_frosqr_out_lamb,
+        'z': args.z_lamb}
+  else:
+    reg_params = {
+        'U_frosqr_in': args.U_frosqr_in_lamb,
+        'U_frosqr_out': args.U_frosqr_out_lamb}
+
+  tic = time.time()
+  if args.form == 'batch-alt-proj':
     model = mod.KSubspaceBatchAltProjModel(args.model_k, args.model_d,
         dataset, affine=args.affine, replicates=args.reps,
         reg_params=reg_params, serial_eval=args.serial_eval,
         svd_solver='randomized', **reset_kwargs)
   elif args.form == 'batch-alt-mf':
-    reg_params = {
-        'U_frosqr_in': args.U_frosqr_in_lamb / args.z_lamb,
-        'U_frosqr_out': args.U_frosqr_out_lamb / args.z_lamb,
-        'z': (args.z_lamb if
-            max(args.U_frosqr_in_lamb, args.U_frosqr_out_lamb) > 0
-            else 0.0)
-    }
     model = mod.KSubspaceBatchAltMFModel(args.model_k, args.model_d,
         dataset, affine=args.affine, replicates=args.reps,
         reg_params=reg_params, serial_eval=args.serial_eval,
         svd_solver='randomized', init=args.init, initX=initX,
         initk=args.init_k, **reset_kwargs)
   elif args.form == 'proj':
-    reg_params = {
-        'U_frosqr_in': args.U_frosqr_in_lamb,
-        'U_frosqr_out': args.U_frosqr_out_lamb
-    }
     model = mod.KSubspaceProjModel(args.model_k, args.model_d, dataset.D,
         affine=args.affine, replicates=args.reps, reg_params=reg_params,
         serial_eval=args.serial_eval, **reset_kwargs)
   else:
-    reg_params = {
-        'U_frosqr_in': args.U_frosqr_in_lamb / args.z_lamb,
-        'U_frosqr_out': args.U_frosqr_out_lamb / args.z_lamb,
-        'z': (args.z_lamb if
-            max(args.U_frosqr_in_lamb, args.U_frosqr_out_lamb) > 0
-            else 0.0)
-    }
     model = mod.KSubspaceMFModel(args.model_k, args.model_d, dataset.D,
         affine=args.affine, replicates=args.reps, reg_params=reg_params,
-        serial_eval=args.serial_eval, scale_grad_freq=args.scale_grad_freq,
-        init=args.init, initX=initX, initk=args.init_k, **reset_kwargs)
+        serial_eval=args.serial_eval, scale_grad_mode=args.scale_grad_mode,
+        scale_grad_update_freq=args.scale_grad_update_freq, init=args.init,
+        initX=initX, initk=args.init_k, **reset_kwargs)
   init_time = time.time() - tic
   model = model.to(device)
+
+  if args.epoch_size is None or args.epoch_size <= 0:
+    args.epoch_size = len(dataset)
 
   # optimizer
   if batch_alt_mode:
     optimizer = None
     scheduler = None
   else:
-    if args.optim == 'SGD':
+    if args.form == 'mf' and args.scale_grad_mode == 'newton':
+      optimizer = torch.optim.SGD(model.parameters(), lr=args.init_lr,
+          momentum=0.0)
+    elif args.optim == 'SGD':
       optimizer = torch.optim.SGD(model.parameters(), lr=args.init_lr,
           momentum=0.9, nesterov=True)
     elif args.optim == 'Adam':
@@ -153,9 +151,9 @@ def main():
 
     min_lr = max(1e-8, 0.1**4 * args.init_lr)
     if args.reset_unused:
-      patience = int(np.ceil(3 * args.reset_patience /
-          (dataset.N // args.batch_size)))
-      threshold = args.reset_try_tol/10
+      patience = int(np.ceil(5 * args.reset_patience /
+          (args.epoch_size // args.batch_size)))
+      threshold = args.reset_try_tol/10 if args.reset_try_tol > 0 else 1e-3
     else:
       patience = 10
       threshold = 1e-3
@@ -166,6 +164,7 @@ def main():
     args.chkp_freq = args.epochs + 1
   if args.stop_freq is None or args.stop_freq <= 0:
     args.stop_freq = -1
+  args.epoch_steps = args.epoch_size // args.batch_size
 
   # save args
   with open('{}/args.json'.format(args.out_dir), 'w') as f:
@@ -173,8 +172,9 @@ def main():
 
   tr.train_loop(model, data_loader, device, optimizer, args.out_dir,
       args.epochs, args.chkp_freq, args.stop_freq, scheduler=scheduler,
-      eval_rank=args.eval_rank, reset_unused=args.reset_unused,
-      save_data=args.save_large_data, init_time=init_time)
+      epoch_steps=args.epoch_steps, eval_rank=args.eval_rank,
+      reset_unused=args.reset_unused, save_data=args.save_large_data,
+      init_time=init_time)
   return
 
 
@@ -212,23 +212,32 @@ if __name__ == '__main__':
                       help='Affine setting [default: 0]')
   parser.add_argument('--sigma-hat', type=float, default=0.1,
                       help='Noise estimate [default: 0.1]')
-  parser.add_argument('--min-size', type=float, default=0.01,
+  parser.add_argument('--min-size', type=float, default=0.0,
                       help=('Minimum cluster size as fraction relative to 1/k'
-                      '[default: 0.01]'))
+                      '[default: 0.0]'))
   # training settings
   parser.add_argument('--batch-size', type=int, default=100,
                       help='Input batch size for training [default: 100]')
   parser.add_argument('--epochs', type=int, default=50,
                       help='Number of epochs to train [default: 50]')
+  parser.add_argument('--epoch-size', type=int, default=None,
+                      help=('Number of samples to consider an "epoch" '
+                      '[default: N]'))
   parser.add_argument('--optim', type=str, default='SGD',
                       help='Optimizer [default: SGD]')
   parser.add_argument('--init-lr', type=float, default=0.5,
                       help='Initial learning rate [default: 0.5]')
-  parser.add_argument('--scale-grad-freq', type=int, default=20,
-                      help=('How often to re-compute local Lipschitz for MF '
+  parser.add_argument('--scale-grad-mode', type=str, default=None,
+                      help=('Gradient scaling mode (none, lip, newton) '
+                      '[default: None]'))
+  parser.add_argument('--scale-grad-update-freq', type=int, default=20,
+                      help=('How often to re-compute gradient scaling for MF '
                       'formulation [default: 20]'))
   parser.add_argument('--reset-unused', type=ut.boolarg, default=True,
                       help='Reset nearly unused clusters [default: 1]')
+  parser.add_argument('--reset-metric', type=str, default='obj_decr',
+                      help=('Metric used to sample swap candidates '
+                      '(obj_decr, value) [default: obj_decr]'))
   parser.add_argument('--reset-patience', type=int, default=100,
                       help=('Steps to wait without obj decrease '
                       'before trying to reset [default: 100]'))
@@ -237,12 +246,9 @@ if __name__ == '__main__':
                       'when to reset [default: 0.01]'))
   parser.add_argument('--reset-max-steps', type=int, default=50,
                       help='Number of reset SA iterations [default: 50]')
-  parser.add_argument('--reset-accept-tol', type=float, default=0.01,
+  parser.add_argument('--reset-accept-tol', type=float, default=0.001,
                       help=('Objective decrease tolerance for accepting'
-                      'a reset [default: 0.01]'))
-  parser.add_argument('--reset-sigma', type=float, default=0.0,
-                      help=('Scale of perturbation to add after reset '
-                      '[default: 0.0]'))
+                      'a reset [default: 0.001]'))
   parser.add_argument('--reset-cache-size', type=int, default=500,
                       help='Num samples for reset assign obj [default: 500]')
   parser.add_argument('--serial-eval', type=str, default=None,
