@@ -1,10 +1,19 @@
 from __future__ import print_function
 from __future__ import division
 
-import numpy as np
+from collections import OrderedDict
 import shutil
+import gc
+
+import numpy as np
+from scipy.optimize import linear_sum_assignment, bisect
+from scipy.sparse.linalg import svds
+from sklearn.utils.extmath import randomized_svd
 import torch
-from scipy.optimize import linear_sum_assignment
+import torch.nn.functional as F
+import pandas as pd
+
+EPS = 1e-8
 
 
 class AverageMeter(object):
@@ -26,6 +35,24 @@ class AverageMeter(object):
     self.sum += val * n
     self.count += n
     self.avg = self.sum / self.count
+
+
+def boolarg(arg):
+  return bool(int(arg))
+
+
+def reset_optimizer_state(model, optimizer, rIdx):
+  """Reset optimizer states to zero for re-initialized replicates &
+  clusters. Or, if copy=True, copy states from duplicated clusters."""
+  for p in model.parameters():
+    if not p.requires_grad:
+      continue
+    state = optimizer.state[p]
+    for key, val in state.items():
+      if isinstance(val, torch.Tensor) and val.shape == p.shape:
+        # assuming all parameters have (r, k) as first dims.
+        val[rIdx, :] = 0.0
+  return
 
 
 def get_learning_rate(optimizer):
@@ -53,8 +80,8 @@ def eval_cluster_error(*args, **kwargs):
   """Evaluate clustering error.
 
   Examples:
-    cluster_error = eval_cluster_error(conf_mat)
-    cluster_error = eval_cluster_error(groups, true_groups)
+    cluster_error, conf_mat = eval_cluster_error(conf_mat)
+    cluster_error, conf_mat = eval_cluster_error(groups, true_groups, k)
 
   Args:
     conf_mat: (n, n) group confusion matrix
@@ -69,8 +96,8 @@ def eval_cluster_error(*args, **kwargs):
   else:
     groups = args[0]
     true_groups = args[1]
-    # number of groups and labels will be inferred from groups and true_groups.
-    conf_mat = eval_confusion(groups, true_groups)
+    # number of groups and labels will be inferred from true_groups.
+    conf_mat = eval_confusion(groups, true_groups, k=kwargs.get('k'))
 
   if torch.is_tensor(conf_mat):
     conf_mat = conf_mat.numpy()
@@ -82,39 +109,419 @@ def eval_cluster_error(*args, **kwargs):
   correct = conf_mat[row_ind, col_ind].sum()
   N = conf_mat.sum()
   cluster_error = 1.0 - correct/N
-  return cluster_error, conf_mat
+
+  if row_ind.size < conf_mat.shape[0]:
+    row_ind = np.concatenate([row_ind,
+      np.setdiff1d(np.arange(conf_mat.shape[0]), row_ind)])
+  if col_ind.size < conf_mat.shape[1]:
+    col_ind = np.concatenate([col_ind,
+      np.setdiff1d(np.arange(conf_mat.shape[1]), col_ind)])
+  map_Idx = (row_ind, col_ind)
+  return cluster_error, map_Idx
 
 
-def eval_confusion(groups, true_groups, k=None, true_k=None,
-      true_classes=None):
-  """compute confusion matrix between assigned and true groups"""
-  if isinstance(groups, np.ndarray):
-    groups = torch.from_numpy(groups)
-  if isinstance(true_groups, np.ndarray):
-    true_groups = torch.from_numpy(true_groups)
-  if groups.numel() != true_groups.numel():
+def eval_confusion(groups, true_groups, k, true_classes=None):
+  """compute confusion matrix between assigned and true groups
+
+  Note: group labels assumed to be integers (0, ..., k-1).
+  """
+  if torch.is_tensor(groups):
+    groups = groups.cpu().numpy()
+  if torch.is_tensor(true_groups):
+    true_groups = true_groups.cpu().numpy()
+  if groups.size != true_groups.size:
     raise ValueError("groups true_groups must have the same size")
 
-  with torch.no_grad():
-    if k is not None:
-      classes = torch.arange(k).view(1, -1)
-      if true_classes is not None:
-        true_classes = torch.tensor(true_classes).view(1, -1)
-      elif true_k is not None:
-        true_classes = torch.arange(true_k).view(1, -1)
-      else:
-        true_classes = classes
-    else:
-      classes = torch.unique(groups).view(1, -1)
-      true_classes = torch.unique(true_groups).view(1, -1)
+  if true_classes is not None:
+    true_groups = np.argmax(true_groups.reshape(-1, 1) ==
+        true_classes.reshape(1, -1), axis=1)
+    true_k = true_classes.shape[0]
+  else:
+    true_labels, true_groups = np.unique(true_groups, return_inverse=True)
+    true_k = true_labels.shape[0]
+  conf_mat = np.zeros((k, true_k))
 
-    groups = groups.view(-1, 1)
-    true_groups = true_groups.view(-1, 1)
-
-    groups_onehot = (groups == classes).type(torch.int64)
-    true_groups_onehot = (true_groups == true_classes).type(torch.int64)
-    # float32 used here so that single all reduce can be used in distributed
-    # setting. Is there a case where float32 might be inaccurate?
-    conf_mat = torch.matmul(groups_onehot.t(),
-        true_groups_onehot).type(torch.float32)
+  groups = groups.reshape(-1)
+  true_groups = true_groups.reshape(-1)
+  groups_stack = np.stack((groups, true_groups), axis=1)
+  Idx, counts = np.unique(groups_stack, axis=0, return_counts=True)
+  conf_mat[Idx[:, 0], Idx[:, 1]] = counts
   return conf_mat
+
+
+def rank(X, tol=.01):
+  """Evaluate approximate rank of X."""
+  _, svs, _ = torch.svd(X)
+  return (svs > tol*svs.max()).sum(), svs
+
+
+def find_soft_assign(losses, T=1.):
+  """soft assignment found by shifting up negative losses by T, thresholding
+  and normalizing.
+
+  Args:
+    losses (Tensor): (Nb, n) matrix of loss values.
+    T (float): soft assignment parameter in (0, \infty).
+
+  .. note::
+    For any T there is a tau such that the returned c is a solution to
+
+      min_c c^T l  s.t.  c >= 0, c^T 1 = 1, ||c||_2^2 <= tau
+
+    Since the optimality conditions of this problem yield
+
+      c^* = 1/gamma( lambda \1 - l)_+
+
+    for gamma, lambda Lagrange multipliers.
+  """
+  if T <= 0:
+    raise ValueError("soft assignment T must be > 0.")
+  # normalize loss to that T has consistent interpretation.
+  # NOTE: minimum loss can't be exactly zero
+  loss_min, _ = losses.min(dim=1, keepdim=True)
+  losses = losses.div(loss_min)
+  c = torch.clamp(T + 1. - losses, min=0.)
+  c = c.div(c.sum(dim=1, keepdim=True))
+  return c
+
+
+def coherence(U1, U2, normalize=False, svd=False, sv_tol=None):
+  """Compute coherence between U1, U2.
+
+  Args:
+    U1, U2: (D x d) matrices
+    normalize: normalize columns of U1, U2 (default: False)
+    svd: Orthogonalize bases by svd (default: False)
+    sv_tol: Singular value threshold (default: None)
+
+  Returns:
+    coh: scalar coherence loss
+  """
+  d = U1.size(1)
+  if normalize:
+    U1 = unit_normalize(U1, p=2, dim=0)
+    U2 = unit_normalize(U2, p=2, dim=0)
+  if svd:
+    U1, s1, _ = torch.svd(U1)
+    U2, s2, _ = torch.svd(U2)
+    if sv_tol is not None and sv_tol > 0:
+      U1 = U1[:, (s1 >= sv_tol*s1[0])]
+      U2 = U2[:, (s2 >= sv_tol*s2[0])]
+      d = min(U1.size(1), U2.size(1))
+  coh = torch.matmul(U1.t(), U2).pow(2).sum().div(d)
+  return coh
+
+
+def eval_cluster_coherence(Us, normalize=False, svd=True, sv_tol=1e-3):
+  """Evaluate coherence for every pair of subspace bases
+
+  Args:
+    Us: subspace bases, shape (k, D, d)
+    normalize: normalize columns of U1, U2 (default: False)
+    svd: Orthogonalize bases by svd (default: True)
+    sv_tol: Singular value threshold (default: 1e-3)
+
+  Returns:
+    coh_mat: coherence matrix, shape (k, k)
+  """
+  with torch.no_grad():
+    k = Us.shape[0]
+    coh_mat = np.array([[
+        coherence(Us[ii, :], Us[jj, :], normalize=False,
+            svd=True, sv_tol=sv_tol).item()
+        for jj in range(k)] for ii in range(k)])
+  return coh_mat
+
+
+def cos_knn(y, X, k, normalize=False):
+  """Find knn in absolute cosine distance.
+
+  Args:
+    y: targets, shape (n, D).
+    X: dataset, shape (N, D).
+
+  Returns:
+    y_nn: nearest neighbors, shape (n, k, D)
+  """
+  with torch.no_grad():
+    if y.dim() == 1:
+      y = y.view(1, -1)
+    if normalize:
+      y = unit_normalize(y, dim=1)
+      X = unit_normalize(X, dim=1)
+
+    # (N, n)
+    cos_abs = torch.matmul(X, y.t()).abs()
+    # (n, k)
+    Idx = (torch.topk(cos_abs, k, dim=0)[1]).t()
+    # (n, k, D)
+    y_knn = X[Idx, :]
+  return y_knn
+
+
+def unit_normalize(X, p=2, dim=None):
+  """Normalize X
+
+  Args:
+    X: tensor
+    p: norm order
+    dim: dimension to normalize
+
+  returns:
+    unitX: normalized tensor
+  """
+  unitX = X.div(torch.norm(X, p=p, dim=dim, keepdim=True).add(EPS))
+  return unitX
+
+
+def batch_svd(X, out=None):
+  """Compute batch svd of X
+
+  Args:
+    X: shape (*, m, n)
+
+  Returns:
+    U, s, V: batch svds, shape (*, m, d), (*, d), (*, n, d) (d = min(m, n))
+  """
+  shape = X.shape
+  if len(shape) < 3:
+    raise ValueError("Invalid X value, should have >= 1 batch dim.")
+
+  X = X.contiguous()  # to ensure viewing works as expected
+  batch_dims = shape[:-2]
+  batch_D = np.prod(batch_dims)
+  m, n = shape[-2:]
+  d = min(m, n)
+  X = X.view(batch_D, m, n)
+
+  if out is not None:
+    U, s, V = out
+    # check strides
+    if U.stride()[-2:] != (1, m):
+      raise ValueError("U has invalid stride, must be stored as transpose")
+    if s.stride()[-1] != 1:
+      raise ValueError("s has invalid stride")
+    if V.stride()[-2:] != (n, 1):
+      raise ValueError("V has invalid stride")
+
+    U = U.view(batch_D, m, d)
+    s = s.view(batch_D, d)
+    V = V.view(batch_D, n, d)
+  else:
+    U = torch.zeros((batch_D, d, m), dtype=X.dtype, device=X.device)
+    # must be stored as transpose
+    U = U.transpose(1, 2)
+    s = torch.zeros((batch_D, d), dtype=X.dtype, device=X.device)
+    V = torch.zeros((batch_D, n, d), dtype=X.dtype, device=X.device)
+
+  for idx in range(batch_D):
+    torch.svd(X[idx, :], some=True, out=(U[idx, :], s[idx, :], V[idx, :]))
+
+  U = U.view(batch_dims + (m, d))
+  s = s.view(batch_dims + (d,))
+  V = V.view(batch_dims + (n, d))
+  return U, s, V
+
+
+def batch_ridge(B, A, lamb=0.0):
+  """Solve regularized least-squares problem
+
+      min_X 1/2 || A X - B ||_F^2 + \lambda/2 || X ||_F^2
+
+  by explicitly solving normal equations
+
+      (A^T A + \lambda I) X = A^T B
+
+  Args:
+    B: shape (*, m, n)
+    A: shape (*, m, p)
+
+  Returns:
+    X: shape (*, p, n)
+  """
+  dim = A.dim()
+  p = A.shape[-1]
+
+  At = A.transpose(dim-2, dim-1)
+  AtA = torch.matmul(At, A)
+  AtB = torch.matmul(At, B)
+
+  if lamb > 0:
+    lambeye = torch.eye(p, dtype=A.dtype, device=A.device).mul_(lamb)
+    AtA = AtA.add_(lambeye)
+
+  X, _ = torch.gesv(AtB, AtA)
+  return X
+
+
+def reg_pca(X, d, form='proj', lamb=0.0, gamma=0.0, affine=False,
+      solver='randomized'):
+  """Solve one of the regularized PCA problems
+
+  (proj):
+
+  min_U  1/2 || (X - 1 b^T) -  (X - 1 b^T) U U^T ||_F^2
+      + lambda || U ||_F^2 + gamma || U U^T ||_F
+
+  (mf):
+
+  min_{U,V}  1/2 || (X - 1 b^T) -  U V^T ||_F^2
+      + lambda/2 (|| U ||_F^2 + || V ||_F^2)
+
+  Args:
+    X: dataset (N, D).
+    form: either 'proj' or 'mf' (default: 'proj')
+    lamb, gamma: regularization parameters (default: 0.0).
+    affine: Use affine PCA model with bias b.
+    solver: SVD solver ('randomized', 'svds', 'svd').
+
+  Returns:
+    U: subspace basis with containing top singular vectors, possibly with
+      column norm shrinkage if lamb, gamma > 0 (D, d).
+    b: subspace bias (d,).
+  """
+  if form not in {'proj', 'mf'}:
+    raise ValueError("Invalid form {}".format(form))
+
+  if not torch.is_tensor(X):
+    X = torch.from_numpy(X)
+  device = X.device
+
+  if affine:
+    b = X.mean(dim=0)
+    X = X.sub(b)
+  else:
+    b = None
+
+  if X.shape[0] < d:
+    # special case where N < d
+    _, s, U = torch.svd(X, some=False)
+    s = torch.cat((s,
+        torch.zeros(d - s.shape[0], dtype=s.dtype, device=s.device)))
+    U = U[:, :d]
+  elif solver == 'svd':
+    _, s, U = torch.svd(X)
+    s, U = s[:d], U[:, :d]
+  else:
+    X = X.cpu().numpy()
+    if solver == 'svds':
+      _, s, Ut = svds(X, d)
+    else:
+      _, s, Ut = randomized_svd(X, d)
+    s, Ut = [torch.from_numpy(z).to(device) for z in (s, Ut)]
+    U = Ut.t()
+
+  # shrink column norms
+  if max(lamb, gamma) > 0:
+    nz_mask = s >= max(s[0], 1)*EPS
+    s_nz = s[nz_mask]
+
+    if form == 'mf':
+      z = F.relu(s_nz - lamb).sqrt()
+    else:
+      s_sqr = s_nz.pow(2)
+      s_sqr_shrk = F.relu(s_sqr - lamb)
+      if gamma == 0:
+        z = s_sqr_shrk.div(s_sqr)
+      else:
+        if torch.norm(s_sqr_shrk) <= gamma + EPS:
+          z = torch.zeros_like(s_nz)
+        else:
+          # find ||z||_2 by bisection
+          def norm_test(beta):
+            z = s_sqr_shrk.div(s_sqr + gamma/beta)
+            return torch.norm(z) - beta
+
+          a, b = 1e-4, np.sqrt(s.shape[0])
+          while norm_test(a) < 0:
+            a /= 10
+            if a <= 1e-16:
+              raise RuntimeError("Bisection zero-finding failed.")
+
+          beta = bisect(norm_test, a, b, xtol=EPS, rtol=EPS)
+          z = s_sqr_shrk.div(s_sqr + gamma/beta)
+      z = z.sqrt()
+    U[:, nz_mask] *= z
+    U[:, nz_mask == 0] = 0.0
+  return U, b
+
+
+def print_cuda_tensors():
+  """Print active cuda tensors.
+
+  Adapted from:
+  https://discuss.pytorch.org/t/how-to-debug-causes-of-gpu-memory-leaks/6741
+  """
+  objs = gc.get_objects()
+  obj_counts = {}
+  obj_dev_shapes = []
+  for obj in objs:
+    try:
+      if (torch.is_tensor(obj) or (hasattr(obj, 'data') and
+            torch.is_tensor(obj.data))):
+        device = str(obj.device)
+        shape = tuple(obj.shape)
+        key = (device, shape)
+        if key in obj_counts:
+          obj_counts[key] += 1
+        else:
+          obj_dev_shapes.append(key)
+          obj_counts[key] = 1
+    except Exception:
+      pass
+
+  for key in sorted(obj_dev_shapes):
+    if 'cuda' in key[0]:
+      print('{}: {}'.format(key, obj_counts[key]))
+  return
+
+
+def unique_resets(reset_cids):
+  """Choose last occurrence of each cidx."""
+  revIdx = np.arange(reset_cids.shape[0] - 1, -1, -1)
+  _, uniqIdx = np.unique(reset_cids[revIdx], axis=0, return_index=True)
+  uniqIdx = revIdx[uniqIdx]
+  return uniqIdx
+
+
+def aggregate_resets(resets):
+  """Aggregate resets for each epoch and replicate."""
+  columns = ['epoch', 'itr', 'ridx', 'cidx', 'cand.ridx', 'cand.cidx',
+      'success', 'obj.decr', 'cumu.obj.decr', 'temp']
+  dtypes = 7*[int] + 3*[float]
+  resets_dict = {columns[ii]: resets[:, ii].astype(dtypes[ii])
+      for ii in range(len(columns))}
+  resets = pd.DataFrame(data=resets_dict)
+  resets = resets[resets['success'] == 1]
+  grouped = resets.groupby(['epoch', 'itr', 'ridx'])
+  agg_resets = grouped.agg(OrderedDict([('success', ['count']), ('obj.decr',
+      ['min', 'median', 'max']), ('cumu.obj.decr', ['min', 'median', 'max']),
+      ('temp', ['min'])]))
+  agg_resets.reset_index(inplace=True)
+  agg_resets.columns = (['epoch', 'itr', 'ridx', 'path.length'] +
+      ['{}.{}'.format(met, meas) for met in ['obj.decr', 'cumu.obj.decr']
+          for meas in ['min', 'med', 'max']] + ['temp'])
+  return agg_resets
+
+
+def set_auto_reg_params(k, d, D, Ng, sigma_hat, min_size=0.0):
+  """Compute "optimal" regularization parameters based on expected singular
+  value distribution.
+
+  Key resource is (Gavish & Donoho, 2014). In general, we know that the noise
+  singular values will have a right bulk edge at:
+      (sqrt{N_j} + sqrt{D - d}) (\sigma / sqrt{D})
+  whereas the data singular values will have a right bulk edge at:
+      (sqrt{N_j} + sqrt{d}) sqrt{1/ d + \sigma^2 / D}
+  The regularization parameters are set so that the "inside reg" will threshold
+  all noise svs, whereas the "outside reg" will threshold all noise + data svs
+  as soon as the cluster becomes too small.
+  """
+  if sigma_hat < 0:
+    raise ValueError("sigma hat {} should be >= 0.".format(sigma_hat))
+  if min_size >= 1 or min_size < 0:
+    raise ValueError("min size {} should be in [0, 1).".format(min_size))
+  U_frosqr_in_lamb = ((1.0 + np.sqrt((D - d)/Ng))**2 * (sigma_hat**2 / D))
+  U_frosqr_out_lamb = ((min_size / k) * (1.0 / d + sigma_hat**2 / D))
+  z_lamb = 0.01
+  return U_frosqr_in_lamb, U_frosqr_out_lamb, z_lamb

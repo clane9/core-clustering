@@ -1,20 +1,27 @@
 from __future__ import division
 from __future__ import print_function
 
-import math
+import os
 import numpy as np
+from scipy.io import loadmat
 import torch
-from torch.utils.data import Dataset, Sampler
-from torchvision.datasets import MNIST
-import torch.distributed as dist
+from torch.utils.data import Dataset
 
-import models as mod
+CODE_DIR = os.path.dirname(os.path.realpath(__file__))
 
 
 class SynthUoSDataset(Dataset):
   """Synthetic union of subspaces dataset."""
-  def __init__(self, n, d, D, Ng, affine=False, sigma=0., seed=None):
+  def __init__(self, n, d, D, Ng, affine=False, sigma=0., theta=None,
+        normalize=False, seed=None):
     super(SynthUoSDataset).__init__()
+
+    if theta is not None:
+      if theta <= 0:
+        raise ValueError("Invalid principal angle {}".format(theta))
+      if n*d > D:
+        raise ValueError("Can only specify principal angle for independent "
+            "subspaces")
 
     self.n = n  # number of subspaces
     self.d = d  # subspace dimension
@@ -23,80 +30,127 @@ class SynthUoSDataset(Dataset):
     self.N = n*Ng
     self.affine = affine
     self.sigma = sigma
+    self.theta = theta
+    self.normalize = normalize
     self.classes = np.arange(n)
 
-    rng = np.random.RandomState(seed=seed)
+    self.rng = np.random.RandomState(seed=seed)
 
-    self.Us = np.zeros([D, d, n])
-    self.Vs = np.zeros([d, Ng, n])
-    self.bs = np.zeros([D, n]) if affine else None
+    self.Us = np.zeros([n, D, d])
+    self.Vs = np.zeros([n, d, Ng])
+    self.bs = np.zeros([n, D]) if affine else None
     self.X = np.zeros([self.N, D])
     self.groups = np.zeros(self.N, dtype=np.int32)
 
-    # sample data from randomnly generated (linear or affine) subspaces
+    # generate bases
+    if theta is None:
+      # bases sampled uniformly at random
+      for ii in range(n):
+        self.Us[ii, :] = np.linalg.qr(self.rng.randn(D, d))[0]
+    else:
+      # bases sampled with fixed principal angles.
+      alpha = np.sqrt(np.cos(theta))
+      beta = np.sqrt(1.0 - alpha**2)
+
+      # all bases will be a perturbation of U0
+      U0 = np.linalg.qr(self.rng.randn(D, d), mode='complete')[0]
+      U0_comp = U0[:, d:]
+      U0 = U0[:, :d]
+      # apply random rotation to U0 complement
+      Q = np.linalg.qr(self.rng.randn(D-d, D-d))[0]
+      U0_comp = np.matmul(U0_comp, Q)
+      for ii in range(n):
+        P = np.linalg.qr(self.rng.randn(d, d))[0]
+        self.Us[ii, :] = (alpha*np.matmul(U0, P) +
+            beta*U0_comp[:, ii*d:(ii+1)*d])
+
+    # sample coefficients
     for ii in range(n):
-      U, _ = np.linalg.qr(rng.randn(D, d))
-      V = (1./np.sqrt(d))*rng.randn(d, Ng)
-      self.Us[:, :, ii] = U
-      self.Vs[:, :, ii] = V
-      Xi = np.matmul(U, V)
+      V = (1./np.sqrt(d))*self.rng.randn(d, Ng)
+      self.Vs[ii, :] = V
+      Xi = np.matmul(self.Us[ii, :], V)
 
       if affine:
-        b = (1./np.sqrt(D))*rng.randn(D, 1)
-        self.bs[:, ii] = b
+        b = (1./np.sqrt(D))*self.rng.randn(D, 1)
+        self.bs[ii, :] = b[:, 0]
         Xi += b
 
       self.X[ii*Ng:(ii+1)*Ng, :] = Xi.T
       self.groups[ii*Ng:(ii+1)*Ng] = ii
 
     if sigma > 0.:
-      E = (sigma/np.sqrt(D))*rng.randn(self.N, D)
+      E = (sigma/np.sqrt(D))*self.rng.randn(self.N, D)
       self.X += E
 
     # permute order of data
-    self.perm = rng.permutation(self.N)
+    self.perm = self.rng.permutation(self.N)
     self.X = self.X[self.perm, :]
     self.groups = self.groups[self.perm]
 
     self.X = torch.tensor(self.X, dtype=torch.float32)
     self.groups = torch.tensor(self.groups, dtype=torch.int64)
-    self.Idx = torch.arange(self.N)
+
+    if normalize:
+      self.X.div_(torch.norm(self.X, dim=1, keepdim=True))
     return
 
   def __len__(self):
     return self.N
 
   def __getitem__(self, ii):
-    return self.Idx[ii], self.X[ii, :], self.groups[ii]
+    return self.X[ii, :], self.groups[ii]
 
 
-class SynthUoSOnlineDataset(Dataset):
+class SynthUoSMissDataset(SynthUoSDataset):
+  """Synthetic union of subspaces dataset with missing data."""
+  def __init__(self, n, d, D, Ng, affine=False, sigma=0., theta=None,
+        miss_rate=0.0, normalize=False, store_sparse=True, store_dense=False,
+        test_frac=0.05, seed=None):
+    if miss_rate >= 1 or miss_rate < 0:
+      raise ValueError("Invalid miss_rate {}".format(miss_rate))
+
+    super().__init__(n, d, D, Ng, affine, sigma, theta, normalize, seed)
+
+    self.miss_rate = miss_rate
+    self.test_frac = test_frac
+    self.store_sparse = store_sparse
+    self.store_dense = store_dense
+
+    # sample observed entries uniformly
+    self.Omega = (torch.tensor(self.rng.rand(self.N, self.D),
+        dtype=torch.float32) <= (1 + test_frac)*(1 - miss_rate))
+    OmegaIdx = self.Omega.nonzero()
+    test_mask = (torch.tensor(self.rng.rand(OmegaIdx.shape[0]),
+        dtype=torch.float32) <= test_frac)
+    self.Omega[OmegaIdx[test_mask, 0], OmegaIdx[test_mask, 1]] = 0
+    self.Omega_test = torch.zeros_like(self.Omega)
+    self.Omega_test[OmegaIdx[test_mask, 0], OmegaIdx[test_mask, 1]] = 1
+    return
+
+  def __getitem__(self, ii):
+    x, omega, omega_test, grp = (self.X[ii, :], self.Omega[ii, :],
+        self.Omega_test[ii, :], self.groups[ii])
+
+    x_miss = MissingDataSample(x, omega=omega, store_sparse=self.store_sparse,
+        store_dense=self.store_dense)
+    x0 = MissingDataSample(x, omega=omega_test, store_sparse=self.store_sparse,
+        store_dense=self.store_dense)
+    return x_miss, grp, x0
+
+
+class SynthUoSOnlineDataset(SynthUoSDataset):
   """Synthetic union of subspaces dataset with fresh samples."""
-  def __init__(self, n, d, D, N, affine=False, sigma=0., seed=None):
-    super(SynthUoSOnlineDataset).__init__()
+  def __init__(self, n, d, D, N, affine=False, sigma=0., theta=None,
+        normalize=False, seed=None):
+    super().__init__(n, d, D, 10, affine, sigma, theta, normalize, seed)
+    self.Us = torch.tensor(self.Us, dtype=torch.float32)
+    self.N = N
 
-    self.n = n  # number of subspaces
-    self.d = d  # subspace dimension
-    self.D = D  # ambient dimension
-    self.N = N  # number of points
-    self.affine = affine
-    self.sigma = sigma
-
-    self.rng = torch.Generator()
-    if seed is not None:
-      self.rng.manual_seed(seed)
-    self.seed = seed
-
-    self.classes = np.arange(n)
-    self.Us = torch.zeros((n, D, d))
-    self.bs = torch.zeros((n, D)) if affine else None
-
-    # sample data from randomnly generated (linear or affine) subspaces
-    for grp in range(n):
-      self.Us[grp, :, :], _ = torch.qr(torch.randn(D, d, generator=self.rng))
-
-      if affine:
-        self.bs[grp, :] = (1./np.sqrt(D))*torch.randn(D, generator=self.rng)
+    # parent constructor called to generate bases, but coefficients and X don't
+    # matter
+    self.Vs = None
+    self.X = None
+    self.groups = None
     return
 
   def __len__(self):
@@ -107,211 +161,450 @@ class SynthUoSOnlineDataset(Dataset):
     # generate data. Otherwise rng is duplicated and end up getting repeated
     # data. Also note that it doesn't matter if seed is changed after
     # DataLoader constructor is called.
-    grp = torch.randint(high=self.n, size=(1,), dtype=torch.int64)
+    grp = torch.randint(high=self.n, size=(1,), dtype=torch.int64)[0]
     v = (1./np.sqrt(self.d))*torch.randn(self.d, 1)
     x = torch.matmul(self.Us[grp, :, :], v).view(-1)
     if self.affine:
       x += self.bs[grp, :]
     if self.sigma > 0:
       x += (self.sigma/np.sqrt(self.D))*torch.randn(self.D)
-    return torch.tensor(ii), x, grp
+    if self.normalize:
+      x.div_(torch.norm(x))
+    return x, grp
 
 
-class SynthUoMDataset(Dataset):
-  """Synthetic union of low-dimensional manifolds dataset."""
-  def __init__(self, n, d, D, Ng, H, res_weight_scale=1.0, sigma=0.,
-        seed=None):
-    super(SynthUoMDataset).__init__()
+class SynthUoSMissOnlineDataset(SynthUoSOnlineDataset):
+  """Synthetic union of subspaces dataset with fresh samples."""
+  def __init__(self, n, d, D, N, affine=False, sigma=0., theta=None,
+        miss_rate=0.0, normalize=False, store_sparse=False, store_dense=False,
+        test_frac=0.05, seed=None):
+    if miss_rate >= 1 or miss_rate < 0:
+      raise ValueError("Invalid miss_rate {}".format(miss_rate))
 
-    self.n = n  # number of subspaces
-    self.d = d  # subspace dimension
-    self.D = D  # ambient dimension
-    self.Ng = Ng  # points per group
-    self.N = n*Ng
-    self.H = H
-    self.res_weight_scale = res_weight_scale
-    self.sigma = sigma
-    self.classes = np.arange(n)
+    super().__init__(n, d, D, N, affine, sigma, theta, normalize, seed)
 
-    if seed is not None:
-      torch.manual_seed(seed)
-    rng = np.random.RandomState(seed=seed)
+    self.miss_rate = miss_rate
+    self.test_frac = test_frac
+    self.store_sparse = store_sparse
+    self.store_dense = store_dense
+    return
 
-    self.group_models = [mod.ResidualManifoldModel(d, D, H,
-        drop_p=0.0, res_lamb=0.0) for _ in range(n)]
-    # scale weights to control smoothness
-    for gm in self.group_models:
-      gm.res_fc1.weight.data.mul_(res_weight_scale)
-      gm.res_fc2.weight.data.mul_(res_weight_scale)
+  def __getitem__(self, ii):
+    x, grp = super().__getitem__(ii)
+    omega = (torch.rand(self.D) <= (1 + self.test_frac)*(1 - self.miss_rate))
+    omegaIdx = omega.nonzero().view(-1)
+    test_mask = (torch.rand(omegaIdx.shape[0]) <= self.test_frac)
+    omega_testIdx = omegaIdx[test_mask]
+    omegaIdx = omegaIdx[test_mask == 0]
 
-    self.planted_model = mod.KManifoldClusterModel(n, d, D, self.N, self.N,
-        self.group_models)
-    self.planted_model.eval()
+    x_miss = MissingDataSample(x[omegaIdx], indices=omegaIdx, D=self.D,
+        store_sparse=self.store_sparse, store_dense=self.store_dense)
+    x0 = MissingDataSample(x[omega_testIdx], indices=omega_testIdx, D=self.D,
+        store_sparse=self.store_sparse, store_dense=self.store_dense)
+    return x_miss, grp, x0
 
-    # generate true groups and segmentation
-    self.groups = np.arange(n, dtype=np.int64).reshape(-1, 1)
-    self.groups = np.tile(self.groups, (1, Ng)).reshape(-1)
 
-    self.planted_model.C.zero_()
-    self.planted_model.C.scatter_(1,
-        torch.from_numpy(self.groups).view(-1, 1), 1)
+class ImageUoSDataset(Dataset):
+  """Image datasets, mostly from (You et al., CVPR 2016)."""
+  def __init__(self, dataset='mnist', center=False, sv_range=None,
+        normalize=True):
+    if dataset == 'mnist':
+      matfile = '{}/datasets/MNIST_SC_pca.mat'.format(CODE_DIR)
+      data = loadmat(matfile)
+      self.X = torch.tensor(data['MNIST_SC_DATA'].T, dtype=torch.float32)
+      self.groups = torch.tensor(data['MNIST_LABEL'].reshape(-1),
+          dtype=torch.int64)
+    elif dataset == 'coil100':
+      matfile = '{}/datasets/COIL100_SC_pca.mat'.format(CODE_DIR)
+      data = loadmat(matfile)
+      self.X = torch.tensor(data['COIL100_SC_DATA'].T, dtype=torch.float32)
+      self.groups = torch.tensor(data['COIL100_LABEL'].reshape(-1),
+          dtype=torch.int64)
+    elif dataset == 'coil20':
+      matfile = '{}/datasets/COIL20_SC_pca.mat'.format(CODE_DIR)
+      data = loadmat(matfile)
+      self.X = torch.tensor(data['COIL20_SC_DATA'].T, dtype=torch.float32)
+      self.groups = torch.tensor(data['COIL20_LABEL'].reshape(-1),
+          dtype=torch.int64)
+    elif dataset == 'yaleb':
+      matfile = '{}/datasets/small_YaleB_48x42.mat'.format(CODE_DIR)
+      data = loadmat(matfile)
+      # tuple (scale, dim, D, N, images, labels)
+      small_yale = data['small_yale'][0, 0]
+      self.X = torch.tensor(small_yale[4].T, dtype=torch.float32)
+      self.groups = torch.tensor(small_yale[5][0, :], dtype=torch.int64)
+    else:
+      raise ValueError("Invalid dataset {}".format(dataset))
 
-    # generate union of manifold data
-    ii = torch.arange(self.N, dtype=torch.int64)
-    with torch.no_grad():
-      self.X = self.planted_model(ii)
-      self.X.mul_(self.planted_model.C.unsqueeze(1))
-      self.X = self.X.sum(dim=2)
+    self.classes = torch.unique(self.groups, sorted=True).numpy()
+    self.n = self.classes.shape[0]
 
-    if sigma > 0.:
-      E = torch.randn(self.N, D).mul(sigma/np.sqrt(D))
-      self.X += E
+    # normalize data points (rows) of X
+    if center:
+      self.X.sub_(self.X.mean(dim=0))
+    if sv_range is not None:
+      # "whitening" by removing first few svs following (Zhang, 2012)
+      starti = sv_range[0] if len(sv_range) == 2 else 0
+      stopi = sv_range[1] if len(sv_range) == 2 else sv_range[0]
+      U, s, _ = torch.svd(self.X)
+      if stopi is None or stopi <= 0:
+        stopi = min(U.shape) + 1
+      self.X = U[:, starti:stopi] * s[starti:stopi]
 
-    # permute order of data
-    self.perm = rng.permutation(self.N)
-    self.X = self.X[self.perm, :]
-    self.groups = self.groups[self.perm]
-
-    self.groups = torch.tensor(self.groups, dtype=torch.int64)
-    self.Idx = torch.arange(self.N)
+    if normalize:
+      self.X.div_(torch.norm(self.X, p=2, dim=1, keepdim=True).add(1e-8))
+    self.N, self.D = self.X.shape
     return
 
   def __len__(self):
     return self.N
 
   def __getitem__(self, ii):
-    return self.Idx[ii], self.X[ii, :], self.groups[ii]
+    return self.X[ii, :], self.groups[ii]
 
 
-class MNISTUoM(MNIST):
-  """`MNIST <http://yann.lecun.com/exdb/mnist/>`_ Dataset.
-    Args:
-      root (string): Root directory of dataset where ``processed/training.pt``
-        and  ``processed/test.pt`` exist.
-      train (bool, optional): If True, creates dataset from ``training.pt``,
-        otherwise from ``test.pt``.
-      download (bool, optional): If true, downloads the dataset from the
-        internet and puts it in root directory. If dataset is already
-        downloaded, it is not downloaded again.
-      transform (callable, optional): A function/transform that  takes in an
-        PIL image and returns a transformed version. E.g,
-        ``transforms.RandomCrop``
-      target_transform (callable, optional): A function/transform that takes in
-        the target and transforms it.
-      classes (sequence, optional): Subset of digits to include. Note that
-        original digit labels are kept.
-    """
-  def __init__(self, root, train=True, transform=None, target_transform=None,
-        download=False, classes=None, batch_size=100):
-    super(MNISTUoM, self).__init__(root, train, transform, target_transform,
-        download)
+class SynthKMeansDataset(Dataset):
+  """Synthetic k means dataset."""
+  def __init__(self, k, D, Ng, separation=2.0, seed=None):
+    super().__init__()
 
-    self.classes = classes
-    if self.classes is not None:
-      self.classes = np.array(self.classes)
-      if np.setdiff1d(self.classes, np.arange(10)).size > 0:
-        raise ValueError("Invalid classes.")
+    self.k = k  # number of groups
+    self.D = D  # ambient dimension
+    self.Ng = Ng  # points per group
+    self.N = k*Ng
+    self.classes = np.arange(k)
 
-      if self.train:
-        self.train_data, self.train_labels = self._subset_classes(
-            self.train_data, self.train_labels, self.classes)
-      else:
-        self.test_data, self.test_labels = self._subset_classes(
-            self.test_data, self.test_labels, self.classes)
+    # c separation from Dasgupta 1999
+    if separation is None or separation < 0:
+      self.separation = 2.0
     else:
-      self.classes = np.arange(10)
+      self.separation = separation
 
-    # make sure batch_size divides N
-    N = len(self)
-    if batch_size <= 0 or batch_size > N:
-      batch_size = N
-    self.batch_size = batch_size
-    N = (N // batch_size)*batch_size
-    # NOTE: separately named train_* and test_* is annoying, and fixed in more
-    # recent torchvision
-    if self.train:
-      self.train_data = self.train_data[:N, :]
-      self.train_labels = self.train_labels[:N]
-    else:
-      self.test_data = self.test_data[:N, :]
-      self.test_labels = self.test_labels[:N]
+    self.rng = np.random.RandomState(seed=seed)
+    self.bs = (self.separation / np.sqrt(2)) * self.rng.randn(k, D)
 
-    self.Idx = torch.arange(len(self))
+    dists = np.sqrt(np.sum((np.expand_dims(self.bs, 1) -
+        np.expand_dims(self.bs, 0))**2, axis=2))
+    triuIdx = np.triu_indices(k, k=1)
+    self.dists = dists[triuIdx]
+
+    self.X = self.bs.repeat(Ng, axis=0)
+    self.groups = np.arange(k, dtype=np.int32).repeat(Ng)
+    self.X += self.rng.randn(Ng*k, D)
+
+    # permute order of data
+    self.perm = self.rng.permutation(self.N)
+    self.X = self.X[self.perm, :]
+    self.groups = self.groups[self.perm]
+
+    self.X = torch.tensor(self.X, dtype=torch.float32)
+    self.groups = torch.tensor(self.groups, dtype=torch.int64)
     return
 
-  def _subset_classes(self, data, labels, classes):
-    """Restrict data to subset of classes."""
-    mask = (labels.view(-1, 1) == torch.tensor(classes).view(1, -1)).any(dim=1)
-    data = data[mask, :]
-    labels = labels[mask]
-    return data, labels
+  def __len__(self):
+    return self.N
 
-  def __getitem__(self, index):
-    """
-    Args:
-      index (int): Index
-    Returns:
-      tuple: (index, image, target) where target is index of the target class.
-    """
-    img, target = super(MNISTUoM, self).__getitem__(index)
-    return self.Idx[index], img, target
+  def __getitem__(self, ii):
+    return self.X[ii, :], self.groups[ii]
 
 
-# taken from pytorch 1.0.0 so that data sampling order consistent regardless
-# world size.
-class DistributedSampler(Sampler):
-  """Sampler that restricts data loading to a subset of the dataset.
+class NetflixDataset(Dataset):
+  def __init__(self, dataset='nf_17k', center=True, normalize=False,
+        store_sparse=True, store_dense=False):
+    if dataset not in {'nf_17k', 'nf_1k'}:
+      raise ValueError("Dataset {} not supported".format(dataset))
 
-  It is especially useful in conjunction with
-  :class:`torch.nn.parallel.DistributedDataParallel`. In such case, each
-  process can pass a DistributedSampler instance as a DataLoader sampler,
-  and load a subset of the original dataset that is exclusive to it.
+    fname = {'nf_17k': 'nf_prize_446460x16885.npz',
+        'nf_1k': 'nf_prize_422889x889.npz'}[dataset]
+    fpath = '{}/datasets/nf_prize_preprocessed/{}.npz'.format(CODE_DIR, fname)
 
-  .. note::
-    Dataset is assumed to be of constant size.
+    with open(fpath, 'rb') as f:
+      f = np.load(f)
+      # tolist required since np.savez doesn't know how to properly handle
+      # sparse matrices. there is probably a better way.
+      self.X = f['nf_train_mat'].tolist().astype(np.float32)
+      self.X_test = f['nf_test_mat'].tolist().astype(np.float32)
+    if center:
+      train_mean = self.X.data.mean()
+      self.X.data -= train_mean
+      self.X_test.data -= train_mean
 
-  Arguments:
-    dataset: Dataset used for sampling.
-    num_replicas (optional): Number of processes participating in
-      distributed training.
-    rank (optional): Rank of the current process within num_replicas.
-  """
-
-  def __init__(self, dataset, num_replicas=None, rank=None):
-    if num_replicas is None:
-      if not dist.is_available():
-        raise RuntimeError("Requires distributed package to be available")
-      num_replicas = dist.get_world_size()
-    if rank is None:
-      if not dist.is_available():
-        raise RuntimeError("Requires distributed package to be available")
-      rank = dist.get_rank()
     self.dataset = dataset
-    self.num_replicas = num_replicas
-    self.rank = rank
-    self.epoch = 0
-    self.num_samples = int(math.ceil(len(self.dataset) *
-        (1.0 / self.num_replicas)))
-    self.total_size = self.num_samples * self.num_replicas
-
-  def __iter__(self):
-    # deterministically shuffle based on epoch
-    g = torch.Generator()
-    g.manual_seed(self.epoch)
-    indices = torch.randperm(len(self.dataset), generator=g).tolist()
-
-    # add extra samples to make it evenly divisible
-    indices += indices[:(self.total_size - len(indices))]
-    assert len(indices) == self.total_size
-
-    # subsample
-    indices = indices[self.rank:self.total_size:self.num_replicas]
-    assert len(indices) == self.num_samples
-
-    return iter(indices)
+    self.fname = fname
+    self.center = center
+    self.normalize = normalize
+    self.store_sparse = store_sparse
+    self.store_dense = store_dense
+    self.N, self.D = self.X.shape
+    self.groups, self.classes = None, None
+    return
 
   def __len__(self):
-    return self.num_samples
+    return self.N
 
-  def set_epoch(self, epoch):
-    self.epoch = epoch
+  def __getitem__(self, ii):
+    x_miss = self.X[ii, :]
+    x0 = self.X_test[ii, :]
+
+    if self.normalize:
+      xnorm = np.sqrt(self.D * (x_miss.data ** 2).mean())
+      x_miss.data = x_miss.data / xnorm
+      x0.data = x0.data / xnorm
+
+    x_miss = MissingDataSample(torch.from_numpy(x_miss.data),
+        indices=torch.from_numpy(x_miss.indices), D=self.D,
+        store_sparse=self.store_sparse, store_dense=self.store_dense)
+    x0 = MissingDataSample(torch.from_numpy(x0.data),
+        indices=torch.from_numpy(x0.indices), D=self.D,
+        store_sparse=self.store_sparse, store_dense=self.store_dense)
+    grp = torch.tensor(0)
+    return x_miss, grp, x0
+
+
+class MissingDataBatch(object):
+  def __init__(self, missing_samples):
+    """Represent a batch of missing data samples. Effectively a container for
+    (values, indices, omega)."""
+    self.nnz = torch.tensor([v.nnz for v in missing_samples],
+        dtype=torch.int64)
+    self.D = missing_samples[0].D
+    self.store_sparse = missing_samples[0].store_sparse
+    self.store_dense = missing_samples[0].store_dense
+    self.max_nnz = self.nnz.max().item()
+    self.pad_nnz = max(self.max_nnz, 2)
+
+    if self.store_sparse:
+      indices, values, omega = [], [], []
+    if self.store_dense:
+      values_dense, omega_dense = [], []
+    for v in missing_samples:
+      if self.store_sparse:
+        v.pad(self.pad_nnz)
+        indices.append(v.indices)
+        values.append(v.values)
+        omega.append(v.omega)
+      if self.store_dense:
+        values_dense.append(v.values_dense)
+        omega_dense.append(v.omega_dense)
+
+    if self.store_sparse:
+      self.indices = torch.stack(indices)
+      self.values = torch.stack(values)
+      self.omega = torch.stack(omega)
+      self.omega_float = self.omega.float()
+    else:
+      self.indices, self.values, self.omega = None, None, None
+      self.omega_float = None
+
+    if self.store_dense:
+      self.values_dense = torch.stack(values_dense)
+      self.omega_dense = torch.stack(omega_dense)
+      self.omega_float_dense = self.omega_dense.float()
+    else:
+      self.values_dense, self.omega_dense = None, None
+      self.omega_float_dense = None
+
+    batch_size = (self.values.shape[0] if self.store_sparse else
+        self.values_dense.shape[0])
+    self.shape = (batch_size, self.D)
+    self.device = (self.values.device if self.store_sparse else
+        self.values_dense.device)
+    return
+
+  def to(self, device):
+    if not isinstance(device, torch.device):
+      raise ValueError("to only supported for devices.")
+    if self.store_sparse:
+      self.indices = self.indices.to(device)
+      self.values = self.values.to(device)
+      self.omega = self.omega.to(device)
+      self.omega_float = self.omega_float.to(device)
+    if self.store_dense:
+      self.values_dense = self.values_dense.to(device)
+      self.omega_dense = self.omega_dense.to(device)
+      self.omega_float_dense = self.omega_float_dense.to(device)
+    self.device = device
+    return self
+
+
+class MissingDataSample(object):
+  def __init__(self, values, omega=None, indices=None, D=None,
+        store_sparse=True, store_dense=False):
+    """Represent a single sample from a dataset with missing entries. Can be
+    constructed either from a mask or indices. Represented in a padded sparse
+    format, or dense format.
+
+    Args:
+      values: data values, either (nnz,) (when indices given) or (D,) (when
+        omega given).
+      omega: observed entry mask (D,).
+      indices: data indices (nnz,).
+      D: data ambient dimension, required if omega not provided.
+      store_dense, store_dense: whether to store sparse, dense representations
+        of data.
+    """
+    if not (store_sparse or store_dense):
+      raise ValueError("Either store_sparse or store_dense required.")
+    if indices is None and omega is None:
+      raise ValueError("Either indices or omega required.")
+    elif indices is None:
+      if D is None:
+        D = omega.numel()
+      elif D != omega.numel():
+        raise ValueError("D doesn't match size of omega.")
+      if values.numel() != omega.numel():
+        raise ValueError("Sizes of values and omega don't match.")
+
+      values = values.view(-1).float()
+      omega = omega.view(-1).byte()
+      indices = omega.nonzero().view(-1)
+      nnz = indices.numel()
+      if store_dense:
+        # mask by missing entry mask to make sure there's no leakage.
+        values_dense = values * omega.float()
+        omega_dense = omega
+      else:
+        values_dense, omega_dense = None, None
+      if store_sparse:
+        values = values[indices]
+        omega = omega[indices]
+      else:
+        values, omega, indices = None, None, None
+    else:
+      if D is None:
+        raise ValueError("D required for indices inputs.")
+      if values.numel() != indices.numel():
+        raise ValueError("Sizes of values and indices don't match.")
+
+      indices, sortIdx = indices.view(-1).long().sort()
+      values = values.view(-1).float()[sortIdx]
+      nnz = indices.numel()
+      omega = torch.ones(nnz, dtype=torch.uint8)
+      if store_dense:
+        values_dense = torch.zeros(D, dtype=torch.float32)
+        omega_dense = torch.zeros(D, dtype=torch.uint8)
+        values_dense[indices] = values
+        omega_dense[indices] = 1
+      else:
+        values_dense, omega_dense = None, None
+      if not store_sparse:
+        values, omega, indices = None, None, None
+
+    # avoid issues of zero size dimensions in 0.4.1 by padding
+    # use pad_nnz = 2 to avoid possible unwanted squeezing
+    if nnz == 0 and store_sparse:
+      indices = torch.tensor([0, 1], dtype=torch.int64)
+      values = torch.tensor([0.0, 0.0], dtype=torch.float32)
+      omega = torch.tensor([0, 0], dtype=torch.uint8)
+      pad_nnz = 2
+    else:
+      pad_nnz = nnz
+
+    self.values = values
+    self.omega = omega
+    self.indices = indices
+    self.values_dense = values_dense
+    self.omega_dense = omega_dense
+    self.D = D
+    self.store_sparse = store_sparse
+    self.store_dense = store_dense
+    self.nnz = nnz
+    self.pad_nnz = pad_nnz
+    self.shape = (D,)
+    return
+
+  def pad(self, pad_nnz):
+    """Pad with pad_nnz zeros selected from initial indices. Only applies to
+    sparse format.
+    """
+    if pad_nnz > self.D:
+      raise ValueError("pad_nnz > D")
+    if self.nnz > pad_nnz:
+      raise ValueError("sparse vector nnz > pad_nnz.")
+
+    # do nothing if not storing sparse format
+    if not self.store_sparse:
+      return
+
+    if self.pad_nnz > pad_nnz:
+      # strip leading padded values
+      nstrip = self.pad_nnz - pad_nnz
+      self.indices = self.indices[nstrip:]
+      self.values = self.values[nstrip:]
+      self.omega = self.omega[nstrip:]
+    elif self.pad_nnz < pad_nnz:
+      # pad with leading zeros
+      npad = pad_nnz - self.pad_nnz
+      self.indices = torch.cat([torch.zeros(npad, dtype=torch.int64),
+          self.indices])
+      self.values = torch.cat([torch.zeros(npad, dtype=torch.float32),
+          self.values])
+      self.omega = torch.cat([torch.zeros(npad, dtype=torch.uint8),
+          self.omega])
+    return
+
+
+def generate_synth_uos_dataset(k, d, D, Ng, N=None, affine=False, sigma=0.0,
+      theta=None, miss_rate=0.0, normalize=False, online=False,
+      comp_test_frac=0.05, miss_store_sparse=True, miss_store_dense=False,
+      seed=None):
+  """Generate synthetic UoS dataset.
+
+  Args:
+    k: number of subspaces.
+    d: subspace dimension.
+    D: ambient dimension.
+    Ng: points per group.
+    N: total num data points, takes precedent over Ng (default: None).
+    affine: affine setting (default: False).
+    sigma: gaussian noise sigma (default: 0.0).
+    theta: principal angle between subspaces in radians (default: None).
+    miss_rate: missing data rate (default: 0.0).
+    online: online data setting (default: False).
+    normalize: project data onto unit sphere (default: False).
+    comp_test_frac: fraction of observed entries to hold out as test in missing
+      data setting (default: 0.05).
+    miss_store_sparse: store sparse representation of missing data (default:
+      True).
+    miss_store_dense: store dense representation of missing data (default:
+      False).
+    seed: random seed (default: None).
+
+  Returns:
+    dataset: Synthetic UoS dataset instance.
+  """
+  # N takes precedent if provided.
+  if N is not None and N > 0:
+    Ng = N // k
+  else:
+    N = k * Ng
+
+  if miss_rate <= 0:
+    if not online:
+      dataset = SynthUoSDataset(k, d, D, Ng, affine=affine, sigma=sigma,
+          theta=theta, normalize=normalize, seed=seed)
+    else:
+      dataset = SynthUoSOnlineDataset(k, d, D, N, affine=affine, sigma=sigma,
+          theta=theta, normalize=normalize, seed=seed)
+  else:
+    if not online:
+      dataset = SynthUoSMissDataset(k, d, D, Ng, affine=affine, sigma=sigma,
+          theta=theta, miss_rate=miss_rate, normalize=normalize,
+          store_sparse=miss_store_sparse, store_dense=miss_store_dense,
+          test_frac=comp_test_frac, seed=seed)
+    else:
+      dataset = SynthUoSMissOnlineDataset(k, d, D, N, affine=affine,
+          sigma=sigma, theta=theta, miss_rate=miss_rate, normalize=normalize,
+          store_sparse=miss_store_sparse, store_dense=miss_store_dense,
+          test_frac=comp_test_frac, seed=seed)
+  return dataset
+
+
+def missing_data_collate(batch):
+  """Collate missing data samples into batch."""
+  # NOTE: maybe it would be more elegant to combine the two classes.
+  x, grp, x0 = zip(*batch)
+  grp = torch.stack(grp)
+  x = MissingDataBatch(x)
+  x0 = MissingDataBatch(x0)
+  return x, grp, x0
