@@ -492,16 +492,31 @@ def aggregate_resets(resets):
   resets_dict = {columns[ii]: resets[:, ii].astype(dtypes[ii])
       for ii in range(len(columns))}
   resets = pd.DataFrame(data=resets_dict)
-  resets = resets[resets['success'] == 1]
   grouped = resets.groupby(['epoch', 'itr', 'ridx'])
-  agg_resets = grouped.agg(OrderedDict([('success', ['count']), ('obj.decr',
-      ['min', 'median', 'max']), ('cumu.obj.decr', ['min', 'median', 'max']),
+  agg_resets = grouped.agg(OrderedDict([
+      ('success', [_count_reset_accept, _count_reset_post_reject,
+          _count_reset_reject]),
+      ('obj.decr', ['min', 'median', 'max']),
+      ('cumu.obj.decr', ['min', 'median', 'max']),
       ('temp', ['min'])]))
   agg_resets.reset_index(inplace=True)
-  agg_resets.columns = (['epoch', 'itr', 'ridx', 'path.length'] +
+  agg_resets.columns = (
+      ['epoch', 'itr', 'ridx', 'accept', 'post.reject', 'reject'] +
       ['{}.{}'.format(met, meas) for met in ['obj.decr', 'cumu.obj.decr']
           for meas in ['min', 'med', 'max']] + ['temp'])
   return agg_resets
+
+
+def _count_reset_accept(x):
+  return np.sum(x == 1)
+
+
+def _count_reset_post_reject(x):
+  return np.sum(x == -1)
+
+
+def _count_reset_reject(x):
+  return np.sum(x == 0)
 
 
 def set_auto_reg_params(k, d, D, Ng, sigma_hat, min_size=0.0):

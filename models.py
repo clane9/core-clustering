@@ -1849,10 +1849,12 @@ class TempScheduler(object):
 class ConstantTempScheduler(TempScheduler):
   def __init__(self, init_temp=1.0, replicates=None):
     super().__init__(init_temp, replicates)
+    self.temp = (init_temp if self.r is None else
+        (init_temp * np.ones(self.r)))
     return
 
   def get_temp(self):
-    return self.init_temp
+    return self.temp
 
 
 class GeoTempScheduler(TempScheduler):

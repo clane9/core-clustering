@@ -14,7 +14,7 @@ global_args_dict = {
     # data settings
     'img-dataset': dict(type=str, default='mnist',
         help='Real image dataset [default: mnist].',
-        choices=['mnist', 'coil100', 'coil20', 'yaleb']),
+        choices=['mnist', 'cifar10', 'coil100', 'coil20', 'yaleb']),
     'mc-dataset': dict(type=str, default='nf_1k',
         help='Real matrix completion dataset [default: nf_1k].',
         choices=['nf_1k', 'nf_17k']),

@@ -21,11 +21,14 @@ import models as mod
 import training as tr
 import utils as ut
 
-# import ipdb
-
 
 def eval_core_clustering(args):
-  # ipdb.set_trace()
+  # setting some potentially undefined args depending on setting
+  default_args = [('init', 'random'), ('form', 'mf'), ('serial_eval', None),
+      ('miss_rate', 0.0), ('eval_rank', False)]
+  for arg, val in default_args:
+    setattr(args, arg, getattr(args, arg, val))
+
   # error checking, in no particular order
   if args.setting == 'synth-uos' and args.online and args.optim == 'batch-alt':
     raise ValueError(("Online mode not compatible with batch-alt "
@@ -51,6 +54,10 @@ def eval_core_clustering(args):
           "initialization."))
   if not uos_mode and args.init == 'pca':
     raise ValueError("pca initialization not compatible with k-means.")
+  real_data_mode = args.setting in {'img-uos', 'movie-mc-uos'}
+  if real_data_mode:
+    if args.model_d is None or args.model_d <= 0:
+      raise ValueError("model dimension is actually required for real data.")
 
   use_cuda = args.cuda and torch.cuda.is_available()
   device = torch.device('cuda' if use_cuda else 'cpu')
@@ -98,7 +105,6 @@ def eval_core_clustering(args):
   else:
     raise ValueError("Invalid setting {}".format(args.setting))
 
-  # ipdb.set_trace()
   if args.setting == 'synth-kmeans' or args.optim == 'batch-alt':
     data_loader = None
   else:
@@ -109,8 +115,6 @@ def eval_core_clustering(args):
       kwargs['collate_fn'] = dat.missing_data_collate
     data_loader = DataLoader(dataset, **kwargs)
 
-  # ipdb.set_trace()
-
   # construct model
   torch.manual_seed(args.seed)
   model_tic = time.time()
@@ -118,7 +122,7 @@ def eval_core_clustering(args):
   if uos_mode and (args.model_d is None or args.model_d <= 0):
     args.model_d = args.d
   if args.model_k is None or args.model_k <= 0:
-    args.model_k = args.k
+    args.model_k = dataset.k
 
   # note auto-reg only makes sense when data are unit norm.
   if uos_mode:
@@ -126,8 +130,8 @@ def eval_core_clustering(args):
       if args.sigma_hat is None or args.sigma_hat < 0:
         args.sigma_hat = args.sigma
       (args.U_frosqr_in_lamb, args.U_frosqr_out_lamb,
-          args.z_lamb) = ut.set_auto_reg_params(args.k, args.d, args.D,
-              args.Ng, args.sigma_hat, args.min_size)
+          args.z_lamb) = ut.set_auto_reg_params(args.model_k, args.model_d,
+              dataset.D, dataset.N/args.model_k, args.sigma_hat, args.min_size)
     if args.form == 'mf':
       if args.z_lamb > 0:
         args.U_frosqr_in_lamb /= args.z_lamb
@@ -181,20 +185,20 @@ def eval_core_clustering(args):
             svd_solver='randomized', **reset_kwargs)
     else:
       if args.miss_rate > 0:
-        model = mod.KSubspaceMCModel(args.model_k, args.model_d, args.D,
+        model = mod.KSubspaceMCModel(args.model_k, args.model_d, dataset.D,
             affine=args.affine, replicates=args.reps, reg_params=reg_params,
             scale_grad_mode=args.scale_grad_mode,
             scale_grad_update_freq=args.scale_grad_update_freq,
             sparse_encode=args.sparse_encode,
             sparse_decode=args.sparse_decode, **reset_kwargs)
       elif args.form == 'mf':
-        model = mod.KSubspaceMFModel(args.model_k, args.model_d, args.D,
+        model = mod.KSubspaceMFModel(args.model_k, args.model_d, dataset.D,
             affine=args.affine, replicates=args.reps, reg_params=reg_params,
             serial_eval=args.serial_eval, scale_grad_mode=args.scale_grad_mode,
             scale_grad_update_freq=args.scale_grad_update_freq, init=args.init,
             initX=initX, **reset_kwargs)
       else:
-        model = mod.KSubspaceProjModel(args.model_k, args.model_d, args.D,
+        model = mod.KSubspaceProjModel(args.model_k, args.model_d, dataset.D,
             affine=args.affine, replicates=args.reps, reg_params=reg_params,
             serial_eval=args.serial_eval, **reset_kwargs)
   else:
@@ -203,8 +207,6 @@ def eval_core_clustering(args):
         kpp_n_trials=args.kpp_n_trials, **reset_kwargs)
   model = model.to(device)
   init_time = time.time() - model_tic
-
-  # ipdb.set_trace()
 
   # optimizer
   if not uos_mode or args.epoch_size is None or args.epoch_size <= 0:
@@ -229,26 +231,21 @@ def eval_core_clustering(args):
 
     min_lr = max(1e-8, 0.1**4 * args.init_lr)
     if args.core_reset:
-      patience = int(np.ceil(5 * args.reset_patience /
-          (args.epoch_steps // args.batch_size)))
+      patience = int(np.ceil(5 * args.reset_patience / args.epoch_steps))
     else:
       patience = 10
     scheduler = ReduceLROnPlateau(optimizer, factor=0.5, patience=patience,
-        threshold=1e-4, min_lr=min_lr)
+        threshold=1e-3, min_lr=min_lr)
 
   # no checkpointing in this case
   if args.chkp_freq is None or args.chkp_freq <= 0:
     args.chkp_freq = args.epochs + 1
   if args.stop_freq is None or args.stop_freq <= 0:
     args.stop_freq = -1
-  if not hasattr(args, 'eval_rank'):
-    args.eval_rank = False
 
   # save args
   with open('{}/args.json'.format(args.out_dir), 'w') as f:
     json.dump(args.__dict__, f, sort_keys=True, indent=4)
-
-  # ipdb.set_trace()
 
   return tr.train_loop(model, data_loader, device, optimizer, args.out_dir,
       args.epochs, args.chkp_freq, args.stop_freq, scheduler=scheduler,
@@ -261,7 +258,6 @@ def generate_parser():
   """Generate command-line parser for core-clustering evaluation."""
   parser = argparse.ArgumentParser(description=('Cluster various datasets by '
       'CoRe clustering'))
-
   subparsers = parser.add_subparsers(title='Evaluation setting',
       dest='setting')
   parser_uos = subparsers.add_parser('synth-uos',
@@ -275,41 +271,41 @@ def generate_parser():
 
   conf.add_args(parser_uos,
       ['out-dir', 'k', 'd', 'D', 'Ng', 'N', 'affine', 'sigma', 'theta',
-      'miss-rate', 'online', 'normalize', 'form', 'init', 'model-k',
-      'model-d', 'auto-reg', 'sigma-hat', 'min-size', 'U-frosqr-in-lamb',
+      'miss-rate', 'online', 'normalize', 'form', 'init', 'model-k', 'model-d',
+      'auto-reg', 'sigma-hat', 'min-size', 'U-frosqr-in-lamb',
       'U-frosqr-out-lamb', 'z-lamb', 'epochs', 'epoch-size', 'batch-size',
       'optim', 'init-lr', 'scale-grad-mode', 'scale-grad-update-freq',
-      'sparse-encode', 'sparse-decode', 'serial-eval', 'reps', 'reset-unused',
+      'sparse-encode', 'sparse-decode', 'serial-eval', 'reps', 'core-reset',
       'reset-metric', 'reset-patience', 'reset-try-tol', 'reset-steps',
       'reset-accept-tol', 'reset-cache-size', 'cuda', 'num-threads',
       'num-workers', 'data-seed', 'seed', 'eval-rank', 'chkp-freq',
       'stop-freq', 'save-large-data'])
 
   conf.add_args(parser_img,
-      ['out-dir', 'img-dataset', 'center', 'normalize', 'sv-range', 'form',
-      'init', 'model-k', 'model-d', 'auto-reg', 'sigma-hat', 'min-size',
-      'U-frosqr-in-lamb', 'U-frosqr-out-lamb', 'z-lamb', 'epochs',
+      ['out-dir', 'img-dataset', 'center', 'normalize', 'sv-range', 'affine',
+      'form', 'init', 'model-k', 'model-d', 'auto-reg', 'sigma-hat',
+      'min-size', 'U-frosqr-in-lamb', 'U-frosqr-out-lamb', 'z-lamb', 'epochs',
       'epoch-size', 'batch-size', 'optim', 'init-lr', 'scale-grad-mode',
       'scale-grad-update-freq', 'sparse-encode', 'sparse-decode',
-      'serial-eval', 'reps', 'reset-unused', 'reset-metric', 'reset-patience',
+      'serial-eval', 'reps', 'core-reset', 'reset-metric', 'reset-patience',
       'reset-try-tol', 'reset-steps', 'reset-accept-tol', 'reset-cache-size',
       'cuda', 'num-threads', 'num-workers', 'data-seed', 'seed', 'eval-rank',
       'chkp-freq', 'stop-freq', 'save-large-data'])
 
   conf.add_args(parser_mc,
-      ['out-dir', 'mc-dataset', 'center', 'normalize', 'init', 'model-k',
-      'model-d', 'auto-reg', 'sigma-hat', 'min-size', 'U-frosqr-in-lamb',
-      'U-frosqr-out-lamb', 'z-lamb', 'epochs', 'epoch-size', 'batch-size',
-      'optim', 'init-lr', 'scale-grad-mode', 'scale-grad-update-freq',
-      'sparse-encode', 'sparse-decode', 'reps', 'reset-unused',
-      'reset-metric', 'reset-patience', 'reset-try-tol', 'reset-steps',
-      'reset-accept-tol', 'reset-cache-size', 'cuda', 'num-threads',
-      'num-workers', 'data-seed', 'seed', 'eval-rank', 'chkp-freq',
-      'stop-freq', 'save-large-data'])
+      ['out-dir', 'mc-dataset', 'center', 'normalize', 'affine',
+      'model-k', 'model-d', 'auto-reg', 'sigma-hat', 'min-size',
+      'U-frosqr-in-lamb', 'U-frosqr-out-lamb', 'z-lamb', 'epochs',
+      'epoch-size', 'batch-size', 'optim', 'init-lr', 'scale-grad-mode',
+      'scale-grad-update-freq', 'sparse-encode', 'sparse-decode', 'reps',
+      'core-reset', 'reset-metric', 'reset-patience', 'reset-try-tol',
+      'reset-steps', 'reset-accept-tol', 'reset-cache-size', 'cuda',
+      'num-threads', 'num-workers', 'data-seed', 'seed', 'eval-rank',
+      'chkp-freq', 'stop-freq', 'save-large-data'])
 
   conf.add_args(parser_km,
       ['out-dir', 'k', 'D', 'Ng', 'N', 'sep', 'init', 'kpp-n-trials',
-      'model-k', 'b-frosqr-out-lamb', 'epochs', 'reps', 'reset-unused',
+      'model-k', 'b-frosqr-out-lamb', 'epochs', 'reps', 'core-reset',
       'reset-metric', 'reset-patience', 'reset-try-tol', 'reset-steps',
       'reset-accept-tol', 'reset-cache-size', 'cuda', 'num-threads',
       'num-workers', 'data-seed', 'seed', 'chkp-freq', 'stop-freq',

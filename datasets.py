@@ -12,40 +12,40 @@ CODE_DIR = os.path.dirname(os.path.realpath(__file__))
 
 class SynthUoSDataset(Dataset):
   """Synthetic union of subspaces dataset."""
-  def __init__(self, n, d, D, Ng, affine=False, sigma=0., theta=None,
+  def __init__(self, k, d, D, Ng, affine=False, sigma=0., theta=None,
         normalize=False, seed=None):
     super(SynthUoSDataset).__init__()
 
     if theta is not None:
       if theta <= 0:
         raise ValueError("Invalid principal angle {}".format(theta))
-      if n*d > D:
+      if k*d > D:
         raise ValueError("Can only specify principal angle for independent "
             "subspaces")
 
-    self.n = n  # number of subspaces
+    self.k = k  # number of subspaces
     self.d = d  # subspace dimension
     self.D = D  # ambient dimension
     self.Ng = Ng  # points per group
-    self.N = n*Ng
+    self.N = k*Ng
     self.affine = affine
     self.sigma = sigma
     self.theta = theta
     self.normalize = normalize
-    self.classes = np.arange(n)
+    self.classes = np.arange(k)
 
     self.rng = np.random.RandomState(seed=seed)
 
-    self.Us = np.zeros([n, D, d])
-    self.Vs = np.zeros([n, d, Ng])
-    self.bs = np.zeros([n, D]) if affine else None
+    self.Us = np.zeros([k, D, d])
+    self.Vs = np.zeros([k, d, Ng])
+    self.bs = np.zeros([k, D]) if affine else None
     self.X = np.zeros([self.N, D])
     self.groups = np.zeros(self.N, dtype=np.int32)
 
     # generate bases
     if theta is None:
       # bases sampled uniformly at random
-      for ii in range(n):
+      for ii in range(k):
         self.Us[ii, :] = np.linalg.qr(self.rng.randn(D, d))[0]
     else:
       # bases sampled with fixed principal angles.
@@ -59,13 +59,13 @@ class SynthUoSDataset(Dataset):
       # apply random rotation to U0 complement
       Q = np.linalg.qr(self.rng.randn(D-d, D-d))[0]
       U0_comp = np.matmul(U0_comp, Q)
-      for ii in range(n):
+      for ii in range(k):
         P = np.linalg.qr(self.rng.randn(d, d))[0]
         self.Us[ii, :] = (alpha*np.matmul(U0, P) +
             beta*U0_comp[:, ii*d:(ii+1)*d])
 
     # sample coefficients
-    for ii in range(n):
+    for ii in range(k):
       V = (1./np.sqrt(d))*self.rng.randn(d, Ng)
       self.Vs[ii, :] = V
       Xi = np.matmul(self.Us[ii, :], V)
@@ -103,13 +103,13 @@ class SynthUoSDataset(Dataset):
 
 class SynthUoSMissDataset(SynthUoSDataset):
   """Synthetic union of subspaces dataset with missing data."""
-  def __init__(self, n, d, D, Ng, affine=False, sigma=0., theta=None,
+  def __init__(self, k, d, D, Ng, affine=False, sigma=0., theta=None,
         miss_rate=0.0, normalize=False, store_sparse=True, store_dense=False,
         test_frac=0.05, seed=None):
     if miss_rate >= 1 or miss_rate < 0:
       raise ValueError("Invalid miss_rate {}".format(miss_rate))
 
-    super().__init__(n, d, D, Ng, affine, sigma, theta, normalize, seed)
+    super().__init__(k, d, D, Ng, affine, sigma, theta, normalize, seed)
 
     self.miss_rate = miss_rate
     self.test_frac = test_frac
@@ -140,9 +140,9 @@ class SynthUoSMissDataset(SynthUoSDataset):
 
 class SynthUoSOnlineDataset(SynthUoSDataset):
   """Synthetic union of subspaces dataset with fresh samples."""
-  def __init__(self, n, d, D, N, affine=False, sigma=0., theta=None,
+  def __init__(self, k, d, D, N, affine=False, sigma=0., theta=None,
         normalize=False, seed=None):
-    super().__init__(n, d, D, 10, affine, sigma, theta, normalize, seed)
+    super().__init__(k, d, D, 10, affine, sigma, theta, normalize, seed)
     self.Us = torch.tensor(self.Us, dtype=torch.float32)
     self.N = N
 
@@ -161,7 +161,7 @@ class SynthUoSOnlineDataset(SynthUoSDataset):
     # generate data. Otherwise rng is duplicated and end up getting repeated
     # data. Also note that it doesn't matter if seed is changed after
     # DataLoader constructor is called.
-    grp = torch.randint(high=self.n, size=(1,), dtype=torch.int64)[0]
+    grp = torch.randint(high=self.k, size=(1,), dtype=torch.int64)[0]
     v = (1./np.sqrt(self.d))*torch.randn(self.d, 1)
     x = torch.matmul(self.Us[grp, :, :], v).view(-1)
     if self.affine:
@@ -175,13 +175,13 @@ class SynthUoSOnlineDataset(SynthUoSDataset):
 
 class SynthUoSMissOnlineDataset(SynthUoSOnlineDataset):
   """Synthetic union of subspaces dataset with fresh samples."""
-  def __init__(self, n, d, D, N, affine=False, sigma=0., theta=None,
+  def __init__(self, k, d, D, N, affine=False, sigma=0., theta=None,
         miss_rate=0.0, normalize=False, store_sparse=False, store_dense=False,
         test_frac=0.05, seed=None):
     if miss_rate >= 1 or miss_rate < 0:
       raise ValueError("Invalid miss_rate {}".format(miss_rate))
 
-    super().__init__(n, d, D, N, affine, sigma, theta, normalize, seed)
+    super().__init__(k, d, D, N, affine, sigma, theta, normalize, seed)
 
     self.miss_rate = miss_rate
     self.test_frac = test_frac
@@ -208,12 +208,13 @@ class ImageUoSDataset(Dataset):
   """Image datasets, mostly from (You et al., CVPR 2016)."""
   def __init__(self, dataset='mnist', center=False, sv_range=None,
         normalize=True):
-    if dataset == 'mnist':
-      matfile = '{}/datasets/MNIST_SC_pca.mat'.format(CODE_DIR)
-      data = loadmat(matfile)
-      self.X = torch.tensor(data['MNIST_SC_DATA'].T, dtype=torch.float32)
-      self.groups = torch.tensor(data['MNIST_LABEL'].reshape(-1),
-          dtype=torch.int64)
+    if dataset in {'mnist', 'cifar10'}:
+      fname = '{}/datasets/{}/{}_scat_pca.npz'.format(CODE_DIR, dataset,
+          dataset)
+      with open(fname, 'rb') as f:
+        f = np.load(f)
+        self.X = torch.tensor(f['data'], dtype=torch.float32)
+        self.groups = torch.tensor(f['labels'], dtype=torch.int64)
     elif dataset == 'coil100':
       matfile = '{}/datasets/COIL100_SC_pca.mat'.format(CODE_DIR)
       data = loadmat(matfile)
@@ -237,7 +238,7 @@ class ImageUoSDataset(Dataset):
       raise ValueError("Invalid dataset {}".format(dataset))
 
     self.classes = torch.unique(self.groups, sorted=True).numpy()
-    self.n = self.classes.shape[0]
+    self.k = self.classes.shape[0]
 
     # normalize data points (rows) of X
     if center:
@@ -246,10 +247,11 @@ class ImageUoSDataset(Dataset):
       # "whitening" by removing first few svs following (Zhang, 2012)
       starti = sv_range[0] if len(sv_range) == 2 else 0
       stopi = sv_range[1] if len(sv_range) == 2 else sv_range[0]
-      U, s, _ = torch.svd(self.X)
-      if stopi is None or stopi <= 0:
-        stopi = min(U.shape) + 1
-      self.X = U[:, starti:stopi] * s[starti:stopi]
+      if (starti, stopi) not in {(0, -1), (0, self.X.shape[1])}:
+        U, s, _ = torch.svd(self.X)
+        if stopi is None or stopi <= 0:
+          stopi = min(U.shape) + 1
+        self.X = U[:, starti:stopi] * s[starti:stopi]
 
     if normalize:
       self.X.div_(torch.norm(self.X, p=2, dim=1, keepdim=True).add(1e-8))
@@ -319,7 +321,7 @@ class NetflixDataset(Dataset):
     fpath = '{}/datasets/nf_prize_preprocessed/{}.npz'.format(CODE_DIR, fname)
 
     with open(fpath, 'rb') as f:
-      f = np.load(f)
+      f = np.load(f, allow_pickle=True)
       # tolist required since np.savez doesn't know how to properly handle
       # sparse matrices. there is probably a better way.
       self.X = f['nf_train_mat'].tolist().astype(np.float32)
