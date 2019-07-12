@@ -219,7 +219,7 @@ def train_epoch(model, data_loader, data_iter, optimizer, device,
   metrics = None
   resets = []
   conf_mats, comp_err = ut.AverageMeter(), ut.AverageMeter()
-  itr = epochN = 0
+  itr = epochN = 1
   epoch_stop = False
   if data_iter is None:
     data_iter = iter(data_loader)
@@ -248,7 +248,6 @@ def train_epoch(model, data_loader, data_iter, optimizer, device,
     x = x.to(device)
     batch_size = x.shape[0]
     epochN += batch_size
-    itr += 1
     data_rtime += time.time() - data_tic
 
     # opt step
