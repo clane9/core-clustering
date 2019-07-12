@@ -230,11 +230,7 @@ def eval_core_clustering(args):
       raise ValueError("Invalid optimizer {}.".format(args.optim))
 
     min_lr = max(1e-8, 0.1**4 * args.init_lr)
-    if args.core_reset:
-      patience = int(np.ceil(5 * args.reset_patience / args.epoch_steps))
-    else:
-      patience = 10
-    scheduler = ReduceLROnPlateau(optimizer, factor=0.5, patience=patience,
+    scheduler = ReduceLROnPlateau(optimizer, factor=0.5, patience=5,
         threshold=1e-3, min_lr=min_lr)
 
   # no checkpointing in this case
@@ -260,6 +256,7 @@ def generate_parser():
       'CoRe clustering'))
   subparsers = parser.add_subparsers(title='Evaluation setting',
       dest='setting')
+  subparsers.required = True
   parser_uos = subparsers.add_parser('synth-uos',
       help='Synthetic UoS setting')
   parser_img = subparsers.add_parser('img-uos',
