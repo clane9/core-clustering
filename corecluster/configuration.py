@@ -4,7 +4,7 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
-import utils as ut
+from . import utils as ut
 
 
 global_args_dict = {
@@ -103,9 +103,6 @@ global_args_dict = {
         help='Sparse encoding in MC setting [default: 1]'),
     'sparse-decode': dict(type=ut.boolarg, default=True,
         help='Sparse decoding in MC setting  [default: 1]'),
-    'serial-eval': dict(type=str, default=None,
-        help='Serial evaluation mode [default: none]',
-        choices=['none', 'r', 'k', 'rk']),
 
     # reset settings
     'reps': dict(type=int, default=6,

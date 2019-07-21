@@ -15,17 +15,17 @@ import torch
 from torch.utils.data import DataLoader
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 
-import configuration as conf
-import datasets as dat
-import models as mod
-import training as tr
-import utils as ut
+from corecluster import configuration as conf
+from corecluster import datasets as dat
+from corecluster import models as mod
+from corecluster import training as tr
+from corecluster import utils as ut
 
 
 def eval_core_clustering(args):
   # setting some potentially undefined args depending on setting
-  default_args = [('init', 'random'), ('form', 'mf'), ('serial_eval', None),
-      ('miss_rate', 0.0), ('eval_rank', False)]
+  default_args = [('init', 'random'), ('form', 'mf'), ('miss_rate', 0.0),
+      ('eval_rank', False)]
   for arg, val in default_args:
     setattr(args, arg, getattr(args, arg, val))
 
@@ -39,8 +39,6 @@ def eval_core_clustering(args):
     if args.optim == 'batch-alt' or args.form == 'proj':
       raise ValueError(("batch-alt optimization and proj form not compatible "
           " with missing data."))
-    if args.setting == 'synth-uos' and args.serial_eval in {'r', 'k', 'rk'}:
-      raise ValueError("serial evaluation not compatible with missing data.")
     if args.init != 'random':
       raise ValueError("only random initialization supported in MC setting.")
   uos_mode = args.setting != 'synth-kmeans'
@@ -145,11 +143,6 @@ def eval_core_clustering(args):
   else:
     reg_params = {'b_frosqr_out': args.b_frosqr_out_lamb}
 
-  if uos_mode and (args.serial_eval is None or args.serial_eval == 'none'):
-    args.serial_eval = {}
-  else:
-    args.serial_eval = set(args.serial_eval)
-
   if args.init in {'pfi', 'pca'}:
     initN = 100 * int(np.ceil(
         args.model_d*args.model_k*np.log(args.model_k) / 100))
@@ -175,14 +168,12 @@ def eval_core_clustering(args):
       if args.form == 'mf':
         model = mod.KSubspaceBatchAltMFModel(args.model_k, args.model_d,
             dataset, affine=args.affine, replicates=args.reps,
-            reg_params=reg_params, serial_eval=args.serial_eval,
-            svd_solver='randomized', init=args.init, initX=initX,
-            **reset_kwargs)
+            reg_params=reg_params, svd_solver='randomized', init=args.init,
+            initX=initX, **reset_kwargs)
       else:
         model = mod.KSubspaceBatchAltProjModel(args.model_k, args.model_d,
             dataset, affine=args.affine, replicates=args.reps,
-            reg_params=reg_params, serial_eval=args.serial_eval,
-            svd_solver='randomized', **reset_kwargs)
+            reg_params=reg_params, svd_solver='randomized', **reset_kwargs)
     else:
       if args.miss_rate > 0:
         model = mod.KSubspaceMCModel(args.model_k, args.model_d, dataset.D,
@@ -194,13 +185,13 @@ def eval_core_clustering(args):
       elif args.form == 'mf':
         model = mod.KSubspaceMFModel(args.model_k, args.model_d, dataset.D,
             affine=args.affine, replicates=args.reps, reg_params=reg_params,
-            serial_eval=args.serial_eval, scale_grad_mode=args.scale_grad_mode,
+            scale_grad_mode=args.scale_grad_mode,
             scale_grad_update_freq=args.scale_grad_update_freq, init=args.init,
             initX=initX, **reset_kwargs)
       else:
         model = mod.KSubspaceProjModel(args.model_k, args.model_d, dataset.D,
             affine=args.affine, replicates=args.reps, reg_params=reg_params,
-            serial_eval=args.serial_eval, **reset_kwargs)
+            **reset_kwargs)
   else:
     model = mod.KMeansBatchAltModel(args.model_k, dataset,
         replicates=args.reps, reg_params=reg_params, init=args.init,
@@ -246,7 +237,7 @@ def eval_core_clustering(args):
   return tr.train_loop(model, data_loader, device, optimizer, args.out_dir,
       args.epochs, args.chkp_freq, args.stop_freq, scheduler=scheduler,
       epoch_steps=args.epoch_steps, eval_rank=args.eval_rank,
-      reset_unused=args.core_reset, save_data=args.save_large_data,
+      core_reset=args.core_reset, save_data=args.save_large_data,
       init_time=init_time)
 
 
@@ -272,11 +263,10 @@ def generate_parser():
       'auto-reg', 'sigma-hat', 'min-size', 'U-frosqr-in-lamb',
       'U-frosqr-out-lamb', 'z-lamb', 'epochs', 'epoch-size', 'batch-size',
       'optim', 'init-lr', 'scale-grad-mode', 'scale-grad-update-freq',
-      'sparse-encode', 'sparse-decode', 'serial-eval', 'reps', 'core-reset',
-      'reset-metric', 'reset-patience', 'reset-try-tol', 'reset-steps',
-      'reset-accept-tol', 'reset-cache-size', 'cuda', 'num-threads',
-      'num-workers', 'data-seed', 'seed', 'eval-rank', 'chkp-freq',
-      'stop-freq', 'save-large-data'])
+      'sparse-encode', 'sparse-decode', 'reps', 'core-reset', 'reset-metric',
+      'reset-patience', 'reset-try-tol', 'reset-steps', 'reset-accept-tol',
+      'reset-cache-size', 'cuda', 'num-threads', 'num-workers', 'data-seed',
+      'seed', 'eval-rank', 'chkp-freq', 'stop-freq', 'save-large-data'])
 
   conf.add_args(parser_img,
       ['out-dir', 'img-dataset', 'center', 'normalize', 'sv-range', 'affine',
@@ -284,9 +274,9 @@ def generate_parser():
       'min-size', 'U-frosqr-in-lamb', 'U-frosqr-out-lamb', 'z-lamb', 'epochs',
       'epoch-size', 'batch-size', 'optim', 'init-lr', 'scale-grad-mode',
       'scale-grad-update-freq', 'sparse-encode', 'sparse-decode',
-      'serial-eval', 'reps', 'core-reset', 'reset-metric', 'reset-patience',
-      'reset-try-tol', 'reset-steps', 'reset-accept-tol', 'reset-cache-size',
-      'cuda', 'num-threads', 'num-workers', 'data-seed', 'seed', 'eval-rank',
+      'reps', 'core-reset', 'reset-metric', 'reset-patience', 'reset-try-tol',
+      'reset-steps', 'reset-accept-tol', 'reset-cache-size', 'cuda',
+      'num-threads', 'num-workers', 'data-seed', 'seed', 'eval-rank',
       'chkp-freq', 'stop-freq', 'save-large-data'])
 
   conf.add_args(parser_mc,

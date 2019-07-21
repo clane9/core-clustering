@@ -15,6 +15,9 @@ import pandas as pd
 
 EPS = 1e-8
 
+# use torch.solve in >=1.1.0 and torch.gesv in 0.4.1
+solve = torch.solve if hasattr(torch, 'solve') else torch.gesv
+
 
 class AverageMeter(object):
   """Computes and stores the average and current value.
@@ -153,6 +156,36 @@ def rank(X, tol=.01):
   """Evaluate approximate rank of X."""
   _, svs, _ = torch.svd(X)
   return (svs > tol*svs.max()).sum(), svs
+
+
+def assign_and_value(assign_obj, compute_c=True):
+  """Compute assignments and cluster size & values."""
+  batch_size, r, k = assign_obj.shape
+  device = assign_obj.device
+
+  if k > 1:
+    top2obj, top2idx = torch.topk(assign_obj, 2, dim=2, largest=False,
+        sorted=True)
+    groups = top2idx[:, :, 0]
+    min_assign_obj = top2obj[:, :, 0]
+  else:
+    groups = torch.zeros(batch_size, r, device=device, dtype=torch.int64)
+    min_assign_obj = assign_obj.squeeze(2)
+
+  if compute_c:
+    c = torch.zeros_like(assign_obj)
+    c.scatter_(2, groups.unsqueeze(2), 1)
+    c_mean = c.mean(dim=0)
+  else:
+    c = c_mean = None
+
+  if k > 1:
+    value = torch.zeros_like(assign_obj)
+    value = value.scatter_(2, groups.unsqueeze(2),
+        (top2obj[:, :, 1] - top2obj[:, :, 0]).unsqueeze(2)).mean(dim=0)
+  else:
+    value = torch.ones(r, k, device=device)
+  return groups, min_assign_obj, c, c_mean, value
 
 
 def find_soft_assign(losses, T=1.):
@@ -350,7 +383,7 @@ def batch_ridge(B, A, lamb=0.0):
     lambeye = torch.eye(p, dtype=A.dtype, device=A.device).mul_(lamb)
     AtA = AtA.add_(lambeye)
 
-  X, _ = torch.gesv(AtB, AtA)
+  X, _ = solve(AtB, AtA)
   return X
 
 
@@ -492,14 +525,13 @@ def aggregate_resets(resets):
   resets_dict = {columns[ii]: resets[:, ii].astype(dtypes[ii])
       for ii in range(len(columns))}
   resets = pd.DataFrame(data=resets_dict)
-  grouped = resets.groupby(['epoch', 'itr', 'ridx'])
+  grouped = resets.groupby(['epoch', 'itr', 'ridx'], as_index=False)
   agg_resets = grouped.agg(OrderedDict([
       ('success', [_count_reset_accept, _count_reset_post_reject,
           _count_reset_reject]),
       ('obj.decr', ['min', 'median', 'max']),
       ('cumu.obj.decr', ['min', 'median', 'max']),
       ('temp', ['min'])]))
-  agg_resets.reset_index(inplace=True)
   agg_resets.columns = (
       ['epoch', 'itr', 'ridx', 'accept', 'post.reject', 'reject'] +
       ['{}.{}'.format(met, meas) for met in ['obj.decr', 'cumu.obj.decr']

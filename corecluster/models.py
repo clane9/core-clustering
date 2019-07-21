@@ -5,11 +5,13 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-import utils as ut
+from . import utils as ut
+from .core_reset import reset_replicate
 
 EPS = 1e-8
 EMA_DECAY = 0.99
 RESET_NCOL = 8
+RESET_CPU = True
 EVAL_RANK_CPU = True
 
 
@@ -19,9 +21,9 @@ class KSubspaceBaseModel(nn.Module):
   assign_reg_terms = set()
 
   def __init__(self, k, d, D, affine=False, replicates=5, reg_params={},
-        serial_eval={}, reset_patience=100, reset_try_tol=0.01,
-        reset_cand_metric='obj_decr', reset_max_steps=50,
-        reset_accept_tol=1e-3, reset_cache_size=500, temp_scheduler=None):
+        reset_patience=100, reset_try_tol=0.01, reset_cand_metric='obj_decr',
+        reset_max_steps=50, reset_accept_tol=1e-3, reset_cache_size=500,
+        temp_scheduler=None):
 
     if replicates < 1:
       raise ValueError("Invalid replicates parameter {}".format(replicates))
@@ -33,8 +35,6 @@ class KSubspaceBaseModel(nn.Module):
         raise ValueError("Invalid {} reg parameter {}".format(k, val))
     if not set(reg_params).issubset(set(self.default_reg_params)):
       raise ValueError("Invalid reg parameter keys")
-    if not set(serial_eval).issubset({'r', 'k'}):
-      raise ValueError("Invalid serial eval mode.".format(serial_eval))
     if reset_patience <= 0:
       raise ValueError("Invalid reset_patience parameter {}".format(
           reset_patience))
@@ -49,7 +49,6 @@ class KSubspaceBaseModel(nn.Module):
     self.affine = affine
     self.replicates = self.r = replicates
     self.reg_params = reg_params
-    self.serial_eval = set(serial_eval)
 
     self.reset_patience = reset_patience
     # no threshold on objective plateau
@@ -71,10 +70,10 @@ class KSubspaceBaseModel(nn.Module):
     self.c = None
     self.groups = None
     # subspace coefficient norms, shape (r, k, batch_size)
-    self.z_frosqr = None
+    self._z_frosqr = None
     # subspace coefficients, shape (r, k, batch_size, d)
     # stored only if cache_z is True, since can be a large memory burden
-    self.z = None
+    self._z = None
     self.cache_z = False
 
     self.Us = nn.Parameter(torch.Tensor(self.r, k, D, d))
@@ -85,9 +84,9 @@ class KSubspaceBaseModel(nn.Module):
 
     self.register_buffer('c_mean', torch.ones(self.r, k).mul_(np.nan))
     self.register_buffer('value', torch.ones(self.r, k).mul_(np.nan))
-    self.register_buffer('obj', torch.ones(self.r).mul_(np.nan))
+    self.register_buffer('obj_ema', torch.ones(self.r).mul_(np.nan))
     self.register_buffer('best_obj', torch.ones(self.r).mul_(np.nan))
-    # 1st row counts since last reset, 2nd since last *successful* reset
+    # 1st row counts since last reset, 2nd since last successful reset
     self.register_buffer('num_bad_steps', torch.zeros(2, self.r))
     if reset_try_tol is None:
       # need to jitter patience when try tol is none to avoid many simultaneous
@@ -98,13 +97,12 @@ class KSubspaceBaseModel(nn.Module):
     else:
       init_jitter = torch.zeros(self.r)
       init_cooldown_counter = torch.ones(self.r).mul_(reset_patience//2)
-    self.register_buffer('jitter', init_jitter)
-    self.register_buffer('cooldown_counter', init_cooldown_counter)
+    self.register_buffer('_jitter', init_jitter)
+    self.register_buffer('_cooldown_counter', init_cooldown_counter)
 
-    self.register_buffer('cache_assign_obj',
+    self.register_buffer('_cache_assign_obj',
         torch.ones(reset_cache_size, self.r, k).mul_(np.nan))
-    self.cache_assign_obj_head = 0
-    self._reset_buffers = None
+    self._cache_assign_obj_head = 0
     return
 
   def reset_parameters(self):
@@ -116,207 +114,121 @@ class KSubspaceBaseModel(nn.Module):
       self.bs.data.zero_()
     return
 
-  def forward(self, x, ii=None, jj=None):
-    """Compute representation of x wrt each subspace.
-
-    Input:
-      x: data, shape (batch_size, D)
-      ii, jj: rep, cluster indices. Either int index or None.
-
-    Returns:
-      x_: reconstruction, shape (r, k, batch_size, D)
-    """
-    z = self.encode(x, ii, jj)
-    x_ = self.decode(z, ii, jj)
-    self._update_forward_cache(ii, jj, z)
-    return x_
-
-  def decode(self, z, ii=None, jj=None):
-    """Embed low-dim code z into ambient space.
-
-    Input:
-      z: latent code, shape (r, k, batch_size, d)
-      ii, jj: rep, cluster indices. Either int index or None.
-
-    Returns:
-      x_: reconstruction, shape (r, k, batch_size, D)
-    """
-    Us, bs = self._slice_Us_bs(ii, jj, no_grad=False)
-    assert(z.dim() == 4 and
-        (z.size(0), z.size(1)) == (Us.size(0), Us.size(1)))
-
-    # x_ = U z + b
-    # shape (r, k, batch_size, D)
-    x_ = torch.matmul(z, Us.transpose(2, 3))
-    if self.affine:
-      x_ = x_.add(self.bs.unsqueeze(2))
-    return x_
-
-  def _slice_Us_bs(self, ii, jj, no_grad=True):
-    """Extract slice of Us, bs. Limited slicing supported, ii, jj must be index
-    or slice(None)."""
-    # don't lose dims
-    ii, jj = self._parse_slice(ii, jj)
-    if no_grad:
-      Us = self.Us.data
-      bs = self.bs.data if self.affine else None
-    else:
-      Us = self.Us
-      bs = self.bs if self.affine else None
-    if not (ii == slice(None) and jj == slice(None)):
-      Us = Us[ii, jj, :]
-      bs = bs[ii, jj, :] if self.affine else None
-    return Us, bs
-
-  def _parse_slice(self, ii, jj):
-    """Parse ii jj slice into Us, bs."""
-    # this is probably dumb but too tired..
-    if type(ii) is int and type(jj) is int:
-      ii = np.array([[ii]])
-      jj = np.array([[jj]])
-    elif type(ii) is int:
-      ii = np.array([ii])
-      jj = slice(None)
-    elif type(jj) is int:
-      ii = slice(None)
-      jj = np.array([jj])
-    else:
-      ii, jj = slice(None), slice(None)
-    return ii, jj
-
-  def _update_forward_cache(self, ii, jj, z):
-    """Update any cached values from forward call."""
-    batch_size = z.shape[2]
-    device = z.device
-
-    if self.z_frosqr is None or self.z_frosqr.shape[2] != batch_size:
-      self.z_frosqr = torch.zeros(self.r, self.k, batch_size, device=device)
-      if self.cache_z:
-        self.z = torch.zeros(self.r, self.k, batch_size, self.d, device=device)
-
-    ii, jj = self._parse_slice(ii, jj)
-    self.z_frosqr[ii, jj, :] = z.data.pow(2).sum(dim=-1)
-    if self.cache_z:
-      self.z[ii, jj, :] = z
-    return
-
-  def objective(self, x):
-    """Evaluate objective function.
-
-    Input:
-      x: data, shape (batch_size, D)
-
-    Returns:
-      obj_mean: average objective across replicates
-      obj, loss, reg_in, reg_out: metrics per replicate, shape (r,)
-    """
-    loss = self.loss(x)
-    reg = self.reg()
-
-    # split regs into assign and outside terms
-    reg_in = torch.zeros(self.r, self.k, dtype=loss.dtype, device=loss.device)
-    reg_out = torch.zeros(self.r, self.k, dtype=loss.dtype, device=loss.device)
-    for key, val in reg.items():
-      if key in self.assign_reg_terms:
-        reg_in = reg_in + val
-      else:
-        reg_out = reg_out + val
-
-    # update assignment c
-    assign_obj = loss.data + reg_in.data
-    self.set_assign(assign_obj)
-    loss = self.c * loss
-    reg_in = self.c * reg_in
-
-    # cache assign_obj and outside reg values
-    self._batch_reg_out = reg_out.data
-
-    # reduce and compute objective, shape (r,)
-    loss = loss.sum(dim=2).mean(dim=0)
-    reg_in = reg_in.sum(dim=2).mean(dim=0)
-    reg_out = reg_out.sum(dim=1)
-    obj = loss + reg_in + reg_out
-    obj_mean = obj.mean()
-
-    # ema objective, shape (r,)
-    nan_mask = torch.isnan(self.obj)
-    self.obj[nan_mask] = obj.data[nan_mask]
-    self.obj.mul_(EMA_DECAY).add_(1-EMA_DECAY, obj.data)
-    return obj_mean, obj.data, loss.data, reg_in.data, reg_out.data
-
-  def loss(self, x):
-    """Evaluate reconstruction loss
+  def forward(self, x):
+    """Compute union of subspace embedding of x.
 
     Inputs:
       x: data, shape (batch_size, D)
 
     Returns:
-      loss: shape (batch_size, r, k)
+      x_: reconstruction, shape (r, batch_size, D)
     """
-    # Note that X[slice(None)] acts the same as X[:]
-    rep_range = range(self.r) if 'r' in self.serial_eval else [None]
-    cluster_range = range(self.k) if 'k' in self.serial_eval else [None]
+    x_ = self.embed(x)
+    loss = self.loss(x, x_)
+    # reg_in shape (batch_size, r, k) or (r, k)
+    # reg_out shape (r, k)
+    reg_in, reg_out = self.reg()
+    # update assignment c, shape (batch_size, r, k)
+    assign_c = self.set_assign(loss.data + reg_in.data)
+    # select among k subspace reconstructions, (r, batch_size, D)
+    x_ = x_.mul(assign_c.permute(1, 2, 0).unsqueeze(3)).sum(dim=1)
+    self._update_forward_cache(assign_c, loss, reg_in, reg_out)
+    return x_
 
-    losses = []
-    for ii in rep_range:
-      rep_losses = []
-      for jj in cluster_range:
-        x_ = self.forward(x, ii, jj)
-        rep_losses.append(torch.sum((x_ - x)**2, dim=-1).mul(0.5))
-      losses.append(torch.cat(rep_losses, dim=1))
-    loss = torch.cat(losses, dim=0)
+  def embed(self, x):
+    """Compute embedding of x wrt each subspace
+
+    Inputs:
+      x: data, shape (batch_size, D)
+
+    Returns:
+      x_: reconstruction, shape (r, k, batch_size, D)
+    """
+    z = self.encode(x)
+    x_ = self.decode(z)
+    self._update_embed_cache(z)
+    return x_
+
+  def decode(self, z):
+    """Embed low-dim code z into ambient space.
+
+    Inputs:
+      z: latent code, shape (r, k, batch_size, d)
+
+    Returns:
+      x_: reconstruction, shape (r, k, batch_size, D)
+    """
+    # z shape (r, k, batch_size, d)
+    # Us shape (r, k, D, d)
+    # bs shape (r, k, D)
+    assert(z.dim() == 4 and z.shape[:2] == self.Us.shape[:2])
+
+    # x_ = U z + b
+    # shape (r, k, batch_size, D)
+    x_ = torch.matmul(z, self.Us.transpose(2, 3))
+    if self.affine:
+      x_ = x_.add(self.bs.unsqueeze(2))
+    return x_
+
+  def _update_embed_cache(self, z):
+    """Cache values computed during embedding."""
+    self._z_frosqr = z.data.pow(2).sum(dim=-1)
+    self._z = z.data if self.cache_z else None
+    return
+
+  def loss(self, x, x_):
+    """Evaluate l2 squared reconstruction loss between x, x_.
+
+    Inputs:
+      x: data, shape (batch_size, D)
+      x_: reconstructions for each replicate and cluster, shape
+        (r, k, batch_size, D)
+
+    Returns:
+      loss: l2 squared loss, shape (batch_size, r, k).
+    """
+    assert(x_.dim() == 4 and x_.shape[:2] == (self.r, self.k) and
+        x.shape == x_.shape[-2:])
+
+    # (r, k, batch_size)
+    loss = torch.sum((x_ - x)**2, dim=-1).mul(0.5)
+    # (batch_size, r, k)
     loss = loss.permute(2, 0, 1)
     return loss
+
+  def _parse_reg(self, reg):
+    """Split reg into assign and outside terms."""
+    reg_in = torch.zeros(self.r, self.k, device=self.Us.device)
+    reg_out = torch.zeros(self.r, self.k, device=self.Us.device)
+    for key, val in reg.items():
+      if key in self.assign_reg_terms:
+        reg_in = reg_in + val
+      else:
+        reg_out = reg_out + val
+    return reg_in, reg_out
 
   def set_assign(self, assign_obj):
     """Compute cluster assignment.
 
     Inputs:
       assign_obj: shape (batch_size, r, k)
+
+    Returns:
+      assign_c: assignment indicator matrix, (batch_size, r, k)
     """
-    (self.groups, _, self.c, self._batch_c_mean,
-        self._batch_value) = self._assign_and_value(assign_obj)
+    (self.groups, _, self.c, batch_c_mean,
+        batch_value) = ut.assign_and_value(assign_obj)
 
     nan_mask = torch.isnan(self.c_mean)
-    if nan_mask.sum() > 0:
-      self.c_mean[nan_mask] = self._batch_c_mean[nan_mask]
-      self.value[nan_mask] = self._batch_value[nan_mask]
+    self.c_mean[nan_mask] = batch_c_mean[nan_mask]
+    self.value[nan_mask] = batch_value[nan_mask]
 
-    self.c_mean.mul_(EMA_DECAY).add_(1-EMA_DECAY, self._batch_c_mean)
-    self.value.mul_(EMA_DECAY).add_(1-EMA_DECAY, self._batch_value)
+    self.c_mean.mul_(EMA_DECAY).add_(1-EMA_DECAY, batch_c_mean)
+    self.value.mul_(EMA_DECAY).add_(1-EMA_DECAY, batch_value)
 
     self.groups = self.groups.cpu()
     self._update_assign_obj_cache(assign_obj)
-    return
-
-  def _assign_and_value(self, assign_obj, compute_c=True):
-    """Compute assignments and cluster size & values."""
-    batch_size, tmpr = assign_obj.shape[:2]
-    device = assign_obj.device
-
-    if self.k > 1:
-      top2obj, top2idx = torch.topk(assign_obj, 2, dim=2, largest=False,
-          sorted=True)
-      groups = top2idx[:, :, 0]
-      min_assign_obj = top2obj[:, :, 0]
-    else:
-      groups = torch.zeros(batch_size, tmpr, device=device, dtype=torch.int64)
-      min_assign_obj = assign_obj.squeeze(2)
-
-    if compute_c:
-      c = torch.zeros_like(assign_obj)
-      c.scatter_(2, groups.unsqueeze(2), 1)
-      c_mean = c.mean(dim=0)
-    else:
-      c = c_mean = None
-
-    if self.k > 1:
-      value = torch.zeros_like(assign_obj)
-      value = value.scatter_(2, groups.unsqueeze(2),
-          (top2obj[:, :, 1] - top2obj[:, :, 0]).unsqueeze(2)).mean(dim=0)
-    else:
-      value = torch.ones(tmpr, self.k, device=device)
-    return groups, min_assign_obj, c, c_mean, value
+    return self.c
 
   def _update_assign_obj_cache(self, assign_obj):
     """Add batch assign obj to a recent cache. Used when resetting unused
@@ -324,38 +236,58 @@ class KSubspaceBaseModel(nn.Module):
     batch_size = assign_obj.shape[0]
     if self.reset_cache_size < batch_size:
       Idx = torch.randperm(batch_size)[:self.reset_cache_size]
-      self.cache_assign_obj.copy_(assign_obj[Idx, :])
-      self.cache_assign_obj_head = 0
+      self._cache_assign_obj.copy_(assign_obj[Idx, :])
+      self._cache_assign_obj_head = 0
     elif self.reset_cache_size == batch_size:
-      self.cache_assign_obj.copy_(assign_obj)
-      self.cache_assign_obj_head = 0
+      self._cache_assign_obj.copy_(assign_obj)
+      self._cache_assign_obj_head = 0
     else:
-      Idx = (torch.arange(self.cache_assign_obj_head,
-          self.cache_assign_obj_head + batch_size) % self.reset_cache_size)
-      self.cache_assign_obj[Idx, :] = assign_obj
-      self.cache_assign_obj_head = ((Idx[-1] + 1) %
+      Idx = (torch.arange(self._cache_assign_obj_head,
+          self._cache_assign_obj_head + batch_size) % self.reset_cache_size)
+      self._cache_assign_obj[Idx, :] = assign_obj
+      self._cache_assign_obj_head = ((Idx[-1] + 1) %
           self.reset_cache_size).item()
     return
 
-  def eval_shrink(self, x, x_):
-    """measure shrinkage of reconstruction wrt data.
+  def _update_forward_cache(self, assign_c, loss, reg_in, reg_out):
+    """Cache loss, reg, obj values computed during forward."""
+    self._reg_out_per_cluster = reg_out.data
+
+    # reduce and compute objective, shape (r,)
+    loss = loss.mul(assign_c).sum(dim=2).mean(dim=0)
+    reg_in = reg_in.mul(assign_c).sum(dim=2).mean(dim=0)
+    reg_out = reg_out.sum(dim=1)
+    obj = loss + reg_in + reg_out
+    obj_mean = obj.mean()
+
+    # per replicate loss, reg shape (r,)
+    self._loss = loss.data
+    self._reg_in = reg_in.data
+    self._reg_out = reg_out.data
+    self._obj = obj.data
+
+    # scalar average loss with grad tracking
+    self._obj_mean = obj_mean
+
+    # ema objective, shape (r,)
+    nan_mask = torch.isnan(self.obj_ema)
+    self.obj_ema[nan_mask] = obj.data[nan_mask]
+    self.obj_ema.mul_(EMA_DECAY).add_(1-EMA_DECAY, obj.data)
+    return
+
+  def objective(self, x=None):
+    """Evaluate objective function.
 
     Inputs:
-      x: data, shape (batch_size, D)
-      x_: reconstruction, shape (r, k, batch_size, D)
+      x: data, shape (batch_size, D) (default: None)
 
     Returns:
-      norm_x_: average norm of x_ relative to x, shape (r,)
+      obj_mean: average objective across replicates
+      obj, loss, reg_in, reg_out: metrics per replicate, shape (r,)
     """
-    # (batch_size, r, k)
-    norm_x_ = x_.data.pow(2).sum(dim=3).sqrt().permute(2, 0, 1)
-    # (batch_size, r)
-    norm_x_ = norm_x_.mul_(self.c.data).sum(dim=2)
-    # (batch_size, 1)
-    norm_x = torch.norm(x.data, dim=1, keepdim=True)
-    # (r,)
-    norm_x_ = norm_x_.div(norm_x.add(EPS)).mean(dim=0)
-    return norm_x_
+    if x is not None:
+      self(x)
+    return self._obj_mean, self._obj, self._loss, self._reg_in, self._reg_out
 
   def eval_rank(self, tol=.01):
     """Compute rank and singular values of subspace bases.
@@ -376,16 +308,14 @@ class KSubspaceBaseModel(nn.Module):
     ranks = (svs > tol).sum(dim=2)
     return ranks, svs
 
-  def reset_unused(self):
-    """Reset replicates whose progress has slowed by doing several iterations
-    of simulated annealing over the graph of all (rk choose k) subsets of
-    clusters.
+  def core_reset(self):
+    """Reset replicates whose progress has slowed by cooperative
+    re-initialization (CoRe).
 
     Returns:
-      resets: np array log of resets, shape (n_resets, 8). Columns
-        are (reset rep idx, reset cluster idx, candidate rep idx,
-        candidate cluster idx, reset success, obj decrease, cumulative obj
-        decrease, temperature).
+      resets: log of resets, shape (n_resets, 8). Columns are (reset rep idx,
+        reset cluster idx, candidate rep idx, candidate cluster idx, reset
+        success, obj decrease, cumulative obj decrease, temperature).
     """
     empty_output = np.zeros((0, RESET_NCOL), dtype=object)
 
@@ -394,211 +324,62 @@ class KSubspaceBaseModel(nn.Module):
     if self.r == 1:
       return empty_output
 
-    # allocate buffers to use during resets
-    # NOTE: will cause late OOM error if cache_size, k too large
-    if self.reset_cand_metric == "obj_decr" and self._reset_buffers is None:
-      self._init_reset_buffers()
-
     # identify clusters to reset based on objective decrease
     reset_rids = self._reset_criterion()
     if reset_rids.shape[0] == 0:
       return empty_output
 
     # check that cache is full and calculate current cache objective
-    cache_not_full = torch.any(torch.isnan(self.cache_assign_obj))
+    cache_not_full = torch.any(torch.isnan(self._cache_assign_obj))
     if cache_not_full:
       return empty_output
 
-    # attempt to re-initialize replicates by greedy hill-climbing
+    assign_obj = self._cache_assign_obj
+    reg_out = self._reg_out_per_cluster
+    if RESET_CPU:
+      assign_obj, reg_out = assign_obj.cpu(), reg_out.cpu()
+
     resets = []
     for ridx in reset_rids:
-      rep_resets = self._reset_replicate(ridx.item())
+      ridx = ridx.item()
+      temp = self.temp_scheduler.step(ridx)
+      success, rep_resets, rep_assign_obj, rep_reg_out = reset_replicate(
+          ridx, assign_obj, reg_out, temp, max_steps=self.reset_max_steps,
+          accept_tol=self.reset_accept_tol, cand_metric=self.reset_cand_metric)
+      if success:
+        rep_reset_ids = rep_resets[rep_resets[:, 4] == 1, 1:4].astype(np.int64)
+        self._post_reset_updates(ridx, rep_reset_ids, rep_assign_obj,
+            rep_reg_out)
+      self.num_bad_steps[0, ridx] = 0
       resets.append(rep_resets)
+
     resets = np.concatenate(resets, axis=0)
     return resets
-
-  def _init_reset_buffers(self):
-    """Allocate large buffers that will be used in resets."""
-    device = self.Us.data.device
-    self._reset_buffers = (
-        # alt_assign_obj
-        torch.zeros((self.reset_cache_size, self.r*self.k, 2),
-            device=device),
-        # alt_obj
-        torch.zeros((self.reset_cache_size, self.r*self.k),
-            device=device),
-        # tmp_Idx
-        torch.zeros((self.reset_cache_size, self.r*self.k),
-            dtype=torch.int64, device=device)
-    )
-    return
 
   def _reset_criterion(self):
     """Identify replicates to reset based on relative objective decrease."""
     nan_mask = torch.isnan(self.best_obj)
-    self.best_obj[nan_mask] = self.obj[nan_mask]
+    self.best_obj[nan_mask] = self.obj_ema[nan_mask]
 
     if self.reset_try_tol is not None:
-      cooldown_mask = self.cooldown_counter > 0
-      self.cooldown_counter[cooldown_mask] -= 1.0
+      cooldown_mask = self._cooldown_counter > 0
+      self._cooldown_counter[cooldown_mask] -= 1.0
 
       better_or_cooldown = torch.max(cooldown_mask,
-          (self.obj < (1.0 - self.reset_try_tol)*self.best_obj))
-      self.best_obj[better_or_cooldown] = self.obj[better_or_cooldown]
+          (self.obj_ema < (1.0 - self.reset_try_tol)*self.best_obj))
+      self.best_obj[better_or_cooldown] = self.obj_ema[better_or_cooldown]
       self.num_bad_steps[:, better_or_cooldown] = 0.0
       self.num_bad_steps[:, better_or_cooldown == 0] += 1.0
     else:
       # no threshold on objective plateau
-      better_mask = self.obj < self.best_obj
-      self.best_obj[better_mask] = self.obj[better_mask]
+      better_mask = self.obj_ema < self.best_obj
+      self.best_obj[better_mask] = self.obj_ema[better_mask]
       self.num_bad_steps += 1.0
 
-    reset_mask = self.num_bad_steps[0, :] > (self.reset_patience + self.jitter)
+    reset_mask = (self.num_bad_steps[0, :] > (self.reset_patience +
+        self._jitter))
     reset_rids = reset_mask.nonzero().view(-1)
     return reset_rids
-
-  def _reset_replicate(self, ridx):
-    """Re-initialize a replicate by executing several steps of simulated
-    annealing over the graph of (rk choose k) subsets of bases."""
-    device = self.Us.data.device
-    resets = []
-    # fixed temp for this inner loop
-    temp = self.temp_scheduler.step(ridx)
-
-    value, min_assign_obj = self._eval_value()
-    rep_obj = (min_assign_obj[:, ridx].mean() +
-        self._batch_reg_out[ridx, :].sum()).item()
-    best_obj = old_obj = rep_obj
-
-    # first dim: (tmp, current, best)
-    rep_assign_obj = torch.zeros(3, self.reset_cache_size, self.k,
-        device=device).copy_(self.cache_assign_obj[:, ridx, :].unsqueeze(0))
-    rep_reg_out = torch.zeros(3, self.k, device=device).copy_(
-        self._batch_reg_out[ridx, :])
-
-    for _ in range(self.reset_max_steps):
-      swap_sample_prob = 1.0 / value[ridx, :].clamp(min=EPS)
-      cidx = torch.multinomial(swap_sample_prob, 1)[0].item()
-      cand_ridx, cand_cidx = self._sample_swap_cand(ridx, cidx, value, rep_obj,
-          rep_assign_obj[0, :], rep_reg_out[0, :])
-
-      # update temp assign obj
-      rep_assign_obj[0, :, cidx] = self.cache_assign_obj[:,
-          cand_ridx, cand_cidx]
-      rep_reg_out[0, cidx] = self._batch_reg_out[cand_ridx, cand_cidx]
-      cand_obj = (rep_assign_obj[0, :].min(dim=1)[0].mean() +
-          rep_reg_out[0, :].sum()).item()
-      obj_decr = (rep_obj - cand_obj) / rep_obj
-
-      # accept with probability decaying exponentially in obj increase, as in
-      # simulated annealing.
-      accept_prob = np.exp(min(obj_decr - self.reset_accept_tol, 0) / temp)
-      success = torch.rand(1)[0].item() <= accept_prob
-
-      if success:
-        # copy assign obj from temp to current
-        rep_assign_obj[1, :, cidx] = rep_assign_obj[0, :, cidx]
-        rep_reg_out[1, cidx] = rep_reg_out[0, cidx]
-        rep_obj = cand_obj
-
-        # update replicate value
-        value[ridx, :], _ = self._eval_value(
-            assign_obj=rep_assign_obj[1, :], reg_out=rep_reg_out[1, :])
-
-        # update best assign obj and copy assign obj from current to best
-        if rep_obj < best_obj:
-          best_obj = rep_obj
-          rep_assign_obj[2, :] = rep_assign_obj[1, :]
-          rep_reg_out[2, :] = rep_reg_out[1, :]
-      else:
-        # revert temp assign obj to previous
-        rep_assign_obj[0, :, cidx] = rep_assign_obj[1, :, cidx]
-        rep_reg_out[0, cidx] = rep_reg_out[1, cidx]
-
-      cumu_obj_decr = (old_obj - rep_obj) / old_obj
-      resets.append([ridx, cidx, cand_ridx, cand_cidx, int(success), obj_decr,
-          cumu_obj_decr, temp])
-
-    resets = np.array(resets, dtype=object)
-    self.num_bad_steps[0, ridx] = 0
-
-    # final updates if objective sufficiently improved
-    if (old_obj - best_obj) / old_obj >= self.reset_accept_tol:
-      bestitr = np.argmax(resets[:, 6])
-      # code reset successes after best as -1
-      # NOTE: possibly need to be careful about negative values elsewhere.
-      resets[bestitr+1:, 4] *= -1
-      reset_ids = resets[resets[:, 4] == 1, 1:4].astype(np.int64)
-      self._post_reset_updates(ridx, reset_ids, rep_assign_obj, rep_reg_out)
-    else:
-      resets[:, 4] *= -1
-    return resets
-
-  def _eval_value(self, assign_obj=None, reg_out=None):
-    """Evaluate value of every replicate, cluster based on cache objective."""
-    assert((assign_obj is None) == (reg_out is None))
-    if assign_obj is None:
-      assign_obj = self.cache_assign_obj
-      reg_out = self._batch_reg_out
-
-    assert(reg_out.dim() == assign_obj.dim() - 1)
-
-    # in this case assign obj/reg_out correspond to a fixed replicate.
-    # unsqueeze rep dimension.
-    if assign_obj.dim() == 2:
-      assign_obj = assign_obj.unsqueeze(1)
-      reg_out = reg_out.unsqueeze(0)
-
-    _, min_assign_obj, _, _, value = self._assign_and_value(assign_obj,
-        compute_c=False)
-    value.sub_(reg_out)
-    return value.squeeze(0), min_assign_obj.squeeze(1)
-
-  def _sample_swap_cand(self, ridx, cidx, value, rep_obj, rep_assign_obj,
-        rep_reg_out):
-    """Sample a candidate replicate, cluster to swap for given ridx, cidx."""
-    if self.reset_cand_metric == 'value':
-      cand_sample_prob = value.clamp(min=EPS)
-    else:
-      # obj_decr
-      alt_obj = self._eval_alt_obj(ridx, cidx, rep_assign_obj, rep_reg_out)
-      alt_obj_decr = (rep_obj - alt_obj) / rep_obj
-      # clamp so objective increase steps have some small non-zero probability
-      cand_sample_prob = alt_obj_decr.clamp(min=EPS)
-    cand_sample_prob[ridx, :] = 0.0
-
-    idx = torch.multinomial(cand_sample_prob.view(-1), 1)[0].item()
-    cand_ridx, cand_cidx = np.unravel_index(idx, (self.r, self.k))
-    return cand_ridx, cand_cidx
-
-  def _eval_alt_obj(self, ridx, cidx, rep_assign_obj, rep_reg_out):
-    """Find the best candidate swap for given ridx, cidx."""
-    # (cache_size, rk, 2), (cache_size, rk), (cache_size, rk)
-    alt_assign_obj, alt_obj, tmp_Idx = self._reset_buffers
-
-    # (cache_size,) of min assign objs with cidx dropped.
-    drop_assign_obj = rep_assign_obj.clone()
-    drop_assign_obj[:, cidx] = np.inf
-    drop_assign_obj = drop_assign_obj.min(dim=1)[0]
-
-    # scalar reg value for single dropped cluster cidx
-    drop_reg_out = rep_reg_out.sum() - rep_reg_out[cidx]
-
-    # (cache_size, rk, 2)
-    alt_assign_obj[:, :, 0] = drop_assign_obj.unsqueeze(1)
-    # the values corresponding to ridx are not valid, but we will zero out the
-    # corresponding probabilities later anyway.
-    alt_assign_obj[:, :, 1] = self.cache_assign_obj.view(-1, self.r*self.k)
-
-    # (cache_size, rk)
-    alt_obj, _ = torch.min(alt_assign_obj, dim=2, out=(alt_obj, tmp_Idx))
-
-    # average over cache and add regularization, (rk,)
-    alt_obj = alt_obj.mean(dim=0)
-    alt_obj.add_(drop_reg_out)
-    alt_obj.add_(self._batch_reg_out.view(-1))
-    alt_obj = alt_obj.view(self.r, self.k)
-    return alt_obj
 
   def _post_reset_updates(self, ridx, reset_ids, rep_assign_obj, rep_reg_out):
     """Duplicate bases from (cand_rIdx, cand_cIdx) to (rIdx, cIdx), and other
@@ -612,18 +393,18 @@ class KSubspaceBaseModel(nn.Module):
     if self.affine:
       self.bs.data[ridx, cIdx, :] = self.bs.data[cand_rIdx, cand_cIdx, :]
 
-    self.cache_assign_obj[:, ridx, :] = rep_assign_obj[2, :]
-    self._batch_reg_out[ridx, :] = rep_reg_out[2, :]
+    self._cache_assign_obj[:, ridx, :] = rep_assign_obj
+    self._reg_out_per_cluster[ridx, :] = rep_reg_out
 
     self.c_mean[ridx, :] = np.nan
     self.value[ridx, :] = np.nan
-    self.obj[ridx] = self.best_obj[ridx] = np.nan
+    self.obj_ema[ridx] = self.best_obj[ridx] = np.nan
     self.num_bad_steps[1, ridx] = 0
     if self.reset_try_tol is None:
-      self.jitter[ridx].random_(-self.reset_patience//2,
+      self._jitter[ridx].random_(-self.reset_patience//2,
           self.reset_patience//2 + 1)
     else:
-      self.cooldown_counter[ridx] = self.reset_patience // 2
+      self._cooldown_counter[ridx] = self.reset_patience // 2
     return
 
   def zero(self):
@@ -652,11 +433,10 @@ class KSubspaceMFModel(KSubspaceBaseModel):
   assign_reg_terms = {'U_frosqr_in', 'z'}
 
   def __init__(self, k, d, D, affine=False, replicates=5, reg_params={},
-        serial_eval={}, reset_patience=100, reset_try_tol=0.01,
-        reset_cand_metric='obj_decr', reset_max_steps=50,
-        reset_accept_tol=1e-3, reset_cache_size=500, temp_scheduler=None,
-        scale_grad_mode=None, scale_grad_update_freq=20, init='random',
-        initX=None, initk=None):
+        reset_patience=100, reset_try_tol=0.01, reset_cand_metric='obj_decr',
+        reset_max_steps=50, reset_accept_tol=1e-3, reset_cache_size=500,
+        temp_scheduler=None, scale_grad_mode=None, scale_grad_update_freq=20,
+        init='random', initX=None, initk=None):
 
     if not (scale_grad_mode is None or scale_grad_mode == 'none'):
       if affine:
@@ -676,10 +456,10 @@ class KSubspaceMFModel(KSubspaceBaseModel):
 
     super().__init__(k, d, D,
         affine=affine, replicates=replicates, reg_params=reg_params,
-        serial_eval=serial_eval, reset_patience=reset_patience,
-        reset_try_tol=reset_try_tol, reset_cand_metric=reset_cand_metric,
-        reset_max_steps=reset_max_steps, reset_accept_tol=reset_accept_tol,
-        reset_cache_size=reset_cache_size, temp_scheduler=temp_scheduler)
+        reset_patience=reset_patience, reset_try_tol=reset_try_tol,
+        reset_cand_metric=reset_cand_metric, reset_max_steps=reset_max_steps,
+        reset_accept_tol=reset_accept_tol, reset_cache_size=reset_cache_size,
+        temp_scheduler=temp_scheduler)
 
     if scale_grad_mode == 'none':
       scale_grad_mode = None
@@ -824,32 +604,30 @@ class KSubspaceMFModel(KSubspaceBaseModel):
         self.bs.data[ii, cidx, :] = b
     return
 
-  def encode(self, x, ii=None, jj=None):
+  def encode(self, x):
     """Compute subspace coefficients for x in closed form, by computing
     batched solution to normal equations.
 
       min_z 1/2 || x - (Uz + b) ||_2^2 + \lambda/2 ||z||_2^2
       (U^T U + \lambda I) z* = U^T (x - b)
 
-    Input:
+    Inputs:
       x: shape (batch_size, D)
-      ii, jj: rep, cluster indices. Either int index or None.
 
     Returns:
       z: latent low-dimensional codes (r, k, batch_size, d)
     """
     # Us shape (r, k, D, d)
     # bs shape (r, k, D)
-    Us, bs = self._slice_Us_bs(ii, jj, no_grad=True)
     batch_size = x.size(0)
 
     # (1, 1, D, batch_size)
     x = x.data.t().view(1, 1, self.D, batch_size)
     if self.affine:
       # (r, k, D, batch_size)
-      x = x.sub(bs.unsqueeze(3))
+      x = x.sub(self.bs.data.unsqueeze(3))
     # (r, k, d, batch_size)
-    z = ut.batch_ridge(x, Us, lamb=self.reg_params['z'])
+    z = ut.batch_ridge(x, self.Us.data, lamb=self.reg_params['z'])
 
     # (r, k, batch_size, d)
     z = z.transpose(2, 3)
@@ -875,8 +653,8 @@ class KSubspaceMFModel(KSubspaceBaseModel):
     # does not affect gradients, only included to ensure objective value
     # is accurate
     if self.reg_params['z'] > 0:
-      regs['z'] = self.z_frosqr.permute(2, 0, 1).mul(self.reg_params['z']*0.5)
-    return regs
+      regs['z'] = self._z_frosqr.permute(2, 0, 1).mul(self.reg_params['z']*0.5)
+    return self._parse_reg(regs)
 
   def _scale_grad(self, Grad, update_accum=True):
     """Divide gradients by an estimate of the Lipschitz constant, per
@@ -885,9 +663,9 @@ class KSubspaceMFModel(KSubspaceBaseModel):
         self.scale_grad_update_freq == 0)
 
     if update_accum:
-      device = self.z.device
+      device = self._z.device
       batch_size = self.c.shape[0]
-      z_zero = self.c.permute(1, 2, 0).unsqueeze(3) * self.z
+      z_zero = self.c.permute(1, 2, 0).unsqueeze(3) * self._z
       Hess = torch.matmul(z_zero.transpose(2, 3), z_zero)
 
       # (r, k)
@@ -972,42 +750,40 @@ class KSubspaceProjModel(KSubspaceBaseModel):
   assign_reg_terms = {'U_frosqr_in'}
 
   def __init__(self, k, d, D, affine=False, replicates=5, reg_params={},
-        serial_eval={}, reset_patience=100, reset_try_tol=0.01,
+        reset_patience=100, reset_try_tol=0.01,
         reset_cand_metric='obj_decr', reset_max_steps=50,
         reset_accept_tol=1e-3, reset_cache_size=500, temp_scheduler=None):
 
     super().__init__(k, d, D,
         affine=affine, replicates=replicates, reg_params=reg_params,
-        serial_eval=serial_eval, reset_patience=reset_patience,
-        reset_try_tol=reset_try_tol, reset_cand_metric=reset_cand_metric,
-        reset_max_steps=reset_max_steps, reset_accept_tol=reset_accept_tol,
-        reset_cache_size=reset_cache_size, temp_scheduler=temp_scheduler)
+        reset_patience=reset_patience, reset_try_tol=reset_try_tol,
+        reset_cand_metric=reset_cand_metric, reset_max_steps=reset_max_steps,
+        reset_accept_tol=reset_accept_tol, reset_cache_size=reset_cache_size,
+        temp_scheduler=temp_scheduler)
 
     self.reset_parameters()
     return
 
-  def encode(self, x, ii=None, jj=None):
+  def encode(self, x):
     """Project x onto each of k low-dimensional spaces.
 
-    Input:
+    Inputs:
       x: shape (batch_size, D)
-      ii, jj: rep, cluster indices. Either int index or None.
 
     Returns:
       z: latent low-dimensional codes (r, k, batch_size, d)
     """
-    Us, bs = self._slice_Us_bs(ii, jj, no_grad=False)
     batch_size = x.size(0)
 
     # z = U^T (x - b) or z = V (x - b)
     if self.affine:
       # (r, k, batch_size, D)
-      x = x.sub(bs.unsqueeze(2))
+      x = x.sub(self.bs.unsqueeze(2))
     else:
       x = x.view(1, 1, batch_size, self.D)
 
     # (r, k, batch_size, d)
-    z = torch.matmul(x, Us)
+    z = torch.matmul(x, self.Us)
     return z
 
   def reg(self):
@@ -1025,7 +801,7 @@ class KSubspaceProjModel(KSubspaceBaseModel):
       if self.reg_params['U_frosqr_out'] > 0:
         regs['U_frosqr_out'] = U_frosqr.mul(
             self.reg_params['U_frosqr_out'])
-    return regs
+    return self._parse_reg(regs)
 
 
 class KSubspaceBatchAltBaseModel(KSubspaceBaseModel):
@@ -1033,10 +809,9 @@ class KSubspaceBatchAltBaseModel(KSubspaceBaseModel):
   assign_reg_terms = dict()
 
   def __init__(self, k, d, dataset, affine=False, replicates=5, reg_params={},
-        serial_eval={}, reset_patience=2, reset_try_tol=0.01,
-        reset_cand_metric='obj_decr', reset_max_steps=50,
-        reset_accept_tol=1e-3, reset_cache_size=500, temp_scheduler=None,
-        svd_solver='randomized', **kwargs):
+        reset_patience=2, reset_try_tol=0.01, reset_cand_metric='obj_decr',
+        reset_max_steps=50, reset_accept_tol=1e-3, reset_cache_size=500,
+        temp_scheduler=None, svd_solver='randomized', **kwargs):
 
     if svd_solver not in ('randomized', 'svds', 'svd'):
       raise ValueError("Invalid svd solver {}".format(svd_solver))
@@ -1045,11 +820,10 @@ class KSubspaceBatchAltBaseModel(KSubspaceBaseModel):
     D = dataset.X.shape[1]
     super().__init__(k, d, D,
         affine=affine, replicates=replicates, reg_params=reg_params,
-        serial_eval=serial_eval, reset_patience=reset_patience,
-        reset_try_tol=reset_try_tol, reset_cand_metric=reset_cand_metric,
-        reset_max_steps=reset_max_steps, reset_accept_tol=reset_accept_tol,
-        reset_cache_size=reset_cache_size, temp_scheduler=temp_scheduler,
-        **kwargs)
+        reset_patience=reset_patience, reset_try_tol=reset_try_tol,
+        reset_cand_metric=reset_cand_metric, reset_max_steps=reset_max_steps,
+        reset_accept_tol=reset_accept_tol, reset_cache_size=reset_cache_size,
+        temp_scheduler=temp_scheduler, **kwargs)
 
     self.dataset = dataset
     self.register_buffer('X', dataset.X)
@@ -1065,46 +839,47 @@ class KSubspaceBatchAltBaseModel(KSubspaceBaseModel):
     return
 
   def objective(self):
-    """Evaluate objective function.
+    """Evaluate objective function. Note, forward evaluation is always
+    computed.
 
     Returns:
       obj_mean: average objective across replicates
       obj, loss, reg_in, reg_out: metrics per replicate, shape (r,)
-      x_: reconstruction, shape (r, k, batch_size, D)
     """
-    ret_vals = super().objective(self.X)
-    # objective is exact for batch algorithm, override ema.
-    self.obj = ret_vals[1].clone()
-    return ret_vals
+    self()
+    return self._obj_mean, self._obj, self._loss, self._reg_in, self._reg_out
+
+  def forward(self):
+    """Compute union of subspace embedding of X.
+
+    Inputs:
+      x: data, shape (batch_size, D) (default: self.X)
+
+    Returns:
+      x_: reconstruction, shape (r, N, D)
+    """
+    # NOTE: will this only call KSubspaceBaseModel forward as intended in
+    # subclasses?
+    return super().forward(self.X)
 
   def set_assign(self, assign_obj):
     """Compute cluster assignment.
 
     Inputs:
       assign_obj: shape (N, r, k)
-    """
-    groups_prev = self.groups
-    (self.groups, _, self.c, self._batch_c_mean,
-        self._batch_value) = self._assign_and_value(assign_obj)
-    self.c_mean = self._batch_c_mean
-    self.value = self._batch_value
-
-    self.groups = self.groups.cpu()
-    self._updates = ((self.groups != groups_prev).sum()
-        if groups_prev is not None else self.N)
-    self._update_assign_obj_cache(assign_obj)
-    return
-
-  def eval_shrink(self, x_):
-    """measure shrinkage of reconstruction wrt data.
-
-    Inputs:
-      x_: reconstruction, shape (r, k, N, D)
 
     Returns:
-      norm_x_: average norm of x_ relative to x, shape (r,)
+      assign_c: assignment indicator matrix, (batch_size, r, k)
     """
-    return super().eval_shrink(self.X, x_)
+    groups_prev = self.groups
+    (self.groups, _, self.c, self.c_mean,
+        self.value) = ut.assign_and_value(assign_obj)
+
+    self.groups = self.groups.cpu()
+    self.updates = ((self.groups != groups_prev).sum()
+        if groups_prev is not None else self.N)
+    self._update_assign_obj_cache(assign_obj)
+    return self.c
 
 
 class KSubspaceBatchAltProjModel(KSubspaceBatchAltBaseModel,
@@ -1116,18 +891,16 @@ class KSubspaceBatchAltProjModel(KSubspaceBatchAltBaseModel,
   assign_reg_terms = {'U_frosqr_in'}
 
   def __init__(self, k, d, dataset, affine=False, replicates=5, reg_params={},
-        serial_eval={}, reset_patience=2, reset_try_tol=0.01,
-        reset_cand_metric='obj_decr', reset_max_steps=50,
-        reset_accept_tol=1e-3, reset_cache_size=500, temp_scheduler=None,
-        svd_solver='randomized'):
+        reset_patience=2, reset_try_tol=0.01, reset_cand_metric='obj_decr',
+        reset_max_steps=50, reset_accept_tol=1e-3, reset_cache_size=500,
+        temp_scheduler=None, svd_solver='randomized'):
 
     super().__init__(k, d, dataset,
         affine=affine, replicates=replicates, reg_params=reg_params,
-        serial_eval=serial_eval, reset_patience=reset_patience,
-        reset_try_tol=reset_try_tol, reset_cand_metric=reset_cand_metric,
-        reset_max_steps=reset_max_steps, reset_accept_tol=reset_accept_tol,
-        reset_cache_size=reset_cache_size, temp_scheduler=temp_scheduler,
-        svd_solver=svd_solver)
+        reset_patience=reset_patience, reset_try_tol=reset_try_tol,
+        reset_cand_metric=reset_cand_metric, reset_max_steps=reset_max_steps,
+        reset_accept_tol=reset_accept_tol, reset_cache_size=reset_cache_size,
+        temp_scheduler=temp_scheduler, svd_solver=svd_solver)
     return
 
   def step(self):
@@ -1157,20 +930,19 @@ class KSubspaceBatchAltMFModel(KSubspaceBatchAltBaseModel, KSubspaceMFModel):
   assign_reg_terms = {'U_frosqr_in', 'z'}
 
   def __init__(self, k, d, dataset, affine=False, replicates=5, reg_params={},
-        serial_eval={}, reset_patience=2, reset_try_tol=0.01,
-        reset_cand_metric='obj_decr', reset_max_steps=50,
-        reset_accept_tol=1e-3, reset_cache_size=500, temp_scheduler=None,
-        init='random', initX=None, initk=None, svd_solver='randomized'):
+        reset_patience=2, reset_try_tol=0.01, reset_cand_metric='obj_decr',
+        reset_max_steps=50, reset_accept_tol=1e-3, reset_cache_size=500,
+        temp_scheduler=None, init='random', initX=None, initk=None,
+        svd_solver='randomized'):
 
     mf_kwargs = {'scale_grad_mode': None, 'init': init, 'initX': initX,
         'initk': initk}
     super().__init__(k, d, dataset,
         affine=affine, replicates=replicates, reg_params=reg_params,
-        serial_eval=serial_eval, reset_patience=reset_patience,
-        reset_try_tol=reset_try_tol, reset_cand_metric=reset_cand_metric,
-        reset_max_steps=reset_max_steps, reset_accept_tol=reset_accept_tol,
-        reset_cache_size=reset_cache_size, temp_scheduler=temp_scheduler,
-        svd_solver=svd_solver, **mf_kwargs)
+        reset_patience=reset_patience, reset_try_tol=reset_try_tol,
+        reset_cand_metric=reset_cand_metric, reset_max_steps=reset_max_steps,
+        reset_accept_tol=reset_accept_tol, reset_cache_size=reset_cache_size,
+        temp_scheduler=temp_scheduler, svd_solver=svd_solver, **mf_kwargs)
 
     # bases initialized in KSubspaceMFModel
     # ensure columns are orthogonal
@@ -1180,7 +952,7 @@ class KSubspaceBatchAltMFModel(KSubspaceBatchAltBaseModel, KSubspaceMFModel):
         self.Us.data[ii, jj, :] = P.mul_(S)
     return
 
-  def encode(self, x, ii=None, jj=None):
+  def encode(self, x):
     """Compute subspace coefficients for x in closed form, by computing
     batched solution to normal equations. Use fact that colums of U are
     orthogonal (althought not necessarily unit norm).
@@ -1188,27 +960,25 @@ class KSubspaceBatchAltMFModel(KSubspaceBatchAltBaseModel, KSubspaceMFModel):
       min_z 1/2 || x - (Uz + b) ||_2^2 + \lambda/2 ||z||_2^2
       (U^T U + \lambda I) z* = U^T (x - b)
 
-    Input:
+    Inputs:
       x: shape (batch_size, D)
-      ii, jj: rep, cluster indices. Either int index or None.
 
     Returns:
       z: latent low-dimensional codes (r, k, batch_size, d)
     """
-    Us, bs = self._slice_Us_bs(ii, jj, no_grad=True)
     batch_size = x.size(0)
 
     if self.affine:
       # (r, k, batch_size, D)
-      x = x.sub(bs.unsqueeze(2))
+      x = x.sub(self.bs.data.unsqueeze(2))
     else:
       x = x.view(1, 1, batch_size, self.D)
 
     # (r, k, batch_size, d)
-    b = torch.matmul(x, Us)
+    b = torch.matmul(x, self.Us.data)
 
     # (r, k, 1, d)
-    S = torch.norm(Us, dim=2, keepdim=True)
+    S = torch.norm(self.Us.data, dim=2, keepdim=True)
     lambeye = torch.ones_like(S).mul_(self.reg_params['z'])
 
     # (r, k, batch_size, d)
@@ -1258,14 +1028,13 @@ class KMeansBatchAltModel(KSubspaceBatchAltBaseModel):
 
     d = 1  # Us not used, but retained for consistency/out of laziness
     affine = True
-    serial_eval = {}  # not supported
 
     super().__init__(k, d, dataset,
         affine=affine, replicates=replicates, reg_params=reg_params,
-        serial_eval=serial_eval, reset_patience=reset_patience,
-        reset_try_tol=reset_try_tol, reset_cand_metric=reset_cand_metric,
-        reset_max_steps=reset_max_steps, reset_accept_tol=reset_accept_tol,
-        reset_cache_size=reset_cache_size, temp_scheduler=temp_scheduler)
+        reset_patience=reset_patience, reset_try_tol=reset_try_tol,
+        reset_cand_metric=reset_cand_metric, reset_max_steps=reset_max_steps,
+        reset_accept_tol=reset_accept_tol, reset_cache_size=reset_cache_size,
+        temp_scheduler=temp_scheduler)
 
     self.init = init
     # Number of candidate means to test. Will add the one that reduces the loss
@@ -1320,30 +1089,44 @@ class KMeansBatchAltModel(KSubspaceBatchAltBaseModel):
       self.bs.data.copy_(self.X[Idx, :])
     return
 
-  def forward(self, x, ii=None, jj=None):
-    """Null placeholder forward method
+  def forward(self, compute_x_=False):
+    """Evaluate loss, compute assignment, and optionally compute k-means
+    embedding.
 
-    Input:
-      x: data, shape (batch_size, D)
+    Inputs:
+      compute_x_: Compute k-means embedding.
 
     Returns:
-      x_: None
+      x_: reconstruction, shape (r, N, D) if compute_x_, otherwise None.
     """
-    x_ = torch.zeros((), dtype=x.dtype, device=x.device)
+    loss = self.loss()
+    # reg_in shape (batch_size, r, k) or (r, k)
+    # reg_out shape (r, k)
+    reg_in, reg_out = self.reg()
+    # update assignment c, shape (batch_size, r, k)
+    assign_c = self.set_assign(loss.data + reg_in.data)
+    self._update_forward_cache(assign_c, loss, reg_in, reg_out)
+    if compute_x_:
+      # bs shape (r, k, D)
+      # groups shape (N, r)
+      rIdx = torch.arange(self.r).view(-1, 1)
+      # shape (r, N, D)
+      x_ = self.bs[rIdx, self.groups.t(), :]
+    else:
+      x_ = None
     return x_
 
-  def loss(self, x, x_, bs=None):
+  def loss(self, bs=None):
     """Evaluate reconstruction loss
 
     Inputs:
-      x: data, shape (batch_size, D) (not used)
-      x_: reconstruction, shape (r, k, batch_size, D) (not used)
       bs: k means (default: None).
 
     Returns:
       loss: shape (batch_size, r, k)
     """
-    bs = bs if bs is not None else self.bs
+    if bs is None:
+      bs = self.bs
     bsqrnorms = bs.pow(2).sum(dim=2).mul(0.5)
 
     # X (batch_size, D)
@@ -1354,10 +1137,13 @@ class KMeansBatchAltModel(KSubspaceBatchAltBaseModel):
     loss = self.Xsqrnorms.view(-1, 1, 1).sub(XTb).add(bsqrnorms.unsqueeze(0))
     return loss.clamp_(min=0.0)
 
-  def encode(self, x, ii=None, jj=None):
+  def embed(self, x):
+    raise NotImplementedError("embed not implemented.")
+
+  def encode(self, x):
     raise NotImplementedError("encode not implemented.")
 
-  def decode(self, x, ii=None, jj=None):
+  def decode(self, z):
     raise NotImplementedError("decode not implemented.")
 
   def reg(self):
@@ -1366,19 +1152,7 @@ class KMeansBatchAltModel(KSubspaceBatchAltBaseModel):
     if self.reg_params['b_frosqr_out'] > 0:
       regs['b_frosqr_out'] = torch.sum(self.bs.pow(2), dim=2).mul(
           self.reg_params['b_frosqr_out']*0.5)
-    return regs
-
-  def eval_shrink(self, x_):
-    """measure shrinkage of reconstruction wrt data.
-
-    Inputs:
-      x_: reconstruction, shape (r, k, batch_size, D) (not used)
-
-    Returns:
-      norm_x_: vector of -1, null placeholder.
-    """
-    norm_x_ = torch.ones(x_.shape[0], dtype=x_.dtype, device=x_.device).mul(-1)
-    return norm_x_
+    return self._parse_reg(regs)
 
   def step(self):
     """Update k means (and increment step count).
@@ -1431,27 +1205,26 @@ class KSubspaceMCModel(KSubspaceMFModel):
     self.repbs = None
 
     self.cache_z = True
-    self.z = None
+    self._z = None
     self.cache_x_ = not sparse_decode
-    self.x_ = None
+    self._x_ = None
     return
 
-  def loss(self, x):
+  def loss(self, x, x_):
     """Evaluate reconstruction loss
 
     Inputs:
-      x: either sparse format (list of sparse tensors), or dense format
-        (tensor with missing elements coded as nan, shape (batch_size, D)).
+      x: MissingDataBatch instance, dense shape (batch_size, D).
+      x_: reconstruction, shape (r, k, batch_size, M) where M = x.pad_nnz if
+        sparse_decode, or M = D otherwise.
 
     Returns:
       loss: shape (batch_size, r, k)
     """
-    x_ = self(x)
     # loss (r, k, batch_size)
     if self.sparse_decode:
       # x_ assumed (r, k, batch_size, pad_nnz)
-      loss = torch.sum(((x_ * x.omega_float) - x.values)**2,
-          dim=-1).mul(0.5)
+      loss = torch.sum(((x_ * x.omega_float) - x.values)**2, dim=-1).mul(0.5)
     else:
       # x_ assumed (r, k, batch_size, D)
       loss = torch.sum(((x_ * x.omega_float_dense) - x.values_dense)**2,
@@ -1460,18 +1233,19 @@ class KSubspaceMCModel(KSubspaceMFModel):
     loss = loss.permute(2, 0, 1)
     return loss
 
-  def forward(self, x):
-    """Compute representation of x wrt each subspace.
+  def embed(self, x):
+    """Compute embedding of x wrt each subspace.
 
-    Input:
-      x: data, shape (batch_size, D)
+    Inputs:
+      x: MissingDataBatch instance, dense shape (batch_size, D).
 
     Returns:
-      x_: reconstruction, shape (r, k, batch_size, D)
+      x_: reconstruction, either shape (r, k, batch_size, M) where M =
+        x.pad_nnz if sparse_decode, or M = D otherwise.
     """
     z = self.encode(x)
     x_ = self.decode(z, x, compute_repUs=False)
-    self._update_forward_cache(z, x_)
+    self._update_embed_cache(z, x_)
     return x_
 
   def encode(self, x):
@@ -1538,22 +1312,17 @@ class KSubspaceMCModel(KSubspaceMFModel):
         x_ = x_.add(self.bs.unsqueeze(2))
     return x_
 
-  def _update_forward_cache(self, z, x_):
-    """Update any cached values from forward call."""
-    self.z_frosqr = z.data.pow(2).sum(dim=-1)
-    if self.cache_z:
-      self.z = z.data
-    if self.cache_x_:
-      self.x_ = x_.data
+  def _update_embed_cache(self, z, x_):
+    """Cache values computed during embedding."""
+    self._z_frosqr = z.data.pow(2).sum(dim=-1)
+    self._z = z.data if self.cache_z else None
+    self._x_ = x_.data if self.cache_x_ else None
     return
-
-  def eval_shrink(self, x, x_):
-    raise NotImplementedError("eval_shrink not implemented.")
 
   def eval_comp_error(self, x0):
     """Evaluate completion error over observed entries in x0.
 
-    Input:
+    Inputs:
       x0: either sparse format (list of sparse tensors), or dense format
         (tensor with missing elements coded as nan, shape (batch_size, D)).
 
@@ -1567,11 +1336,11 @@ class KSubspaceMCModel(KSubspaceMFModel):
 
     with torch.no_grad():
       if self.sparse_decode:
-        # (r, k, batch_size, max_nnz)
-        x0_ = self.decode(self.z, x0)
+        # (r, k, batch_size, pad_nnz)
+        x0_ = self.decode(self._z, x0)
       else:
         # (r, k, batch_size, D)
-        x0_ = self.x_
+        x0_ = self._x_
 
       # (r, batch_size, *)
       rIdx = torch.arange(self.r).view(-1, 1)
@@ -1589,236 +1358,6 @@ class KSubspaceMCModel(KSubspaceMFModel):
       denom = x0.pow(2).mean() if self.norm_comp_error else 1.0
       comp_err = ((x0_ - x0).pow(2).mean(dim=1) / denom).sqrt()
     return comp_err
-
-
-class KSubspaceMFCorruptModel(KSubspaceMFModel):
-  """K-subspace model where low-dim coefficients are computed in closed
-  form. Adapted to handle corrupted data."""
-  default_reg_params = {
-      'U_frosqr_in': 0.01,
-      'U_frosqr_out': 1e-4,
-      'z': 0.01,
-      'e': 0.0
-  }
-  assign_reg_terms = {'U_frosqr_in', 'z', 'e'}
-
-  def __init__(self, k, d, D, affine=False, replicates=5, reg_params={},
-        serial_eval={}, reset_patience=100, reset_try_tol=0.01,
-        reset_cand_metric='obj_decr', reset_max_steps=50,
-        reset_accept_tol=1e-3, reset_cache_size=500, temp_scheduler=None,
-        scale_grad_mode=None, scale_grad_update_freq=20, encode_max_iter=20,
-        encode_tol=1e-3):
-
-    if encode_max_iter <= 0:
-      raise ValueError(("Invalid encode_max_iter parameter {}").format(
-          encode_max_iter))
-
-    super().__init__(k, d, D,
-        affine=affine, replicates=replicates, reg_params=reg_params,
-        serial_eval=serial_eval, reset_patience=reset_patience,
-        reset_try_tol=reset_try_tol, reset_cand_metric=reset_cand_metric,
-        reset_max_steps=reset_max_steps, reset_accept_tol=reset_accept_tol,
-        reset_cache_size=reset_cache_size, temp_scheduler=temp_scheduler,
-        scale_grad_mode=scale_grad_mode,
-        scale_grad_update_freq=scale_grad_update_freq)
-
-    # when e reg parameter is set to zero we disable the corruption term,
-    # although strictly speaking it should give the trivial solution e = full
-    # residual.
-    if self.reg_params['e'] == 0:
-      encode_max_iter = 0
-    self.encode_max_iter = encode_max_iter
-    self.encode_tol = encode_tol
-    self.encode_steps = None
-    self.encode_update = None
-    self.cache_z = True
-
-    # denoised x
-    self.cache_x0_ = True
-    self.x0_ = None
-    # corruption
-    self.cache_e = False
-    self.e = None
-    return
-
-  def forward(self, x, ii=None, jj=None):
-    """Compute subspace coefficients and reconstruction for x by alternating
-    least squares and proximal operator on e.
-
-      min_{z,e} 1/2 || x - (Uz + b + e) ||_2^2
-          \lambda/2 ||z||_2^2 + \gamma ||e||
-
-    Input:
-      x: shape (batch_size, D)
-      ii, jj: rep, cluster indices. Either int index or None.
-
-    Returns:
-      x_: reconstruction, shape (r, k, batch_size, D)
-    """
-    Us, bs = self._slice_Us_bs(ii, jj, no_grad=False)
-    batch_size = x.size(0)
-    xnorm = max(x.abs().max(), 1.0)
-
-    if self.affine:
-      # (r, k, batch_size, D)
-      x = x.sub(bs.data.unsqueeze(2))
-    else:
-      x = x.view(1, 1, batch_size, self.D)
-
-    Us_P, Us_s, Us_Q = ut.batch_svd(Us.data)
-    UsT = Us.data.transpose(2, 3).contiguous()
-
-    e = torch.zeros((), dtype=x.dtype, device=x.device)
-    for kk in range(self.encode_max_iter):
-      e_old = e
-      z = self._least_squares(x - e, Us_P, Us_s, Us_Q)
-      x_ = torch.matmul(z, UsT)
-      e = self._prox_e(x - x_)
-
-      update = (e - e_old).abs().max()
-      if update <= self.encode_tol * xnorm:
-        break
-
-    if self.encode_max_iter > 0:
-      if self.encode_steps is None:
-        self.encode_steps = kk+1
-        self.encode_update = update
-      else:
-        self.encode_steps = (EMA_DECAY*self.encode_steps +
-            (1-EMA_DECAY)*(kk+1))
-        self.encode_update = (EMA_DECAY*self.encode_update +
-            (1-EMA_DECAY)*update)
-
-    # one more time for tracking gradients.
-    # z = self._least_squares(x - e, Us_P, Us_s, Us_Q)
-    x_ = torch.matmul(z, Us.transpose(2, 3))
-    if self.affine:
-      x_ = x_.add(bs.unsqueeze(2))
-    x0_ = x_.data.clone()
-    x_ = x_.add(e)
-
-    self._update_forward_cache(ii, jj, z, e, x0_)
-    return x_
-
-  def encode(self, x, ii=None, jj=None):
-    raise NotImplementedError("encode not implemented.")
-
-  def decode(self, x, ii=None, jj=None):
-    raise NotImplementedError("decode not implemented.")
-
-  def _least_squares(self, y, P, s, Q):
-    """Solve regularized least squares using cached SVD
-
-    min_z 1/2 || Uz - y ||_2^2 + \lambda/2 ||z||_2^2
-              || diag(s) (Q^Tz) - P^T y ||_2^2 + \lambda/2 || (Q^Tz) ||_2^2
-
-              (diag(s)^2 + \lambda I) (Q^Tz) = diag(s) P^T y
-              z = Q(diag(s)/(diag(s)^2 + \lambda I)) P^T y
-    Input:
-      y: least squares target, shape (r, k, batch_size, D)
-      P, s, Q: Us SVD.
-
-    Returns:
-      z: solution (r, k, batch_size, d)
-    """
-    # y shape (r, k, batch_size, D)
-    # (r, k, batch_size, d)
-    PTy = torch.matmul(y, P)
-    lamb = self.reg_params['z']
-    if lamb == 0:
-      lamb = EPS
-    # (r, k, 1, d)
-    s_div_sqr = (s / (s ** 2 + lamb)).unsqueeze(2)
-    # (r, k, batch_size, d)
-    Qtz = s_div_sqr * PTy
-    z = torch.matmul(Qtz, Q.transpose(2, 3))
-    return z
-
-  def _prox_e(self, w):
-    """Compute proximal operator of e regularizer wrt w."""
-    return torch.zeros((), dtype=w.dtype, device=w.device)
-
-  def _update_forward_cache(self, ii, jj, z, e, x0_):
-    """Update any cached values from forward call."""
-    batch_size = z.shape[2]
-    device = z.device
-    ii, jj = self._parse_slice(ii, jj)
-
-    if self.z_frosqr is None or self.z_frosqr.shape[2] != batch_size:
-      self.z_frosqr = torch.zeros(self.r, self.k, batch_size, device=device)
-      if self.cache_z:
-        self.z = torch.zeros(self.r, self.k, batch_size, self.d, device=device)
-
-    self.z_frosqr[ii, jj, :] = z.data.pow(2).sum(dim=-1)
-    if self.cache_z:
-      self.z[ii, jj, :] = z
-
-    if self.cache_x0_:
-      if self.x0_ is None or self.x0_.shape[2] != batch_size:
-        self.x0_ = torch.zeros(self.r, self.k, batch_size, self.D,
-            device=device)
-      self.x0_[ii, jj, :] = x0_
-
-    if self.cache_e:
-      if self.e is None or self.e.shape[2] != batch_size:
-        self.e = torch.zeros(self.r, self.k, batch_size, self.D,
-            device=device)
-      self.e[ii, jj, :] = e
-    return
-
-  def reg(self):
-    """Evaluate subspace regularization."""
-    regs = super().reg()
-
-    if self.reg_params['e'] > 0:
-      regs['e'] = self.reg_e() * self.reg_params['e']
-    return regs
-
-  def reg_e(self):
-    """Compute regularizer wrt e."""
-    return 0.0
-
-
-class KSubspaceMFOutlierModel(KSubspaceMFCorruptModel):
-  """K-subspace model where low-dim coefficients are computed in closed
-  form. Adapted to handle outliers."""
-  default_reg_params = {
-      'U_frosqr_in': 0.01,
-      'U_frosqr_out': 1e-4,
-      'z': 0.01,
-      'e': 0.4
-  }
-  assign_reg_terms = {'U_frosqr_in', 'z', 'e'}
-
-  def __init__(self, k, d, D, affine=False, replicates=5, reg_params={},
-        serial_eval={}, reset_patience=100, reset_try_tol=0.01,
-        reset_cand_metric='obj_decr', reset_max_steps=50,
-        reset_accept_tol=1e-3, reset_cache_size=500, temp_scheduler=None,
-        encode_max_iter=20, encode_tol=1e-3, scale_grad_freq=100):
-
-    super().__init__(k, d, D,
-        affine=affine, replicates=replicates, reg_params=reg_params,
-        serial_eval=serial_eval, reset_patience=reset_patience,
-        reset_try_tol=reset_try_tol, reset_cand_metric=reset_cand_metric,
-        reset_max_steps=reset_max_steps, reset_accept_tol=reset_accept_tol,
-        reset_cache_size=reset_cache_size, temp_scheduler=temp_scheduler,
-        encode_max_iter=encode_max_iter, encode_tol=encode_tol,
-        scale_grad_freq=scale_grad_freq)
-
-    self.cache_e = True
-    return
-
-  def _prox_e(self, w):
-    """Compute proximal operator of ||.||_2."""
-    # w shape (r, k, batch_size, D)
-    wnorm = w.pow(2).sum(dim=3, keepdim=True).sqrt()
-    beta = (wnorm - self.reg_params['e']).clamp_(min=0).div_(wnorm)
-    e = beta * w
-    return e
-
-  def reg_e(self):
-    """Compute regularizer wrt e."""
-    return torch.norm(self.e, dim=3).permute(2, 0, 1)
 
 
 class TempScheduler(object):

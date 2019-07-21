@@ -8,8 +8,8 @@ import numpy as np
 import torch
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 
-import utils as ut
-from models import KSubspaceBatchAltBaseModel, KSubspaceMCModel
+from . import utils as ut
+from .models import KSubspaceBatchAltBaseModel, KSubspaceMCModel
 
 EPS = 1e-8
 # ridx,  cidx, cand_ridx, cand_cidx, success, obj_decr, cumu_obj_decr, temp
@@ -18,7 +18,7 @@ RESET_NCOL = 8
 
 def train_loop(model, data_loader, device, optimizer, out_dir=None, epochs=200,
       chkp_freq=50, stop_freq=-1, scheduler=None, epoch_steps=None,
-      eval_rank=False, reset_unused=False, save_data=True, init_time=0.0):
+      eval_rank=False, core_reset=False, save_data=True, init_time=0.0):
   """Train k-subspace model for series of epochs.
 
   Args:
@@ -34,7 +34,8 @@ def train_loop(model, data_loader, device, optimizer, out_dir=None, epochs=200,
     epoch_steps: maximum steps per "epoch" (default: len(dataset))
     eval_rank: evaluate ranks of group models, only implemented for subspace
       models (default: False)
-    reset_unused: whether to reset unused clusters (default: False)
+    core_reset: whether to perform cooperative re-initialization
+      (default: False)
     save_data: whether to save bigger data, ie conf_mats, svs (default: True)
     init_time: initialization time to add to first epoch (default: 0.0)
   """
@@ -92,7 +93,7 @@ def train_loop(model, data_loader, device, optimizer, out_dir=None, epochs=200,
     conf_mats = None
   svs = (np.zeros((epochs, model.r, model.k, model.d), dtype=np.float32)
       if eval_rank else None)
-  resets = [] if reset_unused else None
+  resets = [] if core_reset else None
 
   if not batch_alt_mode and scheduler is None:
     max_lr = ut.get_learning_rate(optimizer)
@@ -112,13 +113,13 @@ def train_loop(model, data_loader, device, optimizer, out_dir=None, epochs=200,
       if batch_alt_mode:
         (metrics_summary, metrics[epoch-1, :], epoch_conf_mats, epoch_svs,
             epoch_resets) = batch_alt_step(model, eval_rank=eval_rank,
-                reset_unused=reset_unused,
+                core_reset=core_reset,
                 eval_cluster_error=eval_cluster_error)
       else:
         (metrics_summary, metrics[epoch-1, :], epoch_conf_mats, epoch_svs,
             epoch_resets, data_iter) = train_epoch(model, data_loader,
                 data_iter, optimizer, device, epoch_steps=epoch_steps,
-                eval_rank=eval_rank, reset_unused=reset_unused,
+                eval_rank=eval_rank, core_reset=core_reset,
                 mc_mode=mc_mode, eval_cluster_error=eval_cluster_error)
         lr = ut.get_learning_rate(optimizer)
 
@@ -129,7 +130,7 @@ def train_loop(model, data_loader, device, optimizer, out_dir=None, epochs=200,
         conf_mats[epoch-1, :] = epoch_conf_mats
       if eval_rank:
         svs[epoch-1, :] = epoch_svs
-      if reset_unused and epoch_resets.shape[0] > 0:
+      if core_reset and epoch_resets.shape[0] > 0:
         epoch_resets = np.insert(epoch_resets, 0, epoch, axis=1)
         resets.append(epoch_resets)
 
@@ -141,7 +142,7 @@ def train_loop(model, data_loader, device, optimizer, out_dir=None, epochs=200,
       cluster_error, min_obj, max_obj = [metrics_summary[ii]
           for ii in [0, 3, 5]]
 
-      waiting_to_reset = (reset_unused and
+      waiting_to_reset = (core_reset and
           (model.num_bad_steps[1, :] <= 3*model.reset_patience).any().item())
       is_conv = (((model._updates == 0 if batch_alt_mode else lr <= min_lr) and
           (not waiting_to_reset)) or epoch == epochs)
@@ -179,7 +180,7 @@ def train_loop(model, data_loader, device, optimizer, out_dir=None, epochs=200,
     conf_mats = conf_mats[:epoch, :] if eval_cluster_error else None
     svs = svs[:epoch, :] if eval_rank else None
 
-    if reset_unused:
+    if core_reset:
       resets = (np.concatenate(resets, axis=0) if len(resets) > 0
           else np.zeros((0, RESET_NCOL+2), dtype=object))
       reset_summary = ut.aggregate_resets(resets)
@@ -197,7 +198,7 @@ def train_loop(model, data_loader, device, optimizer, out_dir=None, epochs=200,
         save_svs = svs if save_data else svs[[epoch-1], :]
         with open('{}/svs.npz'.format(out_dir), 'wb') as f:
           np.savez(f, svs=save_svs)
-      if reset_unused:
+      if core_reset:
         if save_data:
           with open('{}/resets.npz'.format(out_dir), 'wb') as f:
             np.savez(f, resets=resets)
@@ -210,7 +211,7 @@ def train_loop(model, data_loader, device, optimizer, out_dir=None, epochs=200,
 
 
 def train_epoch(model, data_loader, data_iter, optimizer, device,
-      epoch_steps=None, eval_rank=False, reset_unused=False, mc_mode=False,
+      epoch_steps=None, eval_rank=False, core_reset=False, mc_mode=False,
       eval_cluster_error=True):
   """train model for one epoch and record convergence measures."""
   data_tic = epoch_tic = time.time()
@@ -283,9 +284,9 @@ def train_epoch(model, data_loader, data_iter, optimizer, device,
     if mc_mode:
       comp_err.update(batch_comp_err, batch_size)
 
-    if reset_unused:
+    if core_reset:
       reset_tic = time.time()
-      batch_resets = model.reset_unused()
+      batch_resets = model.core_reset()
       success_mask = batch_resets[:, 4] == 1
       if success_mask.sum() > 0:
         rIdx = np.unique(batch_resets[success_mask, 0].astype(np.int64))
@@ -314,7 +315,7 @@ def train_epoch(model, data_loader, data_iter, optimizer, device,
   else:
     rank_stats, svs = [], None
 
-  if reset_unused:
+  if core_reset:
     resets = (np.concatenate(resets) if len(resets) > 0
         else np.zeros((0, RESET_NCOL+1), dtype=object))
     success_mask = resets[:, 5] == 1
@@ -353,7 +354,7 @@ def train_epoch(model, data_loader, data_iter, optimizer, device,
   return metrics_summary, metrics, conf_mats, svs, resets, data_iter
 
 
-def batch_alt_step(model, eval_rank=False, reset_unused=False,
+def batch_alt_step(model, eval_rank=False, core_reset=False,
       eval_cluster_error=True):
   """Take one full batch alt min step and record convergence measures."""
   epoch_tic = time.time()
@@ -369,9 +370,9 @@ def batch_alt_step(model, eval_rank=False, reset_unused=False,
   else:
     conf_mats = None
 
-  if reset_unused:
+  if core_reset:
     reset_tic = time.time()
-    resets = model.reset_unused()
+    resets = model.core_reset()
     success_mask = resets[:, 4] == 1
     reset_count = success_mask.sum()
     rep_reset_counts = np.zeros((1, model.r))
