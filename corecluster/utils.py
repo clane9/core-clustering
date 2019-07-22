@@ -47,8 +47,8 @@ def boolarg(arg):
 def reset_optimizer_state(model, optimizer, rIdx):
   """Reset optimizer states to zero for re-initialized replicates &
   clusters. Or, if copy=True, copy states from duplicated clusters."""
-  for p in model.parameters():
-    if not p.requires_grad:
+  for p in [model.Us, model.bs]:
+    if p is None or not p.requires_grad:
       continue
     state = optimizer.state[p]
     for key, val in state.items():

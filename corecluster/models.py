@@ -1360,6 +1360,94 @@ class KSubspaceMCModel(KSubspaceMFModel):
     return comp_err
 
 
+class DeepKSubspaceProjModel(KSubspaceProjModel):
+  """Projection k-subspace model embedded within a deep auto-encoder."""
+
+  def __init__(self, k, d, D, encoder, decoder, affine=False, replicates=5,
+        reg_params={}, criterion=None, ksub_obj_weight=1.0, reset_patience=100,
+        reset_try_tol=0.01, reset_cand_metric='obj_decr', reset_max_steps=50,
+        reset_accept_tol=1e-3, reset_cache_size=500, temp_scheduler=None):
+
+    super().__init__(k, d, D,
+        affine=affine, replicates=replicates, reg_params=reg_params,
+        reset_patience=reset_patience, reset_try_tol=reset_try_tol,
+        reset_cand_metric=reset_cand_metric, reset_max_steps=reset_max_steps,
+        reset_accept_tol=reset_accept_tol, reset_cache_size=reset_cache_size,
+        temp_scheduler=temp_scheduler)
+
+    self.encoder = encoder
+    self.decoder = decoder
+    if criterion is None:
+      criterion = nn.MSELoss(reduction='none')
+    self.criterion = criterion
+    self.ksub_obj_weight = ksub_obj_weight / D
+
+    self._x = None
+    self._x_ = None
+    self.reset_parameters()
+    return
+
+  def forward(self, x):
+    xshape = x.shape
+    batch_size = xshape[0]
+    x_ = self.encoder(x)
+    # flatten if necessary
+    featshape = tuple(x_.shape)
+    flatD = np.prod(featshape[1:])
+    x_ = x_.view(batch_size, flatD)
+    # union of subspace embedding
+    # shape (r, batch_size, D)
+    x_ = super(DeepKSubspaceProjModel, self).forward(x_)
+    # un-flatten
+    x_ = x_.view((self.r * batch_size,) + featshape[1:])
+    x_ = self.decoder(x_)
+    # re-separate replicate dimension
+    x_ = x_.view((self.r, batch_size) + xshape[1:])
+    # keep reference to data and reconstruction
+    self._x = x
+    self._x_ = x_
+    return x_
+
+  def objective(self, x=None):
+    if x is None:
+      x, x_ = self._x, self._x_
+    else:
+      x_ = self(x)
+
+    # shape (r,)
+    loss = self._deep_loss(x, x_)
+    reg_out = self._deep_reg()
+    obj = loss + reg_out
+    obj_mean = obj.mean()
+
+    loss = loss.data + self._loss.mul(self.ksub_obj_weight)
+    reg_in = self._reg_in.mul(self.ksub_obj_weight)
+    reg_out = reg_out.data + self._reg_out.mul(self.ksub_obj_weight)
+    obj = obj.data + self._obj.mul(self.ksub_obj_weight)
+    obj_mean = obj_mean + self._obj_mean.mul(self.ksub_obj_weight)
+
+    # drop references
+    self._x = self._x_ = None
+    return obj_mean, obj, loss, reg_in, reg_out
+
+  def _deep_loss(self, x, x_):
+    assert(x_.shape == (self.r,) + x.shape)
+    x = x.unsqueeze(0).expand((self.r,) + x.dim() * (-1,))
+    loss = self.criterion(x, x_)
+    # assert no reduction
+    assert(loss.shape == x_.shape)
+    loss = loss.view(self.r, -1).mean(dim=1)
+    return loss
+
+  def _deep_reg(self):
+    reg = torch.zeros((1,), device=self.Us.device)
+    if hasattr(self.encoder, 'reg'):
+      reg += self.encoder.reg()
+    if hasattr(self.decoder, 'reg'):
+      reg += self.decoder.reg()
+    return reg
+
+
 class TempScheduler(object):
   def __init__(self, init_temp=1.0, replicates=None):
     self.init_temp = init_temp
