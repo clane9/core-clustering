@@ -234,6 +234,7 @@ class KSubspaceBaseModel(nn.Module):
     """Add batch assign obj to a recent cache. Used when resetting unused
     clusters."""
     batch_size = assign_obj.shape[0]
+    self._assign_obj = assign_obj
     if self.reset_cache_size < batch_size:
       Idx = torch.randperm(batch_size)[:self.reset_cache_size]
       self._cache_assign_obj.copy_(assign_obj[Idx, :])
@@ -544,43 +545,15 @@ class KSubspaceMFModel(KSubspaceBaseModel):
 
     for cidx in range(1, self.initk):
       # (N, r, k')
-      obj = self._prob_insert_objective(X, cidx)
+      _ = self.objective(X)
+      obj = self._assign_obj[:, :, :cidx]
       # (N, r)
       min_obj = torch.min(obj, dim=2)[0]
       # (r,)
       Idx = torch.multinomial(min_obj.t(), 1).view(-1)
       self._insert_next(cidx, X[Idx, :], X, nn_k)
+    self._reset_buffers()
     return
-
-  def _prob_insert_objective(self, X, cidx):
-    """Evaluate objective wrt X for current initialized subspaces up to but not
-    including cidx.
-    """
-    # NOTE: this mostly duplicates code from objective, loss. Purpose is to
-    # avoid unnecessary computation. But still, could probably simplify.
-    device = X.device
-    batch_size = X.shape[0]
-    loss = torch.zeros(self.r, cidx, batch_size, device=device)
-
-    with torch.no_grad():
-      for ii in range(self.r):
-        for jj in range(cidx):
-          X_ = self.forward(X, ii, jj)
-          slci, slcj = self._parse_slice(ii, jj)
-          loss[slci, slcj, :] = torch.sum((X_ - X)**2, dim=-1).mul(0.5)
-      loss = loss.permute(2, 0, 1)
-
-      reg = self.reg()
-      reg_in = torch.zeros(self.r, self.k, device=device)
-      for key, val in reg.items():
-        if key in self.assign_reg_terms:
-          reg_in = reg_in + val
-      if reg_in.dim() == 2:
-        reg_in = reg_in.unsqueeze(0)
-      reg_in = reg_in[:, :, :cidx]
-
-      assign_obj = loss + reg_in
-    return assign_obj
 
   def _insert_next(self, cidx, y, X, nn_k):
     """Insert next basis (cidx) centered on sampled points y from X."""
@@ -602,6 +575,17 @@ class KSubspaceMFModel(KSubspaceBaseModel):
       self.Us.data[ii, cidx, :] = U
       if self.affine:
         self.bs.data[ii, cidx, :] = b
+    return
+
+  def _reset_buffers(self):
+    """Reset buffers that track objective and related quantities."""
+    nan = torch.tensor(np.nan)
+    self.c_mean.copy_(nan)
+    self.value.copy_(nan)
+    self.obj_ema.copy_(nan)
+    self.best_obj.copy_(nan)
+    self._cache_assign_obj.copy_(nan)
+    self._cache_assign_obj_head = 0
     return
 
   def encode(self, x):
