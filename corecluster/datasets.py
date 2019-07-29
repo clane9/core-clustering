@@ -7,7 +7,7 @@ from scipy.io import loadmat
 import torch
 from torch.utils.data import Dataset
 
-CODE_DIR = os.path.dirname(os.path.realpath(__file__))
+DATA_DIR = os.path.realpath(os.path.dirname(__file__)) + '/../datasets'
 
 
 class SynthUoSDataset(Dataset):
@@ -209,26 +209,25 @@ class ImageUoSDataset(Dataset):
   def __init__(self, dataset='mnist', center=False, sv_range=None,
         normalize=True):
     if dataset in {'mnist', 'cifar10'}:
-      fname = '{}/datasets/{}/{}_scat_pca.npz'.format(CODE_DIR, dataset,
-          dataset)
+      fname = '{}/{}/{}_scat_pca.npz'.format(DATA_DIR, dataset, dataset)
       with open(fname, 'rb') as f:
         f = np.load(f)
         self.X = torch.tensor(f['data'], dtype=torch.float32)
         self.groups = torch.tensor(f['labels'], dtype=torch.int64)
     elif dataset == 'coil100':
-      matfile = '{}/datasets/COIL100_SC_pca.mat'.format(CODE_DIR)
+      matfile = '{}/COIL100_SC_pca.mat'.format(DATA_DIR)
       data = loadmat(matfile)
       self.X = torch.tensor(data['COIL100_SC_DATA'].T, dtype=torch.float32)
       self.groups = torch.tensor(data['COIL100_LABEL'].reshape(-1),
           dtype=torch.int64)
     elif dataset == 'coil20':
-      matfile = '{}/datasets/COIL20_SC_pca.mat'.format(CODE_DIR)
+      matfile = '{}/COIL20_SC_pca.mat'.format(DATA_DIR)
       data = loadmat(matfile)
       self.X = torch.tensor(data['COIL20_SC_DATA'].T, dtype=torch.float32)
       self.groups = torch.tensor(data['COIL20_LABEL'].reshape(-1),
           dtype=torch.int64)
     elif dataset == 'yaleb':
-      matfile = '{}/datasets/small_YaleB_48x42.mat'.format(CODE_DIR)
+      matfile = '{}/small_YaleB_48x42.mat'.format(DATA_DIR)
       data = loadmat(matfile)
       # tuple (scale, dim, D, N, images, labels)
       small_yale = data['small_yale'][0, 0]
@@ -318,7 +317,7 @@ class NetflixDataset(Dataset):
 
     fname = {'nf_17k': 'nf_prize_446460x16885.npz',
         'nf_1k': 'nf_prize_422889x889.npz'}[dataset]
-    fpath = '{}/datasets/nf_prize_preprocessed/{}.npz'.format(CODE_DIR, fname)
+    fpath = '{}/nf_prize_preprocessed/{}.npz'.format(DATA_DIR, fname)
 
     with open(fpath, 'rb') as f:
       f = np.load(f, allow_pickle=True)
