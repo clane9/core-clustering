@@ -1391,18 +1391,18 @@ class DeepKSubspaceProjModel(KSubspaceProjModel):
     xshape = x.shape
     batch_size = xshape[0]
     x_ = self.encoder(x)
+
+    # uos embedding
     # flatten if necessary
     featshape = tuple(x_.shape)
     flatD = np.prod(featshape[1:])
-    x_ = x_.view(batch_size, flatD)
+    x_uos = x_.clone().view(batch_size, flatD)
     # union of subspace embedding
     # shape (r, batch_size, D)
-    x_ = super(DeepKSubspaceProjModel, self).forward(x_)
-    # un-flatten
-    x_ = x_.view((self.r * batch_size,) + featshape[1:])
+    x_uos = super(DeepKSubspaceProjModel, self).forward(x_uos)
+
+    # continue with auto-encoder, independent of uos embedding
     x_ = self.decoder(x_)
-    # re-separate replicate dimension
-    x_ = x_.view((self.r, batch_size) + xshape[1:])
     # keep reference to data and reconstruction
     self._x = x
     self._x_ = x_
@@ -1414,7 +1414,7 @@ class DeepKSubspaceProjModel(KSubspaceProjModel):
     else:
       x_ = self(x)
 
-    # shape (r,)
+    # shape (1,)
     loss = self._deep_loss(x, x_)
     reg_out = self._deep_reg()
     obj = loss + reg_out
@@ -1431,12 +1431,8 @@ class DeepKSubspaceProjModel(KSubspaceProjModel):
     return obj_mean, obj, loss, reg_in, reg_out
 
   def _deep_loss(self, x, x_):
-    assert(x_.shape == (self.r,) + x.shape)
-    x = x.unsqueeze(0).expand((self.r,) + x.dim() * (-1,))
-    loss = self.criterion(x, x_)
-    # assert no reduction
-    assert(loss.shape == x_.shape)
-    loss = loss.view(self.r, -1).mean(dim=1)
+    assert(x_.shape == x.shape)
+    loss = self.criterion(x, x_).mean().view((1,))
     return loss
 
   def _deep_reg(self):
