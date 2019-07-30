@@ -473,11 +473,10 @@ class KSubspaceMFModel(KSubspaceBaseModel):
       self.Us.register_hook(lambda UGrad: self._scale_grad(UGrad))
 
     self.init = init.lower()
-    self.initX = initX
+    self.register_buffer('initX', initX)
     if initk is None or initk <= 0:
       initk = k
     self.initk = initk
-    self.reset_parameters()
     return
 
   def reset_parameters(self):
@@ -744,8 +743,6 @@ class KSubspaceProjModel(KSubspaceBaseModel):
         reset_cand_metric=reset_cand_metric, reset_max_steps=reset_max_steps,
         reset_accept_tol=reset_accept_tol, reset_cache_size=reset_cache_size,
         temp_scheduler=temp_scheduler)
-
-    self.reset_parameters()
     return
 
   def encode(self, x):
@@ -1029,8 +1026,6 @@ class KMeansBatchAltModel(KSubspaceBatchAltBaseModel):
     self.kpp_n_trials = kpp_n_trials
     self.Xsqrnorms = self.X.pow(2).sum(dim=1).mul(0.5)
     self.XT = self.X.t().contiguous()
-
-    self.reset_parameters()
     return
 
   def reset_parameters(self):
@@ -1368,7 +1363,6 @@ class DeepKSubspaceProjModel(KSubspaceProjModel):
 
     self._x = None
     self._x_ = None
-    self.reset_parameters()
     return
 
   def forward(self, x):

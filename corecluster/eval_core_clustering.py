@@ -144,8 +144,7 @@ def eval_core_clustering(args):
     reg_params = {'b_frosqr_out': args.b_frosqr_out_lamb}
 
   if args.init in {'pfi', 'pca'}:
-    initN = 100 * int(np.ceil(
-        args.model_d*args.model_k*np.log(args.model_k) / 100))
+    initN = args.reset_cache_size
     if initN < dataset.N:
       Idx = torch.randperm(dataset.N)[:initN]
       initX = dataset.X[Idx]
@@ -197,6 +196,7 @@ def eval_core_clustering(args):
         replicates=args.reps, reg_params=reg_params, init=args.init,
         kpp_n_trials=args.kpp_n_trials, **reset_kwargs)
   model = model.to(device)
+  model.reset_parameters()
   init_time = time.time() - model_tic
 
   # optimizer
