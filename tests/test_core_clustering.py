@@ -57,11 +57,11 @@ synth_uos_base_args = {
     # re-initialization
     'reps': 6,
     'core_reset': True,
-    'reset_metric': 'obj_decr',
     'reset_patience': 50,
     'reset_try_tol': 0.01,
     'reset_steps': 20,
     'reset_accept_tol': 0.001,
+    'reset_temp': 0.1,
     'reset_cache_size': 500,
 
     # general configuration

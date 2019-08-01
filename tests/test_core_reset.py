@@ -32,18 +32,19 @@ def assign_obj_and_reg_out():
 
 def test_reset_replicate(assign_obj_and_reg_out):
   assign_obj, reg_out = assign_obj_and_reg_out
-  temp = 0.1
 
-  success, resets, rep_assign_obj, rep_reg_out = reset_replicate(0, assign_obj,
-      reg_out, temp, max_steps=10, accept_tol=1e-3, cand_metric='obj_decr')
+  temps = [0.1, 0.0]
+  expected_rep_objs = [7.4878e-07, 7.4878e-07]
+  expected_first_swaps = [(0, 3, 3), (2, 1, 0)]
+  for temp, ero, efs in zip(temps, expected_rep_objs, expected_first_swaps):
+    success, resets, rep_assign_obj, rep_reg_out = reset_replicate(0,
+        assign_obj, reg_out, temp=temp, max_steps=10, accept_tol=1e-3)
 
-  expected_rep_obj = 7.4878e-07
-  rep_obj = rep_assign_obj.min(dim=1)[0].mean().item()
-  assert np.isclose(rep_obj, expected_rep_obj, rtol=RTOL, atol=ATOL)
+    rep_obj = rep_assign_obj.min(dim=1)[0].mean().item()
+    assert np.isclose(rep_obj, ero, rtol=RTOL, atol=ATOL)
 
-  first_swap = tuple(resets[0, 1:4])
-  expected_first_swap = (0, 3, 3)
-  assert first_swap == expected_first_swap
+    first_swap = tuple(resets[0, 1:4])
+    assert first_swap == efs
 
 
 def test_core_reset(assign_obj_and_reg_out):
@@ -51,8 +52,8 @@ def test_core_reset(assign_obj_and_reg_out):
   assign_obj, reg_out = assign_obj_and_reg_out
 
   mf_model = mod.KSubspaceMFModel(k, d, D, affine=False, replicates=r,
-      reset_patience=20, reset_try_tol=-1, reset_cand_metric='obj_decr',
-      reset_max_steps=10, reset_accept_tol=1e-3, reset_cache_size=cache_size,
+      reset_patience=20, reset_try_tol=-1, reset_max_steps=10,
+      reset_accept_tol=1e-3, reset_cache_size=cache_size,
       temp_scheduler=mod.ConstantTempScheduler(init_temp=0.1))
 
   # plant assign obj and set num bad steps to trigger re-initialization
@@ -66,5 +67,5 @@ def test_core_reset(assign_obj_and_reg_out):
   assert np.allclose(obj, expected_obj, rtol=RTOL, atol=ATOL)
 
   first_swap = tuple(resets[0, 1:4])
-  expected_first_swap = (0, 5, 2)
+  expected_first_swap = (0, 1, 3)
   assert first_swap == expected_first_swap

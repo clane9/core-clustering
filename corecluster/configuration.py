@@ -109,10 +109,6 @@ global_args_dict = {
         help='Number of model replicates [default: 6]'),
     'core-reset': dict(type=ut.boolarg, default=True,
         help='Re-initialize using CoRe [default: 1]'),
-    'reset-metric': dict(type=str, default='obj_decr',
-        help=('Metric used to sample swap candidates '
-            '[default: obj_decr]'),
-        choices=['obj_decr', 'value']),
     'reset-patience': dict(type=int, default=100,
         help=('Steps to wait without obj decrease before trying to reset '
             '[default: 100]')),
@@ -121,6 +117,8 @@ global_args_dict = {
             'set <= 0 to disable [default: 0.01]')),
     'reset-steps': dict(type=int, default=50,
         help='Number of reset terations [default: 50]'),
+    'reset-temp': dict(type=float, default=0.1,
+        help='Simulated annealing temperature [default: 0.1]'),
     'reset-accept-tol': dict(type=float, default=0.001,
         help=('Objective decrease tolerance for accepting a reset '
             '[default: 0.001]')),

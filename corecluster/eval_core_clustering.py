@@ -156,12 +156,10 @@ def eval_core_clustering(args):
 
   reset_kwargs = dict(reset_patience=args.reset_patience,
       reset_try_tol=args.reset_try_tol,
-      reset_cand_metric=args.reset_metric,
       reset_max_steps=args.reset_steps,
       reset_accept_tol=args.reset_accept_tol,
       reset_cache_size=args.reset_cache_size,
-      temp_scheduler=mod.ConstantTempScheduler(init_temp=0.1,
-          replicates=args.reps))
+      temp_scheduler=mod.ConstantTempScheduler(init_temp=args.reset_temp))
 
   if uos_mode:
     if args.optim == 'batch-alt':
@@ -226,7 +224,11 @@ def eval_core_clustering(args):
       raise ValueError("Invalid optimizer {}.".format(args.optim))
 
     min_lr = max(1e-8, 0.1**4 * args.init_lr)
-    scheduler = ReduceLROnPlateau(optimizer, factor=0.5, patience=5,
+    if args.core_reset:
+      patience = int(np.ceil(10 * args.reset_patience / args.epoch_steps))
+    else:
+      patience = 2000 // args.epoch_steps
+    scheduler = ReduceLROnPlateau(optimizer, factor=0.5, patience=patience,
         threshold=1e-3, min_lr=min_lr)
 
   # no checkpointing in this case
@@ -268,7 +270,7 @@ def generate_parser():
       'auto-reg', 'sigma-hat', 'min-size', 'U-frosqr-in-lamb',
       'U-frosqr-out-lamb', 'z-lamb', 'epochs', 'epoch-size', 'batch-size',
       'optim', 'init-lr', 'scale-grad-mode', 'scale-grad-update-freq',
-      'sparse-encode', 'sparse-decode', 'reps', 'core-reset', 'reset-metric',
+      'sparse-encode', 'sparse-decode', 'reps', 'core-reset', 'reset-temp',
       'reset-patience', 'reset-try-tol', 'reset-steps', 'reset-accept-tol',
       'reset-cache-size', 'cuda', 'num-threads', 'num-workers', 'data-seed',
       'seed', 'eval-rank', 'chkp-freq', 'stop-freq', 'save-large-data'])
@@ -279,7 +281,7 @@ def generate_parser():
       'min-size', 'U-frosqr-in-lamb', 'U-frosqr-out-lamb', 'z-lamb', 'epochs',
       'epoch-size', 'batch-size', 'optim', 'init-lr', 'scale-grad-mode',
       'scale-grad-update-freq', 'sparse-encode', 'sparse-decode',
-      'reps', 'core-reset', 'reset-metric', 'reset-patience', 'reset-try-tol',
+      'reps', 'core-reset', 'reset-temp', 'reset-patience', 'reset-try-tol',
       'reset-steps', 'reset-accept-tol', 'reset-cache-size', 'cuda',
       'num-threads', 'num-workers', 'data-seed', 'seed', 'eval-rank',
       'chkp-freq', 'stop-freq', 'save-large-data'])
@@ -290,7 +292,7 @@ def generate_parser():
       'U-frosqr-in-lamb', 'U-frosqr-out-lamb', 'z-lamb', 'epochs',
       'epoch-size', 'batch-size', 'optim', 'init-lr', 'scale-grad-mode',
       'scale-grad-update-freq', 'sparse-encode', 'sparse-decode', 'reps',
-      'core-reset', 'reset-metric', 'reset-patience', 'reset-try-tol',
+      'core-reset', 'reset-temp', 'reset-patience', 'reset-try-tol',
       'reset-steps', 'reset-accept-tol', 'reset-cache-size', 'cuda',
       'num-threads', 'num-workers', 'data-seed', 'seed', 'eval-rank',
       'chkp-freq', 'stop-freq', 'save-large-data'])
@@ -298,7 +300,7 @@ def generate_parser():
   conf.add_args(parser_km,
       ['out-dir', 'k', 'D', 'Ng', 'N', 'sep', 'init', 'kpp-n-trials',
       'model-k', 'b-frosqr-out-lamb', 'epochs', 'reps', 'core-reset',
-      'reset-metric', 'reset-patience', 'reset-try-tol', 'reset-steps',
+      'reset-temp', 'reset-patience', 'reset-try-tol', 'reset-steps',
       'reset-accept-tol', 'reset-cache-size', 'cuda', 'num-threads',
       'num-workers', 'data-seed', 'seed', 'chkp-freq', 'stop-freq',
       'save-large-data'])
