@@ -437,7 +437,7 @@ class KSubspaceMFModel(KSubspaceBaseModel):
         reset_patience=100, reset_try_tol=0.01, reset_cand_metric='obj_decr',
         reset_max_steps=50, reset_accept_tol=1e-3, reset_cache_size=500,
         temp_scheduler=None, scale_grad_mode=None, scale_grad_update_freq=20,
-        init='random', initX=None, initk=None):
+        init='random', initk=None):
 
     if not (scale_grad_mode is None or scale_grad_mode == 'none'):
       if affine:
@@ -447,13 +447,6 @@ class KSubspaceMFModel(KSubspaceBaseModel):
 
     if init.lower() not in {'random', 'pfi', 'pca'}:
       raise ValueError("Invalid init mode {}".format(init))
-    if init.lower in {'pfi', 'pca'}:
-      if initX is None:
-        raise ValueError(("Data subset initX required for PFI or PCA "
-            "initialization"))
-      elif not (torch.is_tensor(initX) and
-            initX.dim() == 2 and initX.shape[1] == D):
-        raise ValueError("Invalid data subset initX ")
 
     super().__init__(k, d, D,
         affine=affine, replicates=replicates, reg_params=reg_params,
@@ -473,24 +466,32 @@ class KSubspaceMFModel(KSubspaceBaseModel):
       self.Us.register_hook(lambda UGrad: self._scale_grad(UGrad))
 
     self.init = init.lower()
-    self.register_buffer('initX', initX)
     if initk is None or initk <= 0:
       initk = k
     self.initk = initk
     return
 
-  def reset_parameters(self):
+  def reset_parameters(self, initX=None):
     """Initialize bases either with small random entries, by probabilistic
     farthest insertion, or PCA."""
+    if self.init.lower in {'pfi', 'pca'}:
+      if initX is None:
+        raise ValueError(("Data subset initX required for PFI or PCA "
+            "initialization"))
+      elif not (torch.is_tensor(initX) and
+            initX.dim() == 2 and initX.shape[1] == D):
+        raise ValueError("Invalid data subset initX ")
+
     if self.init == 'random':
       super().reset_parameters()
       if self.initk < self.k:
         self.Us.data[:, self.initk:, :] = 0.0
     elif self.init == 'pca':
-      self._pca_init(self.initX)
+      self._pca_init(initX)
     else:
-      self._prob_farthest_insert_init(self.initX,
-          nn_q=int(np.ceil(0.1*self.d)))
+      with torch.no_grad():
+        self._prob_farthest_insert_init(initX, nn_q=int(np.ceil(0.1*self.d)))
+      torch.cuda.empty_cache()
     return
 
   def _pca_init(self, X, sigma=0.2):
@@ -913,11 +914,10 @@ class KSubspaceBatchAltMFModel(KSubspaceBatchAltBaseModel, KSubspaceMFModel):
   def __init__(self, k, d, dataset, affine=False, replicates=5, reg_params={},
         reset_patience=2, reset_try_tol=0.01, reset_cand_metric='obj_decr',
         reset_max_steps=50, reset_accept_tol=1e-3, reset_cache_size=500,
-        temp_scheduler=None, init='random', initX=None, initk=None,
+        temp_scheduler=None, init='random', initk=None,
         svd_solver='randomized'):
 
-    mf_kwargs = {'scale_grad_mode': None, 'init': init, 'initX': initX,
-        'initk': initk}
+    mf_kwargs = {'scale_grad_mode': None, 'init': init, 'initk': initk}
     super().__init__(k, d, dataset,
         affine=affine, replicates=replicates, reg_params=reg_params,
         reset_patience=reset_patience, reset_try_tol=reset_try_tol,

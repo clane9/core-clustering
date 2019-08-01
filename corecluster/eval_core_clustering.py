@@ -150,6 +150,7 @@ def eval_core_clustering(args):
       initX = dataset.X[Idx]
     else:
       initX = dataset.X
+    initX = initX.to(device)
   else:
     initX = None
 
@@ -168,7 +169,7 @@ def eval_core_clustering(args):
         model = mod.KSubspaceBatchAltMFModel(args.model_k, args.model_d,
             dataset, affine=args.affine, replicates=args.reps,
             reg_params=reg_params, svd_solver='randomized', init=args.init,
-            initX=initX, **reset_kwargs)
+            **reset_kwargs)
       else:
         model = mod.KSubspaceBatchAltProjModel(args.model_k, args.model_d,
             dataset, affine=args.affine, replicates=args.reps,
@@ -186,7 +187,7 @@ def eval_core_clustering(args):
             affine=args.affine, replicates=args.reps, reg_params=reg_params,
             scale_grad_mode=args.scale_grad_mode,
             scale_grad_update_freq=args.scale_grad_update_freq, init=args.init,
-            initX=initX, **reset_kwargs)
+            **reset_kwargs)
       else:
         model = mod.KSubspaceProjModel(args.model_k, args.model_d, dataset.D,
             affine=args.affine, replicates=args.reps, reg_params=reg_params,
@@ -196,7 +197,11 @@ def eval_core_clustering(args):
         replicates=args.reps, reg_params=reg_params, init=args.init,
         kpp_n_trials=args.kpp_n_trials, **reset_kwargs)
   model = model.to(device)
-  model.reset_parameters()
+  if initX is not None:
+    model.reset_parameters(initX=initX)
+    initX = None
+  else:
+    model.reset_parameters()
   init_time = time.time() - model_tic
 
   # optimizer
