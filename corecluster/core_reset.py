@@ -9,26 +9,26 @@ from .utils import assign_and_value
 EPS = 1e-8
 
 
-def reset_replicate(ridx, assign_obj, reg_out, temp, max_steps=10,
-      accept_tol=1e-3, cand_metric='obj_decr'):
+def reset_replicate(ridx, assign_obj, reg_out, temp=0, max_steps=10,
+      accept_tol=1e-3):
   """Re-initialize a given replicate by cooperative re-initialization. This
   consists of several iterations of simulated annealing over the graph of all
   (rk choose k) subsets of clusters. On each iteration we choose a cluster to
   replace along with a candidate replacement from the replicate's siblings. The
   swapped cluster is sampled with prob inversely proportional to its value,
-  while the replacement can be chosen based on either value or objective
-  decrease (greedier, more sensitive). The replacement is then accepted with
-  probability depending on the objective increase. At termination we mark the
-  best iterate surpassing the accept tolerance (if one exists).
+  while the replacement is chosen either deterministically (when temp <= 0) or
+  probabilistically based on objective decrease. The replacement is then
+  accepted if the objective decrease surpasses the accept tolerance (when temp
+  <= 0) or with probability exponential in the objective decrease. At
+  termination we mark the best iterate surpassing the accept tolerance (if one
+  exists).
 
   Args:
     ridx: replicate index
     assign_obj: cached assignment objectives, (cache_size, r, k).
     reg_out: outside regularization values, (r, k).
-    temp: simulated annealing temperature.
+    temp: simulated annealing temperature (default: 0).
     accept_tol: relative objective decrease accept tolerance (default: 1e-3).
-    cand_metric: candidate replacement selection metric, either 'value' or
-      obj_decr (default: 'obj_decr').
 
   Returns
     success: whether we surpassed accept tolerance.
@@ -38,74 +38,78 @@ def reset_replicate(ridx, assign_obj, reg_out, temp, max_steps=10,
     rep_assign_obj, rep_reg_out: new assign objective, outside regularization
       values for ridx.
   """
+  # make copies since these will be modified.
   assign_obj, reg_out = assign_obj.clone(), reg_out.clone()
   cache_size, r, k = assign_obj.shape
   device = assign_obj.device
   resets = []
 
   # initialize large tensors used in computing alternate objectives
-  if cand_metric == 'obj_decr':
-    alt_obj_buffers = (
-        # alt_assign_obj
-        torch.zeros((cache_size, r*k, 2), device=device),
-        # alt_obj
-        torch.zeros((cache_size, r*k), device=device),
-        # tmp_Idx
-        torch.zeros((cache_size, r*k), dtype=torch.int64, device=device))
+  alt_obj_buffers = (
+      # alt_assign_obj
+      torch.zeros((cache_size, r*k, 2), device=device),
+      # alt_obj
+      torch.zeros((cache_size, r*k), device=device),
+      # tmp_Idx
+      torch.zeros((cache_size, r*k), dtype=torch.int64, device=device))
 
   value, min_assign_obj = _eval_value(assign_obj, reg_out)
   rep_obj = (min_assign_obj[:, ridx].mean() + reg_out[ridx, :].sum()).item()
-  best_obj = old_obj = rep_obj
 
-  # first dim: (tmp, best)
-  rep_assign_obj = torch.zeros(2, cache_size, k, device=device).copy_(
-      assign_obj[:, ridx, :].unsqueeze(0))
-  rep_reg_out = torch.zeros(2, k, device=device).copy_(reg_out[ridx, :])
+  best_obj = old_obj = rep_obj
+  best_rep_assign_obj = torch.zeros(cache_size, k, device=device).copy_(
+      assign_obj[:, ridx, :])
+  best_rep_reg_out = torch.zeros(k, device=device).copy_(reg_out[ridx, :])
 
   for _ in range(max_steps):
-    swap_sample_prob = 1.0 / value[ridx, :].clamp(min=EPS)
-    cidx = torch.multinomial(swap_sample_prob, 1)[0].item()
-    cand_ridx, cand_cidx = _sample_swap_cand(ridx, cidx, value, rep_obj,
-        assign_obj, reg_out, cand_metric, alt_obj_buffers)
+    # sample cluster to swap with prob inversely proportional to value.
+    # clamp at EPS so that negative value have a very high chance of being
+    # chosen.
+    cidx = _multinom_single(1.0 / value[ridx, :].clamp(min=EPS))
 
-    # update temp assign obj
-    rep_assign_obj[0, :, cidx] = assign_obj[:, cand_ridx, cand_cidx]
-    rep_reg_out[0, cidx] = reg_out[cand_ridx, cand_cidx]
-    cand_obj = (rep_assign_obj[0, :].min(dim=1)[0].mean() +
-        rep_reg_out[0, :].sum()).item()
-    obj_decr = (rep_obj - cand_obj) / rep_obj
+    # alternate objectives for every possible swap, (rk,)
+    alt_obj = _eval_alt_obj(ridx, cidx, assign_obj, reg_out, alt_obj_buffers)
+    alt_obj_decr = (rep_obj - alt_obj) / rep_obj
+    if temp <= 0:
+      # choose best replacement deterministically
+      idx = alt_obj_decr.max(dim=0)[1]
+    else:
+      # sample with prob proportional to decrease when doing SA.
+      idx = _multinom_single(alt_obj_decr.clamp(min=EPS))
+    cand_ridx, cand_cidx = np.unravel_index(idx, (r, k))
+    cand_obj, obj_decr = alt_obj[idx].item(), alt_obj_decr[idx].item()
 
     # accept with probability decaying exponentially in obj increase, as in
     # simulated annealing.
-    accept_prob = np.exp(min(obj_decr - accept_tol, 0) / temp)
-    success = torch.rand(1)[0].item() <= accept_prob
+    if temp <= 0:
+      success = obj_decr > accept_tol
+    else:
+      accept_prob = np.exp(min(obj_decr - accept_tol, 0) / temp)
+      success = torch.rand(1)[0].item() <= accept_prob
 
     if success:
-      # copy assign obj from temp to current
-      assign_obj[:, ridx, cidx] = rep_assign_obj[0, :, cidx]
-      reg_out[ridx, cidx] = rep_reg_out[0, cidx]
+      # copy assign obj
+      assign_obj[:, ridx, cidx] = assign_obj[:, cand_ridx, cand_cidx]
+      reg_out[ridx, cidx] = reg_out[cand_ridx, cand_cidx]
       rep_obj = cand_obj
 
       # update replicate value
-      value[ridx, :], _ = _eval_value(rep_assign_obj[0, :], rep_reg_out[0, :])
+      rep_assign_obj = assign_obj[:, ridx, :]
+      rep_reg_out = reg_out[ridx, :]
+      value[ridx, :], _ = _eval_value(rep_assign_obj, rep_reg_out)
 
       # update best assign obj and copy assign obj from current to best
       if rep_obj < best_obj:
         best_obj = rep_obj
-        rep_assign_obj[1, :] = rep_assign_obj[0, :]
-        rep_reg_out[1, :] = rep_reg_out[0, :]
-    else:
-      # revert temporary assign obj to previous
-      rep_assign_obj[0, :, cidx] = assign_obj[:, ridx, cidx]
-      rep_reg_out[0, cidx] = reg_out[ridx, cidx]
+        best_rep_assign_obj.copy_(rep_assign_obj)
+        best_rep_reg_out.copy_(rep_reg_out)
 
     cumu_obj_decr = (old_obj - rep_obj) / old_obj
     resets.append([ridx, cidx, cand_ridx, cand_cidx, int(success), obj_decr,
         cumu_obj_decr, temp])
 
+  # identify best iterate and adjust reset success after the fact
   resets = np.array(resets, dtype=object)
-
-  # adjust reset success after the fact to terminate after best iteration
   success = (old_obj - best_obj) / old_obj >= accept_tol
   if success:
     bestitr = np.argmax(resets[:, 6])
@@ -113,7 +117,7 @@ def reset_replicate(ridx, assign_obj, reg_out, temp, max_steps=10,
     resets[bestitr+1:, 4] *= -1
   else:
     resets[:, 4] *= -1
-  return success, resets, rep_assign_obj[1, :], rep_reg_out[1, :]
+  return success, resets, best_rep_assign_obj, best_rep_reg_out
 
 
 def _eval_value(assign_obj, reg_out):
@@ -130,24 +134,6 @@ def _eval_value(assign_obj, reg_out):
       compute_c=False)
   value = value.sub_(reg_out)
   return value.squeeze(0), min_assign_obj.squeeze(1)
-
-
-def _sample_swap_cand(ridx, cidx, value, rep_obj, assign_obj, reg_out,
-      cand_metric, alt_obj_buffers):
-  """Sample a candidate replicate, cluster to swap for given ridx, cidx."""
-  r, k = assign_obj.shape[1:]
-  if cand_metric == 'value':
-    cand_sample_prob = value.clamp(min=EPS)
-  else:
-    # obj_decr
-    alt_obj = _eval_alt_obj(ridx, cidx, assign_obj, reg_out, alt_obj_buffers)
-    alt_obj_decr = (rep_obj - alt_obj) / rep_obj
-    # clamp so objective increase steps have some small non-zero probability
-    cand_sample_prob = alt_obj_decr.clamp(min=EPS)
-  cand_sample_prob[ridx, :] = 0.0
-  idx = torch.multinomial(cand_sample_prob.view(-1), 1)[0].item()
-  cand_ridx, cand_cidx = np.unravel_index(idx, (r, k))
-  return cand_ridx, cand_cidx
 
 
 def _eval_alt_obj(ridx, cidx, assign_obj, reg_out, buffers):
@@ -174,5 +160,9 @@ def _eval_alt_obj(ridx, cidx, assign_obj, reg_out, buffers):
   alt_obj = alt_obj.mean(dim=0)
   alt_obj.add_(drop_reg_out)
   alt_obj.add_(reg_out.view(-1))
-  alt_obj = alt_obj.view(r, k)
   return alt_obj
+
+
+def _multinom_single(sample_prob):
+  """Draw a single sample from a discrete distribution."""
+  return torch.multinomial(sample_prob, 1)[0].item()

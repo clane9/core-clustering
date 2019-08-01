@@ -21,9 +21,8 @@ class KSubspaceBaseModel(nn.Module):
   assign_reg_terms = set()
 
   def __init__(self, k, d, D, affine=False, replicates=5, reg_params={},
-        reset_patience=100, reset_try_tol=0.01, reset_cand_metric='obj_decr',
-        reset_max_steps=50, reset_accept_tol=1e-3, reset_cache_size=500,
-        temp_scheduler=None):
+        reset_patience=100, reset_try_tol=0.01, reset_max_steps=50,
+        reset_accept_tol=1e-3, reset_cache_size=500, temp_scheduler=None):
 
     if replicates < 1:
       raise ValueError("Invalid replicates parameter {}".format(replicates))
@@ -38,9 +37,6 @@ class KSubspaceBaseModel(nn.Module):
     if reset_patience <= 0:
       raise ValueError("Invalid reset_patience parameter {}".format(
           reset_patience))
-    if reset_cand_metric not in {'obj_decr', 'value'}:
-      raise ValueError("Invalid reset_cand_metric parameter {}".format(
-          reset_cand_metric))
 
     super().__init__()
     self.k = k  # number of groups
@@ -55,7 +51,6 @@ class KSubspaceBaseModel(nn.Module):
     if reset_try_tol <= 0:
       reset_try_tol = None
     self.reset_try_tol = reset_try_tol
-    self.reset_cand_metric = reset_cand_metric
     self.reset_max_steps = reset_max_steps
     self.reset_accept_tol = reset_accept_tol
     self.reset_cache_size = reset_cache_size
@@ -346,7 +341,7 @@ class KSubspaceBaseModel(nn.Module):
       temp = self.temp_scheduler.step(ridx)
       success, rep_resets, rep_assign_obj, rep_reg_out = reset_replicate(
           ridx, assign_obj, reg_out, temp, max_steps=self.reset_max_steps,
-          accept_tol=self.reset_accept_tol, cand_metric=self.reset_cand_metric)
+          accept_tol=self.reset_accept_tol)
       if success:
         rep_reset_ids = rep_resets[rep_resets[:, 4] == 1, 1:4].astype(np.int64)
         self._post_reset_updates(ridx, rep_reset_ids, rep_assign_obj,
@@ -434,10 +429,10 @@ class KSubspaceMFModel(KSubspaceBaseModel):
   assign_reg_terms = {'U_frosqr_in', 'z'}
 
   def __init__(self, k, d, D, affine=False, replicates=5, reg_params={},
-        reset_patience=100, reset_try_tol=0.01, reset_cand_metric='obj_decr',
-        reset_max_steps=50, reset_accept_tol=1e-3, reset_cache_size=500,
-        temp_scheduler=None, scale_grad_mode=None, scale_grad_update_freq=20,
-        init='random', initk=None):
+        reset_patience=100, reset_try_tol=0.01, reset_max_steps=50,
+        reset_accept_tol=1e-3, reset_cache_size=500, temp_scheduler=None,
+        scale_grad_mode=None, scale_grad_update_freq=20, init='random',
+        initk=None):
 
     if not (scale_grad_mode is None or scale_grad_mode == 'none'):
       if affine:
@@ -451,9 +446,8 @@ class KSubspaceMFModel(KSubspaceBaseModel):
     super().__init__(k, d, D,
         affine=affine, replicates=replicates, reg_params=reg_params,
         reset_patience=reset_patience, reset_try_tol=reset_try_tol,
-        reset_cand_metric=reset_cand_metric, reset_max_steps=reset_max_steps,
-        reset_accept_tol=reset_accept_tol, reset_cache_size=reset_cache_size,
-        temp_scheduler=temp_scheduler)
+        reset_max_steps=reset_max_steps, reset_accept_tol=reset_accept_tol,
+        reset_cache_size=reset_cache_size, temp_scheduler=temp_scheduler)
 
     if scale_grad_mode == 'none':
       scale_grad_mode = None
@@ -479,7 +473,7 @@ class KSubspaceMFModel(KSubspaceBaseModel):
         raise ValueError(("Data subset initX required for PFI or PCA "
             "initialization"))
       elif not (torch.is_tensor(initX) and
-            initX.dim() == 2 and initX.shape[1] == D):
+            initX.dim() == 2 and initX.shape[1] == self.D):
         raise ValueError("Invalid data subset initX ")
 
     if self.init == 'random':
@@ -545,7 +539,7 @@ class KSubspaceMFModel(KSubspaceBaseModel):
 
     for cidx in range(1, self.initk):
       # (N, r, k')
-      _ = self.objective(X)
+      self.objective(X)
       obj = self._assign_obj[:, :, :cidx]
       # (N, r)
       min_obj = torch.min(obj, dim=2)[0]
@@ -734,16 +728,14 @@ class KSubspaceProjModel(KSubspaceBaseModel):
   assign_reg_terms = {'U_frosqr_in'}
 
   def __init__(self, k, d, D, affine=False, replicates=5, reg_params={},
-        reset_patience=100, reset_try_tol=0.01,
-        reset_cand_metric='obj_decr', reset_max_steps=50,
+        reset_patience=100, reset_try_tol=0.01, reset_max_steps=50,
         reset_accept_tol=1e-3, reset_cache_size=500, temp_scheduler=None):
 
     super().__init__(k, d, D,
         affine=affine, replicates=replicates, reg_params=reg_params,
         reset_patience=reset_patience, reset_try_tol=reset_try_tol,
-        reset_cand_metric=reset_cand_metric, reset_max_steps=reset_max_steps,
-        reset_accept_tol=reset_accept_tol, reset_cache_size=reset_cache_size,
-        temp_scheduler=temp_scheduler)
+        reset_max_steps=reset_max_steps, reset_accept_tol=reset_accept_tol,
+        reset_cache_size=reset_cache_size, temp_scheduler=temp_scheduler)
     return
 
   def encode(self, x):
@@ -791,9 +783,9 @@ class KSubspaceBatchAltBaseModel(KSubspaceBaseModel):
   assign_reg_terms = dict()
 
   def __init__(self, k, d, dataset, affine=False, replicates=5, reg_params={},
-        reset_patience=2, reset_try_tol=0.01, reset_cand_metric='obj_decr',
-        reset_max_steps=50, reset_accept_tol=1e-3, reset_cache_size=500,
-        temp_scheduler=None, svd_solver='randomized', **kwargs):
+        reset_patience=2, reset_try_tol=0.01, reset_max_steps=50,
+        reset_accept_tol=1e-3, reset_cache_size=500, temp_scheduler=None,
+        svd_solver='randomized', **kwargs):
 
     if svd_solver not in ('randomized', 'svds', 'svd'):
       raise ValueError("Invalid svd solver {}".format(svd_solver))
@@ -803,9 +795,9 @@ class KSubspaceBatchAltBaseModel(KSubspaceBaseModel):
     super().__init__(k, d, D,
         affine=affine, replicates=replicates, reg_params=reg_params,
         reset_patience=reset_patience, reset_try_tol=reset_try_tol,
-        reset_cand_metric=reset_cand_metric, reset_max_steps=reset_max_steps,
-        reset_accept_tol=reset_accept_tol, reset_cache_size=reset_cache_size,
-        temp_scheduler=temp_scheduler, **kwargs)
+        reset_max_steps=reset_max_steps, reset_accept_tol=reset_accept_tol,
+        reset_cache_size=reset_cache_size, temp_scheduler=temp_scheduler,
+        **kwargs)
 
     self.dataset = dataset
     self.register_buffer('X', dataset.X)
@@ -873,16 +865,16 @@ class KSubspaceBatchAltProjModel(KSubspaceBatchAltBaseModel,
   assign_reg_terms = {'U_frosqr_in'}
 
   def __init__(self, k, d, dataset, affine=False, replicates=5, reg_params={},
-        reset_patience=2, reset_try_tol=0.01, reset_cand_metric='obj_decr',
-        reset_max_steps=50, reset_accept_tol=1e-3, reset_cache_size=500,
-        temp_scheduler=None, svd_solver='randomized'):
+        reset_patience=2, reset_try_tol=0.01, reset_max_steps=50,
+        reset_accept_tol=1e-3, reset_cache_size=500, temp_scheduler=None,
+        svd_solver='randomized'):
 
     super().__init__(k, d, dataset,
         affine=affine, replicates=replicates, reg_params=reg_params,
         reset_patience=reset_patience, reset_try_tol=reset_try_tol,
-        reset_cand_metric=reset_cand_metric, reset_max_steps=reset_max_steps,
-        reset_accept_tol=reset_accept_tol, reset_cache_size=reset_cache_size,
-        temp_scheduler=temp_scheduler, svd_solver=svd_solver)
+        reset_max_steps=reset_max_steps, reset_accept_tol=reset_accept_tol,
+        reset_cache_size=reset_cache_size, temp_scheduler=temp_scheduler,
+        svd_solver=svd_solver)
     return
 
   def step(self):
@@ -912,18 +904,17 @@ class KSubspaceBatchAltMFModel(KSubspaceBatchAltBaseModel, KSubspaceMFModel):
   assign_reg_terms = {'U_frosqr_in', 'z'}
 
   def __init__(self, k, d, dataset, affine=False, replicates=5, reg_params={},
-        reset_patience=2, reset_try_tol=0.01, reset_cand_metric='obj_decr',
-        reset_max_steps=50, reset_accept_tol=1e-3, reset_cache_size=500,
-        temp_scheduler=None, init='random', initk=None,
-        svd_solver='randomized'):
+        reset_patience=2, reset_try_tol=0.01, reset_max_steps=50,
+        reset_accept_tol=1e-3, reset_cache_size=500, temp_scheduler=None,
+        init='random', initk=None, svd_solver='randomized'):
 
     mf_kwargs = {'scale_grad_mode': None, 'init': init, 'initk': initk}
     super().__init__(k, d, dataset,
         affine=affine, replicates=replicates, reg_params=reg_params,
         reset_patience=reset_patience, reset_try_tol=reset_try_tol,
-        reset_cand_metric=reset_cand_metric, reset_max_steps=reset_max_steps,
-        reset_accept_tol=reset_accept_tol, reset_cache_size=reset_cache_size,
-        temp_scheduler=temp_scheduler, svd_solver=svd_solver, **mf_kwargs)
+        reset_max_steps=reset_max_steps, reset_accept_tol=reset_accept_tol,
+        reset_cache_size=reset_cache_size, temp_scheduler=temp_scheduler,
+        svd_solver=svd_solver, **mf_kwargs)
 
     # bases initialized in KSubspaceMFModel
     # ensure columns are orthogonal
@@ -1000,9 +991,9 @@ class KMeansBatchAltModel(KSubspaceBatchAltBaseModel):
   assign_reg_terms = {}
 
   def __init__(self, k, dataset, replicates=5, reg_params={},
-        reset_patience=2, reset_try_tol=0.01, reset_cand_metric='obj_decr',
-        reset_max_steps=50, reset_accept_tol=1e-3, reset_cache_size=500,
-        temp_scheduler=None, init='random', kpp_n_trials=None):
+        reset_patience=2, reset_try_tol=0.01, reset_max_steps=50,
+        reset_accept_tol=1e-3, reset_cache_size=500, temp_scheduler=None,
+        init='random', kpp_n_trials=None):
 
     if init not in {'pfi', 'random'}:
       raise ValueError("Invalid init parameter {}".format(init))
@@ -1013,9 +1004,8 @@ class KMeansBatchAltModel(KSubspaceBatchAltBaseModel):
     super().__init__(k, d, dataset,
         affine=affine, replicates=replicates, reg_params=reg_params,
         reset_patience=reset_patience, reset_try_tol=reset_try_tol,
-        reset_cand_metric=reset_cand_metric, reset_max_steps=reset_max_steps,
-        reset_accept_tol=reset_accept_tol, reset_cache_size=reset_cache_size,
-        temp_scheduler=temp_scheduler)
+        reset_max_steps=reset_max_steps, reset_accept_tol=reset_accept_tol,
+        reset_cache_size=reset_cache_size, temp_scheduler=temp_scheduler)
 
     self.init = init
     # Number of candidate means to test. Will add the one that reduces the loss
@@ -1164,17 +1154,17 @@ class KSubspaceMCModel(KSubspaceMFModel):
   assign_reg_terms = {'U_frosqr_in', 'z', 'e'}
 
   def __init__(self, k, d, D, affine=False, replicates=5, reg_params={},
-        reset_patience=100, reset_try_tol=0.01, reset_cand_metric='obj_decr',
-        reset_max_steps=50, reset_accept_tol=1e-3, reset_cache_size=500,
-        temp_scheduler=None, scale_grad_mode=None, scale_grad_update_freq=20,
-        sparse_encode=True, sparse_decode=False, norm_comp_error=True):
+        reset_patience=100, reset_try_tol=0.01, reset_max_steps=50,
+        reset_accept_tol=1e-3, reset_cache_size=500, temp_scheduler=None,
+        scale_grad_mode=None, scale_grad_update_freq=20, sparse_encode=True,
+        sparse_decode=False, norm_comp_error=True):
 
     super().__init__(k, d, D,
         affine=affine, replicates=replicates, reg_params=reg_params,
         reset_patience=reset_patience, reset_try_tol=reset_try_tol,
-        reset_cand_metric=reset_cand_metric, reset_max_steps=reset_max_steps,
-        reset_accept_tol=reset_accept_tol, reset_cache_size=reset_cache_size,
-        temp_scheduler=temp_scheduler, scale_grad_mode=scale_grad_mode,
+        reset_max_steps=reset_max_steps, reset_accept_tol=reset_accept_tol,
+        reset_cache_size=reset_cache_size, temp_scheduler=temp_scheduler,
+        scale_grad_mode=scale_grad_mode,
         scale_grad_update_freq=scale_grad_update_freq)
 
     self.sparse_encode = sparse_encode
@@ -1344,15 +1334,14 @@ class DeepKSubspaceProjModel(KSubspaceProjModel):
 
   def __init__(self, k, d, D, encoder, decoder, affine=False, replicates=5,
         reg_params={}, criterion=None, ksub_obj_weight=1.0, reset_patience=100,
-        reset_try_tol=0.01, reset_cand_metric='obj_decr', reset_max_steps=50,
-        reset_accept_tol=1e-3, reset_cache_size=500, temp_scheduler=None):
+        reset_try_tol=0.01, reset_max_steps=50, reset_accept_tol=1e-3,
+        reset_cache_size=500, temp_scheduler=None):
 
     super().__init__(k, d, D,
         affine=affine, replicates=replicates, reg_params=reg_params,
         reset_patience=reset_patience, reset_try_tol=reset_try_tol,
-        reset_cand_metric=reset_cand_metric, reset_max_steps=reset_max_steps,
-        reset_accept_tol=reset_accept_tol, reset_cache_size=reset_cache_size,
-        temp_scheduler=temp_scheduler)
+        reset_max_steps=reset_max_steps, reset_accept_tol=reset_accept_tol,
+        reset_cache_size=reset_cache_size, temp_scheduler=temp_scheduler)
 
     self.encoder = encoder
     self.decoder = decoder
