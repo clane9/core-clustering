@@ -10,8 +10,8 @@ import torch
 from corecluster.core_reset import reset_replicate
 from corecluster import models as mod
 
-RTOL = 1e-5
-ATOL = 1e-8
+RTOL = 1e-4
+ATOL = 1e-6
 
 torch.manual_seed(2019)
 
@@ -34,14 +34,13 @@ def test_reset_replicate(assign_obj_and_reg_out):
   assign_obj, reg_out = assign_obj_and_reg_out
 
   temps = [0.1, 0.0]
-  expected_rep_objs = [7.4878e-07, 7.4878e-07]
+  expected_obj_decrs = [0.9999, 0.9999]
   expected_first_swaps = [(0, 3, 3), (2, 1, 0)]
-  for temp, ero, efs in zip(temps, expected_rep_objs, expected_first_swaps):
-    success, resets, rep_assign_obj, rep_reg_out = reset_replicate(0,
-        assign_obj, reg_out, temp=temp, max_steps=10, accept_tol=1e-3)
-
-    rep_obj = rep_assign_obj.min(dim=1)[0].mean().item()
-    assert np.isclose(rep_obj, ero, rtol=RTOL, atol=ATOL)
+  for temp, eod, efs in zip(temps, expected_obj_decrs, expected_first_swaps):
+    success, resets = reset_replicate(0, assign_obj, reg_out, temp=temp,
+        max_steps=10, accept_tol=1e-3)
+    obj_decr = resets[:, 6].max()
+    assert np.isclose(obj_decr, eod, rtol=RTOL, atol=ATOL)
 
     first_swap = tuple(resets[0, 1:4])
     assert first_swap == efs
@@ -62,9 +61,9 @@ def test_core_reset(assign_obj_and_reg_out):
   mf_model.num_bad_steps[:] = 40
   resets = mf_model.core_reset()
 
-  obj = mf_model._cache_assign_obj.min(dim=2)[0].mean(dim=0).numpy()
-  expected_obj = 7.4878e-07
-  assert np.allclose(obj, expected_obj, rtol=RTOL, atol=ATOL)
+  obj_decr = resets[:, 6].max()
+  expected_obj_decr = 0.9999
+  assert np.allclose(obj_decr, expected_obj_decr, rtol=RTOL, atol=ATOL)
 
   first_swap = tuple(resets[0, 1:4])
   expected_first_swap = (0, 1, 3)

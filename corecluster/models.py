@@ -34,9 +34,10 @@ class KSubspaceBaseModel(nn.Module):
         raise ValueError("Invalid {} reg parameter {}".format(k, val))
     if not set(reg_params).issubset(set(self.default_reg_params)):
       raise ValueError("Invalid reg parameter keys")
-    if reset_patience <= 0:
-      raise ValueError("Invalid reset_patience parameter {}".format(
-          reset_patience))
+    if (min(reset_patience, reset_max_steps, reset_accept_tol,
+          reset_cache_size) <= 0):
+      raise ValueError(("Reset patience, max steps, accept tol, "
+          "cache size must all be > 0"))
 
     super().__init__()
     self.k = k  # number of groups
@@ -325,8 +326,9 @@ class KSubspaceBaseModel(nn.Module):
     if reset_rids.shape[0] == 0:
       return empty_output
 
-    # check that cache is full and calculate current cache objective
-    cache_not_full = torch.any(torch.isnan(self._cache_assign_obj))
+    # check that assign obj cache is full for all reps
+    cache_not_full = torch.isnan(self._cache_assign_obj[
+        self._cache_assign_obj_head, 0, 0])
     if cache_not_full:
       return empty_output
 
@@ -339,13 +341,11 @@ class KSubspaceBaseModel(nn.Module):
     for ridx in reset_rids:
       ridx = ridx.item()
       temp = self.temp_scheduler.step(ridx)
-      success, rep_resets, rep_assign_obj, rep_reg_out = reset_replicate(
-          ridx, assign_obj, reg_out, temp, max_steps=self.reset_max_steps,
-          accept_tol=self.reset_accept_tol)
+      success, rep_resets = reset_replicate(ridx, assign_obj, reg_out, temp,
+          max_steps=self.reset_max_steps, accept_tol=self.reset_accept_tol)
       if success:
         rep_reset_ids = rep_resets[rep_resets[:, 4] == 1, 1:4].astype(np.int64)
-        self._post_reset_updates(ridx, rep_reset_ids, rep_assign_obj,
-            rep_reg_out)
+        self._post_reset_updates(ridx, rep_reset_ids)
       self.num_bad_steps[0, ridx] = 0
       resets.append(rep_resets)
 
@@ -377,20 +377,22 @@ class KSubspaceBaseModel(nn.Module):
     reset_rids = reset_mask.nonzero().view(-1)
     return reset_rids
 
-  def _post_reset_updates(self, ridx, reset_ids, rep_assign_obj, rep_reg_out):
+  def _post_reset_updates(self, ridx, reset_ids):
     """Duplicate bases from (cand_rIdx, cand_cIdx) to (rIdx, cIdx), and other
     re-initializations."""
     # reset_ids = cIdx, cand_rIdx, cand_cIdx
     uniqIdx = ut.unique_resets(reset_ids[:, 0])
     reset_ids = reset_ids[uniqIdx, :]
     cIdx, cand_rIdx, cand_cIdx = [reset_ids[:, ii] for ii in range(3)]
+    if np.any(cand_rIdx == ridx):
+      raise RuntimeError(("Shouldn't swap with a cluster from the same "
+          "replica."))
 
     self.Us.data[ridx, cIdx, :] = self.Us.data[cand_rIdx, cand_cIdx, :]
     if self.affine:
       self.bs.data[ridx, cIdx, :] = self.bs.data[cand_rIdx, cand_cIdx, :]
-
-    self._cache_assign_obj[:, ridx, :] = rep_assign_obj
-    self._reg_out_per_cluster[ridx, :] = rep_reg_out
+    self._cache_assign_obj[:, ridx, cIdx] = self._cache_assign_obj[:,
+        cand_rIdx, cand_cIdx]
 
     self.c_mean[ridx, :] = np.nan
     self.value[ridx, :] = np.nan
@@ -687,8 +689,8 @@ class KSubspaceMFModel(KSubspaceBaseModel):
     super().epoch_init()
     if self.scale_grad_mode is not None:
       if self.Hess is None:
-        self.Hess = torch.eye(self.d, device=self.Us.device).repeat(
-            2, self.r, self.k, 1, 1)
+        Id = torch.diag(torch.ones(self.d).mul_(1e-3))
+        self.Hess = Id.repeat(2, self.r, self.k, 1, 1).to(self.Us.device)
         self.HessN = torch.zeros((2, self.r), device=self.Us.device)
       else:
         self.Hess = self._shift_and_zero(self.Hess)
@@ -702,16 +704,17 @@ class KSubspaceMFModel(KSubspaceBaseModel):
     buf[1, :] = 0.0
     return buf
 
-  def _post_reset_updates(self, ridx, reset_ids, rep_assign_obj, rep_reg_out):
+  def _post_reset_updates(self, ridx, reset_ids):
     """Duplicate bases from (cand_rIdx, cand_cIdx) to (rIdx, cIdx), and other
     re-initializations."""
-    super()._post_reset_updates(ridx, reset_ids, rep_assign_obj, rep_reg_out)
+    super()._post_reset_updates(ridx, reset_ids)
     if self.scale_grad_mode is not None:
       # re-initialize hessian estimate with identity.
       # NOTE: would using the candidate's hessian be a better choice? I think
       # probably not, since there is some dependence on the "sibling clusters",
       # through the assignment.
-      self.Hess[:, ridx, :] = torch.eye(self.d, device=self.Us.device)
+      self.Hess[:, ridx, :] = torch.diag(
+          torch.ones(self.d).mul_(1e-3)).to(self.Us.device)
       self.HessN[:, ridx] = 0.0
       # be sure to update grad scale on next iter
       self.scale_grad_steps = 0
