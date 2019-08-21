@@ -9,10 +9,9 @@ import torch
 
 from . import utils as ut
 from .models import KSubspaceBatchAltBaseModel, KSubspaceMCModel
+from .core_reset import RESET_NCOL
 
 EPS = 1e-8
-# ridx,  cidx, cand_ridx, cand_cidx, success, obj_decr, cumu_obj_decr, temp
-RESET_NCOL = 8
 
 
 def train_loop(model, data_loader, device, optimizer, out_dir=None, epochs=200,
@@ -281,11 +280,9 @@ def train_epoch(model, data_loader, data_iter, optimizer, device,
     if core_reset:
       reset_tic = time.time()
       batch_resets = model.core_reset()
-      success_mask = batch_resets[:, 4] == 1
-      if success_mask.sum() > 0:
-        rIdx = np.unique(batch_resets[success_mask, 0].astype(np.int64))
-        ut.reset_optimizer_state(model, optimizer, rIdx)
       if batch_resets.shape[0] > 0:
+        rIdx = np.unique(batch_resets[:, 0].astype(np.int64))
+        ut.reset_optimizer_state(model, optimizer, rIdx)
         batch_resets = np.insert(batch_resets, 0, itr, axis=1)
         resets.append(batch_resets)
       reset_rtime += time.time() - reset_tic
@@ -312,13 +309,12 @@ def train_epoch(model, data_loader, data_iter, optimizer, device,
   if core_reset:
     resets = (np.concatenate(resets) if len(resets) > 0
         else np.zeros((0, RESET_NCOL+1), dtype=object))
-    success_mask = resets[:, 5] == 1
-    reset_count = success_mask.sum()
+    reset_count = resets.shape[0]
     rep_reset_counts = np.zeros((1, model.r))
     if reset_count > 0:
-      reset_rids, success_counts = np.unique(
-          resets[success_mask, 1].astype(np.int64), return_counts=True)
-      rep_reset_counts[0, reset_rids] = success_counts
+      rIdx, success_counts = np.unique(resets[:, 1].astype(np.int64),
+          return_counts=True)
+      rep_reset_counts[0, rIdx] = success_counts
   else:
     reset_count = 0
     rep_reset_counts = np.zeros((1, model.r))
@@ -367,20 +363,18 @@ def batch_alt_step(model, eval_rank=False, core_reset=False,
   if core_reset:
     reset_tic = time.time()
     resets = model.core_reset()
-    success_mask = resets[:, 4] == 1
-    reset_count = success_mask.sum()
+    reset_count = resets.shape[0]
     rep_reset_counts = np.zeros((1, model.r))
     if reset_count > 0:
-      reset_rids, success_counts = np.unique(
-          resets[success_mask, 0].astype(np.int64), return_counts=True)
-      rep_reset_counts[0, reset_rids] = success_counts
-    resets = np.insert(resets, 0, 1, axis=1)
+      resets = np.insert(resets, 0, 1, axis=1)
+      rIdx, success_counts = np.unique(resets[:, 1].astype(np.int64),
+          return_counts=True)
+      rep_reset_counts[0, rIdx] = success_counts
     reset_rtime = time.time() - reset_tic
   else:
     resets = np.zeros((0, RESET_NCOL+1), dtype=object)
-    reset_count = 0
     rep_reset_counts = np.zeros((1, model.r))
-    reset_rtime = 0.0
+    reset_count, reset_rtime = 0, 0.0
 
   if eval_cluster_error:
     errors = torch.tensor([ut.eval_cluster_error(conf_mats.sum[ii, :])[0]

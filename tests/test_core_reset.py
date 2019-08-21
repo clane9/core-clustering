@@ -9,6 +9,7 @@ import torch
 
 from corecluster.core_reset import reset_replicate
 from corecluster import models as mod
+from corecluster.utils import aggregate_resets
 
 RTOL = 1e-4
 ATOL = 1e-6
@@ -33,17 +34,21 @@ def assign_obj_and_reg_out():
 def test_reset_replicate(assign_obj_and_reg_out):
   assign_obj, reg_out = assign_obj_and_reg_out
 
-  temps = [0.1, 0.0]
-  expected_obj_decrs = [0.9999, 0.9999]
-  expected_first_swaps = [(0, 3, 3), (2, 1, 0)]
-  for temp, eod, efs in zip(temps, expected_obj_decrs, expected_first_swaps):
-    success, resets = reset_replicate(0, assign_obj, reg_out, temp=temp,
-        max_steps=10, accept_tol=1e-3)
-    obj_decr = resets[:, 6].max()
-    assert np.isclose(obj_decr, eod, rtol=RTOL, atol=ATOL)
+  expected_obj_decr = 0.9999
+  expected_first_swap = (3, 1, 0)
 
-    first_swap = tuple(resets[0, 1:4])
-    assert first_swap == efs
+  # resets cols: ridx,  step, cidx, cand_ridx, cand_cidx, obj_decr,
+  # cumu_obj_decr
+  resets = reset_replicate(0, assign_obj, reg_out, max_steps=10,
+      accept_tol=1e-3)
+
+  assert resets.shape[0] > 0
+
+  obj_decr = resets[:, 6].max()
+  assert np.isclose(obj_decr, expected_obj_decr, rtol=RTOL, atol=ATOL)
+
+  first_swap = tuple(resets[0, 2:5])
+  assert first_swap == expected_first_swap
 
 
 def test_core_reset(assign_obj_and_reg_out):
@@ -52,8 +57,7 @@ def test_core_reset(assign_obj_and_reg_out):
 
   mf_model = mod.KSubspaceMFModel(k, d, D, affine=False, replicates=r,
       reset_patience=20, reset_try_tol=-1, reset_max_steps=10,
-      reset_accept_tol=1e-3, reset_cache_size=cache_size,
-      temp_scheduler=mod.ConstantTempScheduler(init_temp=0.1))
+      reset_accept_tol=1e-3, reset_cache_size=cache_size)
 
   # plant assign obj and set num bad steps to trigger re-initialization
   mf_model._cache_assign_obj.copy_(assign_obj)
@@ -61,10 +65,14 @@ def test_core_reset(assign_obj_and_reg_out):
   mf_model.num_bad_steps[:] = 40
   resets = mf_model.core_reset()
 
-  obj_decr = resets[:, 6].max()
-  expected_obj_decr = 0.9999
-  assert np.allclose(obj_decr, expected_obj_decr, rtol=RTOL, atol=ATOL)
+  assert resets.shape[0] > 0
 
-  first_swap = tuple(resets[0, 1:4])
-  expected_first_swap = (0, 1, 3)
+  pad_resets = np.insert(resets, [0, 0], [0, 0], axis=1)
+  agg_resets = aggregate_resets(pad_resets)
+  obj_decr = agg_resets['cumu.obj.decr.max'].min()
+  expected_obj_decr = 0.9999
+  assert np.isclose(obj_decr, expected_obj_decr, rtol=RTOL, atol=ATOL)
+
+  first_swap = tuple(resets[0, 2:5])
+  expected_first_swap = (3, 1, 0)
   assert first_swap == expected_first_swap

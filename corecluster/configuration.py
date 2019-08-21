@@ -129,8 +129,6 @@ global_args_dict = {
             'set <= 0 to disable [default: 0.01]')),
     'reset-steps': dict(type=int, default=50,
         help='Number of reset terations [default: 50]'),
-    'reset-temp': dict(type=float, default=0.1,
-        help='Simulated annealing temperature [default: 0.1]'),
     'reset-accept-tol': dict(type=float, default=0.001,
         help=('Objective decrease tolerance for accepting a reset '
             '[default: 0.001]')),

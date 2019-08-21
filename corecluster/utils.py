@@ -578,36 +578,22 @@ def unique_resets(reset_cids):
 
 def aggregate_resets(resets):
   """Aggregate resets for each epoch and replicate."""
-  columns = ['epoch', 'itr', 'ridx', 'cidx', 'cand.ridx', 'cand.cidx',
-      'success', 'obj.decr', 'cumu.obj.decr', 'temp']
-  dtypes = 7*[int] + 3*[float]
+  columns = ['epoch', 'step', 'ridx', 'core.step', 'cidx', 'cand.ridx',
+      'cand.cidx', 'obj.decr', 'cumu.obj.decr']
+  dtypes = 7*[int] + 2*[float]
   resets_dict = {columns[ii]: resets[:, ii].astype(dtypes[ii])
       for ii in range(len(columns))}
   resets = pd.DataFrame(data=resets_dict)
-  grouped = resets.groupby(['epoch', 'itr', 'ridx'], as_index=False)
+  grouped = resets.groupby(['epoch', 'step', 'ridx'], as_index=False)
   agg_resets = grouped.agg(OrderedDict([
-      ('success', [_count_reset_accept, _count_reset_post_reject,
-          _count_reset_reject]),
+      ('core.step', ['count']),
       ('obj.decr', ['min', 'median', 'max']),
-      ('cumu.obj.decr', ['min', 'median', 'max']),
-      ('temp', ['min'])]))
+      ('cumu.obj.decr', ['min', 'median', 'max'])]))
   agg_resets.columns = (
-      ['epoch', 'itr', 'ridx', 'accept', 'post.reject', 'reject'] +
+      ['epoch', 'step', 'ridx', 'core.steps'] +
       ['{}.{}'.format(met, meas) for met in ['obj.decr', 'cumu.obj.decr']
-          for meas in ['min', 'med', 'max']] + ['temp'])
+          for meas in ['min', 'med', 'max']])
   return agg_resets
-
-
-def _count_reset_accept(x):
-  return np.sum(x == 1)
-
-
-def _count_reset_post_reject(x):
-  return np.sum(x == -1)
-
-
-def _count_reset_reject(x):
-  return np.sum(x == 0)
 
 
 def set_auto_reg_params(k, d, D, Ng, sigma_hat, min_size=0.0):

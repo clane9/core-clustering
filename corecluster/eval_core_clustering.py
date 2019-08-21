@@ -170,8 +170,7 @@ def eval_core_clustering(args):
       reset_try_tol=args.reset_try_tol,
       reset_max_steps=args.reset_steps,
       reset_accept_tol=args.reset_accept_tol,
-      reset_cache_size=args.reset_cache_size,
-      temp_scheduler=mod.ConstantTempScheduler(init_temp=args.reset_temp))
+      reset_cache_size=args.reset_cache_size)
 
   if uos_mode:
     if args.optim == 'batch-alt':
@@ -276,8 +275,8 @@ def generate_parser():
       'lr-gamma', 'lr-min', 'init-bs', 'bs-step-size', 'bs-gamma', 'bs-max']
   scale_grad_args = ['scale-grad-mode', 'scale-grad-update-freq']
   sparse_args = ['sparse-encode', 'sparse-decode']
-  reset_args = ['reps', 'core-reset', 'reset-temp', 'reset-patience',
-      'reset-try-tol', 'reset-steps', 'reset-accept-tol', 'reset-cache-size']
+  reset_args = ['reps', 'core-reset', 'reset-patience', 'reset-try-tol',
+      'reset-steps', 'reset-accept-tol', 'reset-cache-size']
   generic_args = ['cuda', 'num-threads', 'num-workers', 'data-seed', 'seed',
       'eval-rank', 'chkp-freq', 'stop-freq', 'save-large-data', 'config']
 
