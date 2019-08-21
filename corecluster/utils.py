@@ -11,12 +11,71 @@ from scipy.sparse.linalg import svds
 from sklearn.utils.extmath import randomized_svd
 import torch
 import torch.nn.functional as F
+from torch.utils.data import DataLoader
 import pandas as pd
 
 EPS = 1e-8
 
 # use torch.solve in >=1.1.0 and torch.gesv in 0.4.1
 solve = torch.solve if hasattr(torch, 'solve') else torch.gesv
+
+
+class _BSScheduler(object):
+  def __init__(self, dataset, dl_kwargs, last_epoch=0):
+    self.dataset = dataset
+    self.dl_kwargs = dl_kwargs
+    self.last_epoch = last_epoch
+    self.batch_size = dl_kwargs['batch_size']
+
+  def update_bs(self):
+    raise NotImplementedError
+
+  def step(self, epoch=None):
+    # returns a new DataLoader instance when batch size updated. this is not
+    # too elegant, but not overly expensive either.
+    if epoch is None:
+      epoch = self.last_epoch + 1
+    self.last_epoch = epoch
+    return self.update_bs()
+
+  def new_data_loader(self):
+    return DataLoader(self.dataset, **self.dl_kwargs)
+
+
+class LambdaBS(_BSScheduler):
+  def __init__(self, dataset, dl_kwargs, bs_lambda, last_epoch=0):
+    self.bs_lambda = bs_lambda
+    super(LambdaBS, self).__init__(dataset, dl_kwargs, last_epoch)
+
+  def update_bs(self):
+    batch_size = self.bs_lambda(self.last_epoch)
+    updated = False
+    if batch_size != self.batch_size:
+      self.batch_size = self.dl_kwargs['batch_size'] = batch_size
+      updated = True
+    return updated
+
+
+class ClampDecay(object):
+  def __init__(self, initval, step_size, gamma, min=None, max=None):
+    self.initval = initval
+    self.step_size = step_size
+    self.gamma = gamma
+    self.minval = min
+    self.maxval = max
+
+  def __call__(self, ii):
+    val = clamp(self.initval * (self.gamma ** (ii // self.step_size)),
+        minval=self.minval, maxval=self.maxval)
+    return val
+
+
+def clamp(x, minval=None, maxval=None):
+  if minval is not None:
+    x = max(x, minval)
+  if maxval is not None:
+    x = min(x, maxval)
+  return x
 
 
 class AverageMeter(object):

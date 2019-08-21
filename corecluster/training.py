@@ -6,7 +6,6 @@ import time
 import ipdb
 import numpy as np
 import torch
-from torch.optim.lr_scheduler import ReduceLROnPlateau
 
 from . import utils as ut
 from .models import KSubspaceBatchAltBaseModel, KSubspaceMCModel
@@ -17,8 +16,9 @@ RESET_NCOL = 8
 
 
 def train_loop(model, data_loader, device, optimizer, out_dir=None, epochs=200,
-      chkp_freq=50, stop_freq=-1, scheduler=None, epoch_steps=None,
-      eval_rank=False, core_reset=False, save_data=True, init_time=0.0):
+      chkp_freq=50, stop_freq=-1, lr_scheduler=None, bs_scheduler=None,
+      epoch_size=None, eval_rank=False, core_reset=False, save_data=True,
+      init_time=0.0):
   """Train k-subspace model for series of epochs.
 
   Args:
@@ -30,8 +30,9 @@ def train_loop(model, data_loader, device, optimizer, out_dir=None, epochs=200,
     epochs: number of epochs to run for (default: 200)
     chkp_freq: how often to save checkpoint (default: 50)
     stop_freq: how often to stop for debugging (default: -1)
-    scheduler: lr scheduler. If None, use reduce on plateau (default: None)
-    epoch_steps: maximum steps per "epoch" (default: len(dataset))
+    lr_scheduler: lr scheduler (default: None)
+    bs_scheduler: batch size scheduler (default: None)
+    epoch_size: maximum number of samples per "epoch" (default: len(dataset))
     eval_rank: evaluate ranks of group models, only implemented for subspace
       models (default: False)
     core_reset: whether to perform cooperative re-initialization
@@ -39,7 +40,7 @@ def train_loop(model, data_loader, device, optimizer, out_dir=None, epochs=200,
     save_data: whether to save bigger data, ie conf_mats, svs (default: True)
     init_time: initialization time to add to first epoch (default: 0.0)
   """
-  printformstr = ('(epoch {:d}/{:d}) lr={:.1e} '
+  printformstr = ('(epoch {:d}/{:d}) lr={:.1e} bs={:d} '
       'err={:.3f},{:.3f},{:.3f} obj={:.2e},{:.2e},{:.2e} '
       'loss={:.1e},{:.1e},{:.1e} reg.in={:.1e},{:.1e},{:.1e} '
       'reg.out={:.1e},{:.1e},{:.1e} ')
@@ -52,7 +53,7 @@ def train_loop(model, data_loader, device, optimizer, out_dir=None, epochs=200,
       'data.rt={:.2f} reset.rt={:.2f}')
 
   if out_dir is not None:
-    logheader = ('Epoch,LR,' + ','.join(['{}.{}'.format(met, meas)
+    logheader = ('Epoch,LR,BS,' + ','.join(['{}.{}'.format(met, meas)
         for met in ['Err', 'Obj', 'Loss', 'Reg.in', 'Reg.out']
         for meas in ['min', 'med', 'max']]) + ',')
     if mc_mode:
@@ -61,7 +62,7 @@ def train_loop(model, data_loader, device, optimizer, out_dir=None, epochs=200,
       logheader += 'Rank.min,Rank.med,Rank.max,'
     logheader += 'Resets,Samp.s,RT,Data.RT,Reset.RT'
 
-    logformstr = ('{:d},{:.9e},{:.9f},{:.9f},{:.9f},'
+    logformstr = ('{:d},{:.9e},{:d},{:.9f},{:.9f},{:.9f},'
         '{:.9e},{:.9e},{:.9e},{:.9e},{:.9e},{:.9e},'
         '{:.9e},{:.9e},{:.9e},{:.9e},{:.9e},{:.9e},')
     if mc_mode:
@@ -95,14 +96,6 @@ def train_loop(model, data_loader, device, optimizer, out_dir=None, epochs=200,
       if eval_rank else None)
   resets = [] if core_reset else None
 
-  if not batch_alt_mode and scheduler is None:
-    max_lr = ut.get_learning_rate(optimizer)
-    min_lr = max(EPS, 0.5**10 * max_lr)
-    scheduler = ReduceLROnPlateau(optimizer, factor=0.5, patience=10,
-        threshold=(model.reset_try_tol/10), min_lr=min_lr)
-  elif scheduler is not None:
-    min_lr = scheduler.min_lrs[0]
-
   # training loop
   err = None
   lr = float('inf')
@@ -118,10 +111,11 @@ def train_loop(model, data_loader, device, optimizer, out_dir=None, epochs=200,
       else:
         (metrics_summary, metrics[epoch-1, :], epoch_conf_mats, epoch_svs,
             epoch_resets, data_iter) = train_epoch(model, data_loader,
-                data_iter, optimizer, device, epoch_steps=epoch_steps,
+                data_iter, optimizer, device, epoch_size=epoch_size,
                 eval_rank=eval_rank, core_reset=core_reset,
                 mc_mode=mc_mode, eval_cluster_error=eval_cluster_error)
         lr = ut.get_learning_rate(optimizer)
+        bs = data_loader.batch_size
 
       if epoch == 1:
         metrics_summary[-3] += init_time
@@ -136,17 +130,13 @@ def train_loop(model, data_loader, device, optimizer, out_dir=None, epochs=200,
 
       if val_logf is not None:
         with open(val_logf, 'a') as f:
-          print(logformstr.format(epoch, lr, *metrics_summary), file=f)
-      print(printformstr.format(epoch, epochs, lr, *metrics_summary))
+          print(logformstr.format(epoch, lr, bs, *metrics_summary), file=f)
+      print(printformstr.format(epoch, epochs, lr, bs, *metrics_summary))
 
       cluster_error, min_obj, max_obj = [metrics_summary[ii]
           for ii in [0, 3, 5]]
 
-      waiting_to_reset = (core_reset and
-          (model.num_bad_steps[1, :] <= 3*model.reset_patience).any().item())
-      is_conv = (((model._updates == 0 if batch_alt_mode else lr <= min_lr) and
-          (not waiting_to_reset)) or epoch == epochs)
-
+      is_conv = model._updates == 0 if batch_alt_mode else epoch == epochs
       save_chkp = (out_dir is not None and
           (epoch % chkp_freq == 0 or (is_conv and chkp_freq <= epochs)))
       if save_chkp:
@@ -159,7 +149,11 @@ def train_loop(model, data_loader, device, optimizer, out_dir=None, epochs=200,
             filename='{}/checkpoint{}.pth.tar'.format(out_dir, epoch))
 
       if not batch_alt_mode:
-        scheduler.step(max_obj)
+        if lr_scheduler is not None:
+          lr_scheduler.step()
+        if bs_scheduler is not None and bs_scheduler.step():
+          data_loader = bs_scheduler.new_data_loader()
+          data_iter = None
 
       if stop_freq > 0 and epoch % stop_freq == 0:
         ipdb.set_trace()
@@ -211,7 +205,7 @@ def train_loop(model, data_loader, device, optimizer, out_dir=None, epochs=200,
 
 
 def train_epoch(model, data_loader, data_iter, optimizer, device,
-      epoch_steps=None, eval_rank=False, core_reset=False, mc_mode=False,
+      epoch_size=None, eval_rank=False, core_reset=False, mc_mode=False,
       eval_cluster_error=True):
   """train model for one epoch and record convergence measures."""
   data_tic = epoch_tic = time.time()
@@ -220,7 +214,7 @@ def train_epoch(model, data_loader, data_iter, optimizer, device,
   metrics = None
   resets = []
   conf_mats, comp_err = ut.AverageMeter(), ut.AverageMeter()
-  itr = epochN = 1
+  itr, epochN = 1, 0
   epoch_stop = False
   if data_iter is None:
     data_iter = iter(data_loader)
@@ -229,14 +223,14 @@ def train_epoch(model, data_loader, data_iter, optimizer, device,
     try:
       data_tup = next(data_iter)
     except StopIteration:
-      if epoch_steps is None or epoch_steps == itr:
+      if epoch_size is None or epochN >= epoch_size:
         data_iter = None
         epoch_stop = True
         break
       else:
         data_iter = iter(data_loader)
         data_tup = next(data_iter)
-    if itr == epoch_steps:
+    if epochN >= epoch_size:
       epoch_stop = True
 
     if len(data_tup) == 3:

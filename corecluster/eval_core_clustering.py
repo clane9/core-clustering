@@ -6,14 +6,14 @@ from __future__ import print_function
 
 import argparse
 import os
+import sys
 import shutil
 import json
 import time
 
-import numpy as np
 import torch
 from torch.utils.data import DataLoader
-from torch.optim.lr_scheduler import ReduceLROnPlateau
+from torch.optim.lr_scheduler import LambdaLR
 
 from corecluster import configuration as conf
 from corecluster import datasets as dat
@@ -66,6 +66,10 @@ def eval_core_clustering(args):
     shutil.rmtree(args.out_dir)
   os.makedirs(args.out_dir)
 
+  # save args
+  with open('{}/args.json'.format(args.out_dir), 'w') as f:
+    json.dump(args.__dict__, f, sort_keys=True, indent=4)
+
   # construct/load dataset
   torch.manual_seed(args.data_seed)
 
@@ -105,13 +109,21 @@ def eval_core_clustering(args):
 
   if args.setting == 'synth-kmeans' or args.optim == 'batch-alt':
     data_loader = None
+    bs_scheduler = None
   else:
     kwargs = {'num_workers': args.num_workers,
-        'batch_size': args.batch_size, 'shuffle': shuffle_data,
+        'batch_size': args.init_bs, 'shuffle': shuffle_data,
         'drop_last': True, 'pin_memory': use_cuda}
     if mc_mode:
       kwargs['collate_fn'] = dat.missing_data_collate
     data_loader = DataLoader(dataset, **kwargs)
+
+    if args.bs_step_size is not None and args.bs_step_size > 0:
+      bs_step_decay = ut.ClampDecay(args.init_bs, args.bs_step_size,
+          args.bs_gamma, max=args.bs_max)
+      bs_scheduler = ut.LambdaBS(dataset, kwargs, bs_step_decay)
+    else:
+      bs_scheduler = None
 
   # construct model
   torch.manual_seed(args.seed)
@@ -205,11 +217,10 @@ def eval_core_clustering(args):
   # optimizer
   if not uos_mode or args.epoch_size is None or args.epoch_size <= 0:
     args.epoch_size = len(dataset)
-  args.epoch_steps = args.epoch_size // args.batch_size
 
   if not uos_mode or args.optim == 'batch-alt':
     optimizer = None
-    scheduler = None
+    lr_scheduler = None
   else:
     if args.scale_grad_mode == 'newton':
       optimizer = torch.optim.SGD(model.parameters(), lr=args.init_lr,
@@ -223,13 +234,12 @@ def eval_core_clustering(args):
     else:
       raise ValueError("Invalid optimizer {}.".format(args.optim))
 
-    min_lr = max(1e-8, 0.1**4 * args.init_lr)
-    if args.core_reset:
-      patience = int(np.ceil(10 * args.reset_patience / args.epoch_steps))
+    if args.lr_step_size is not None and args.lr_step_size > 0:
+      lr_step_decay = ut.ClampDecay(args.init_lr, args.lr_step_size,
+          args.lr_gamma, min=args.lr_min)
+      lr_scheduler = LambdaLR(dataset, kwargs, lr_step_decay)
     else:
-      patience = 2000 // args.epoch_steps
-    scheduler = ReduceLROnPlateau(optimizer, factor=0.5, patience=patience,
-        threshold=1e-3, min_lr=min_lr)
+      lr_scheduler = None
 
   # no checkpointing in this case
   if args.chkp_freq is None or args.chkp_freq <= 0:
@@ -237,15 +247,11 @@ def eval_core_clustering(args):
   if args.stop_freq is None or args.stop_freq <= 0:
     args.stop_freq = -1
 
-  # save args
-  with open('{}/args.json'.format(args.out_dir), 'w') as f:
-    json.dump(args.__dict__, f, sort_keys=True, indent=4)
-
   return tr.train_loop(model, data_loader, device, optimizer, args.out_dir,
-      args.epochs, args.chkp_freq, args.stop_freq, scheduler=scheduler,
-      epoch_steps=args.epoch_steps, eval_rank=args.eval_rank,
-      core_reset=args.core_reset, save_data=args.save_large_data,
-      init_time=init_time)
+      args.epochs, args.chkp_freq, args.stop_freq, lr_scheduler=lr_scheduler,
+      bs_scheduler=bs_scheduler, epoch_size=args.epoch_size,
+      eval_rank=args.eval_rank, core_reset=args.core_reset,
+      save_data=args.save_large_data, init_time=init_time)
 
 
 def generate_parser():
@@ -264,50 +270,50 @@ def generate_parser():
   parser_km = subparsers.add_parser('synth-kmeans',
       help='Synthetic k-means setting')
 
+  model_args = ['form', 'init', 'model-k', 'model-d', 'auto-reg', 'sigma-hat',
+      'min-size', 'U-frosqr-in-lamb', 'U-frosqr-out-lamb', 'z-lamb']
+  opt_args = ['epochs', 'epoch-size', 'optim', 'init-lr', 'lr-step-size',
+      'lr-gamma', 'lr-min', 'init-bs', 'bs-step-size', 'bs-gamma', 'bs-max']
+  scale_grad_args = ['scale-grad-mode', 'scale-grad-update-freq']
+  sparse_args = ['sparse-encode', 'sparse-decode']
+  reset_args = ['reps', 'core-reset', 'reset-temp', 'reset-patience',
+      'reset-try-tol', 'reset-steps', 'reset-accept-tol', 'reset-cache-size']
+  generic_args = ['cuda', 'num-threads', 'num-workers', 'data-seed', 'seed',
+      'eval-rank', 'chkp-freq', 'stop-freq', 'save-large-data', 'config']
+
   conf.add_args(parser_uos,
       ['out-dir', 'k', 'd', 'D', 'Ng', 'N', 'affine', 'sigma', 'theta',
-      'miss-rate', 'online', 'normalize', 'form', 'init', 'model-k', 'model-d',
-      'auto-reg', 'sigma-hat', 'min-size', 'U-frosqr-in-lamb',
-      'U-frosqr-out-lamb', 'z-lamb', 'epochs', 'epoch-size', 'batch-size',
-      'optim', 'init-lr', 'scale-grad-mode', 'scale-grad-update-freq',
-      'sparse-encode', 'sparse-decode', 'reps', 'core-reset', 'reset-temp',
-      'reset-patience', 'reset-try-tol', 'reset-steps', 'reset-accept-tol',
-      'reset-cache-size', 'cuda', 'num-threads', 'num-workers', 'data-seed',
-      'seed', 'eval-rank', 'chkp-freq', 'stop-freq', 'save-large-data'])
+      'miss-rate', 'online', 'normalize'] + model_args + opt_args +
+      scale_grad_args + sparse_args + reset_args + generic_args)
 
   conf.add_args(parser_img,
-      ['out-dir', 'img-dataset', 'center', 'normalize', 'sv-range', 'affine',
-      'form', 'init', 'model-k', 'model-d', 'auto-reg', 'sigma-hat',
-      'min-size', 'U-frosqr-in-lamb', 'U-frosqr-out-lamb', 'z-lamb', 'epochs',
-      'epoch-size', 'batch-size', 'optim', 'init-lr', 'scale-grad-mode',
-      'scale-grad-update-freq', 'sparse-encode', 'sparse-decode',
-      'reps', 'core-reset', 'reset-temp', 'reset-patience', 'reset-try-tol',
-      'reset-steps', 'reset-accept-tol', 'reset-cache-size', 'cuda',
-      'num-threads', 'num-workers', 'data-seed', 'seed', 'eval-rank',
-      'chkp-freq', 'stop-freq', 'save-large-data'])
+      ['out-dir', 'img-dataset', 'center', 'normalize', 'sv-range', 'affine'] +
+      model_args + opt_args + scale_grad_args + reset_args + generic_args)
 
   conf.add_args(parser_mc,
-      ['out-dir', 'mc-dataset', 'center', 'normalize', 'affine',
-      'model-k', 'model-d', 'auto-reg', 'sigma-hat', 'min-size',
-      'U-frosqr-in-lamb', 'U-frosqr-out-lamb', 'z-lamb', 'epochs',
-      'epoch-size', 'batch-size', 'optim', 'init-lr', 'scale-grad-mode',
-      'scale-grad-update-freq', 'sparse-encode', 'sparse-decode', 'reps',
-      'core-reset', 'reset-temp', 'reset-patience', 'reset-try-tol',
-      'reset-steps', 'reset-accept-tol', 'reset-cache-size', 'cuda',
-      'num-threads', 'num-workers', 'data-seed', 'seed', 'eval-rank',
-      'chkp-freq', 'stop-freq', 'save-large-data'])
+      ['out-dir', 'mc-dataset', 'center', 'normalize', 'affine'] +
+      model_args[2:] + opt_args + scale_grad_args + sparse_args + reset_args +
+      generic_args)
 
   conf.add_args(parser_km,
       ['out-dir', 'k', 'D', 'Ng', 'N', 'sep', 'init', 'kpp-n-trials',
-      'model-k', 'b-frosqr-out-lamb', 'epochs', 'reps', 'core-reset',
-      'reset-temp', 'reset-patience', 'reset-try-tol', 'reset-steps',
-      'reset-accept-tol', 'reset-cache-size', 'cuda', 'num-threads',
-      'num-workers', 'data-seed', 'seed', 'chkp-freq', 'stop-freq',
-      'save-large-data'])
+      'model-k', 'b-frosqr-out-lamb', 'epochs'] + reset_args + generic_args)
   return parser
 
 
 if __name__ == '__main__':
   parser = generate_parser()
   args = parser.parse_args()
+
+  # update unspecified args with values from config json
+  if args.config is not None:
+    with open(args.config, 'r') as f:
+      config = json.load(f)
+    # assumes all passed argument flags start with '--'
+    passed_args = set([arg[2:].replace('-', '_')
+        for arg in sys.argv[1:] if arg[:2] == '--'])
+    update_args = set(config.keys()).difference(passed_args)
+    for arg in update_args:
+      setattr(args, arg, config[arg])
+
   eval_core_clustering(args)
