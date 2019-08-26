@@ -33,7 +33,6 @@ synth_uos_base_args = {
 
     # model
     'form': 'mf',
-    'init': 'random',
     'model_k': None,
     'model_d': None,
     'auto_reg': True,
@@ -44,13 +43,21 @@ synth_uos_base_args = {
     'z_lamb': 0.01,
 
     # training
+    'init': 'random',
+    'pfi_init_size': 500,
+    'pfi_n_cands': None,
     'epochs': 10,
     'epoch_size': None,
-    'batch_size': 100,
     'optim': 'sgd',
     'init_lr': 0.1,
-    'scale_grad_mode': None,
-    'scale_grad_update_freq': 20,
+    'lr_step_size': None,
+    'lr_gamma': 0.1,
+    'lr_min': 1e-8,
+    'init_bs': 100,
+    'bs_step_size': None,
+    'bs_gamma': 4,
+    'bs_max': 1000,
+    'scale_grad_lip': False,
     'sparse_encode': True,
     'sparse_decode': True,
 
@@ -59,9 +66,8 @@ synth_uos_base_args = {
     'core_reset': True,
     'reset_patience': 50,
     'reset_try_tol': 0.01,
-    'reset_steps': 20,
-    'reset_accept_tol': 0.001,
-    'reset_temp': 0.1,
+    'reset_steps': 5,
+    'reset_accept_tol': 1e-3,
     'reset_cache_size': 500,
 
     # general configuration
@@ -73,94 +79,76 @@ synth_uos_base_args = {
     'eval_rank': True,
     'chkp_freq': None,
     'stop_freq': None,
-    'save_large_data': False
+    'save_large_data': False,
+    'config': None,
 }
 
 
 def test_base_synth_uos():
   """Expected output:
-
-    (epoch 1/10) lr=1.0e-01 err=0.610,0.674,0.728 obj=4.87e-01,4.92e-01,4.94e-01 loss=4.0e-01,4.1e-01,4.1e-01 reg.in=8.4e-02,8.5e-02,8.7e-02 reg.out=0.0e+00,0.0e+00,0.0e+00 rank=20,20,20 resets=0 samp/s=7760 rtime=1.29 data.rt=0.11 reset.rt=0.03
-    (epoch 2/10) lr=1.0e-01 err=0.137,0.229,0.333 obj=3.75e-01,3.89e-01,4.05e-01 loss=2.4e-01,2.6e-01,2.8e-01 reg.in=1.3e-01,1.3e-01,1.4e-01 reg.out=0.0e+00,0.0e+00,0.0e+00 rank=20,20,20 resets=0 samp/s=7612 rtime=1.31 data.rt=0.12 reset.rt=0.04
-    (epoch 3/10) lr=1.0e-01 err=0.001,0.083,0.126 obj=2.91e-01,3.16e-01,3.32e-01 loss=1.2e-01,1.5e-01,1.8e-01 reg.in=1.6e-01,1.6e-01,1.7e-01 reg.out=0.0e+00,0.0e+00,0.0e+00 rank=20,20,20 resets=0 samp/s=7208 rtime=1.39 data.rt=0.12 reset.rt=0.04
-    (epoch 4/10) lr=1.0e-01 err=0.000,0.005,0.101 obj=2.73e-01,2.87e-01,2.99e-01 loss=9.4e-02,1.1e-01,1.3e-01 reg.in=1.7e-01,1.7e-01,1.8e-01 reg.out=0.0e+00,0.0e+00,0.0e+00 rank=20,20,20 resets=0 samp/s=7696 rtime=1.30 data.rt=0.11 reset.rt=0.03
-    (epoch 5/10) lr=1.0e-01 err=0.000,0.000,0.099 obj=2.72e-01,2.73e-01,2.95e-01 loss=9.1e-02,9.3e-02,1.2e-01 reg.in=1.7e-01,1.8e-01,1.8e-01 reg.out=0.0e+00,0.0e+00,0.0e+00 rank=20,20,20 resets=0 samp/s=7670 rtime=1.30 data.rt=0.11 reset.rt=0.03
-    (epoch 6/10) lr=1.0e-01 err=0.000,0.000,0.120 obj=2.72e-01,2.72e-01,2.92e-01 loss=9.1e-02,9.1e-02,1.2e-01 reg.in=1.7e-01,1.8e-01,1.8e-01 reg.out=0.0e+00,0.0e+00,0.0e+00 rank=20,20,20 resets=32 samp/s=7205 rtime=1.39 data.rt=0.12 reset.rt=0.07
-    (epoch 7/10) lr=1.0e-01 err=0.000,0.000,0.000 obj=2.71e-01,2.72e-01,2.72e-01 loss=9.1e-02,9.1e-02,9.1e-02 reg.in=1.8e-01,1.8e-01,1.8e-01 reg.out=0.0e+00,0.0e+00,0.0e+00 rank=20,20,20 resets=0 samp/s=7094 rtime=1.41 data.rt=0.12 reset.rt=0.14
-    (epoch 8/10) lr=1.0e-01 err=0.000,0.000,0.000 obj=2.71e-01,2.71e-01,2.71e-01 loss=9.1e-02,9.1e-02,9.1e-02 reg.in=1.8e-01,1.8e-01,1.8e-01 reg.out=0.0e+00,0.0e+00,0.0e+00 rank=20,20,20 resets=0 samp/s=6703 rtime=1.49 data.rt=0.11 reset.rt=0.23
-    (epoch 9/10) lr=1.0e-01 err=0.000,0.000,0.000 obj=2.71e-01,2.71e-01,2.71e-01 loss=9.1e-02,9.1e-02,9.1e-02 reg.in=1.8e-01,1.8e-01,1.8e-01 reg.out=0.0e+00,0.0e+00,0.0e+00 rank=20,20,20 resets=0 samp/s=6835 rtime=1.46 data.rt=0.11 reset.rt=0.21
-    (epoch 10/10) lr=1.0e-01 err=0.000,0.000,0.000 obj=2.72e-01,2.72e-01,2.72e-01 loss=9.1e-02,9.1e-02,9.1e-02 reg.in=1.8e-01,1.8e-01,1.8e-01 reg.out=0.0e+00,0.0e+00,0.0e+00 rank=20,20,20 resets=0 samp/s=6524 rtime=1.53 data.rt=0.11 reset.rt=0.25
+    (epoch 1/10) lr=1.0e-01 bs=100 err=0.610,0.674,0.728 obj=4.87e-01,4.92e-01,4.94e-01 loss=4.0e-01,4.1e-01,4.1e-01 reg.in=8.4e-02,8.5e-02,8.7e-02 reg.out=0.0e+00,0.0e+00,0.0e+00 resets=0 rank=20,20,20 samp/s=6692 rtime=1.50 data.rt=0.15 reset.rt=0.04
+    (epoch 2/10) lr=1.0e-01 bs=100 err=0.137,0.229,0.333 obj=3.75e-01,3.89e-01,4.05e-01 loss=2.4e-01,2.6e-01,2.8e-01 reg.in=1.3e-01,1.3e-01,1.4e-01 reg.out=0.0e+00,0.0e+00,0.0e+00 resets=0 rank=20,20,20 samp/s=6717 rtime=1.49 data.rt=0.15 reset.rt=0.04
+    (epoch 3/10) lr=1.0e-01 bs=100 err=0.001,0.083,0.126 obj=2.91e-01,3.16e-01,3.32e-01 loss=1.2e-01,1.5e-01,1.8e-01 reg.in=1.6e-01,1.6e-01,1.7e-01 reg.out=0.0e+00,0.0e+00,0.0e+00 resets=0 rank=20,20,20 samp/s=6731 rtime=1.49 data.rt=0.15 reset.rt=0.04
+    (epoch 4/10) lr=1.0e-01 bs=100 err=0.000,0.005,0.101 obj=2.73e-01,2.87e-01,2.99e-01 loss=9.4e-02,1.1e-01,1.3e-01 reg.in=1.7e-01,1.7e-01,1.8e-01 reg.out=0.0e+00,0.0e+00,0.0e+00 resets=0 rank=20,20,20 samp/s=6749 rtime=1.48 data.rt=0.15 reset.rt=0.04
+    (epoch 5/10) lr=1.0e-01 bs=100 err=0.000,0.000,0.099 obj=2.72e-01,2.73e-01,2.95e-01 loss=9.1e-02,9.3e-02,1.2e-01 reg.in=1.7e-01,1.8e-01,1.8e-01 reg.out=0.0e+00,0.0e+00,0.0e+00 resets=0 rank=20,20,20 samp/s=6755 rtime=1.48 data.rt=0.15 reset.rt=0.04
+    (epoch 6/10) lr=1.0e-01 bs=100 err=0.000,0.000,0.087 obj=2.72e-01,2.72e-01,2.92e-01 loss=9.1e-02,9.1e-02,1.2e-01 reg.in=1.7e-01,1.8e-01,1.8e-01 reg.out=0.0e+00,0.0e+00,0.0e+00 resets=4 rank=20,20,20 samp/s=6658 rtime=1.50 data.rt=0.15 reset.rt=0.05
+    (epoch 7/10) lr=1.0e-01 bs=100 err=0.000,0.000,0.000 obj=2.71e-01,2.71e-01,2.71e-01 loss=9.1e-02,9.1e-02,9.1e-02 reg.in=1.8e-01,1.8e-01,1.8e-01 reg.out=0.0e+00,0.0e+00,0.0e+00 resets=0 rank=20,20,20 samp/s=6700 rtime=1.49 data.rt=0.15 reset.rt=0.05
+    (epoch 8/10) lr=1.0e-01 bs=100 err=0.000,0.000,0.000 obj=2.72e-01,2.72e-01,2.72e-01 loss=9.1e-02,9.1e-02,9.1e-02 reg.in=1.8e-01,1.8e-01,1.8e-01 reg.out=0.0e+00,0.0e+00,0.0e+00 resets=0 rank=20,20,20 samp/s=6675 rtime=1.50 data.rt=0.15 reset.rt=0.05
+    (epoch 9/10) lr=1.0e-01 bs=100 err=0.000,0.000,0.000 obj=2.72e-01,2.72e-01,2.72e-01 loss=9.1e-02,9.1e-02,9.1e-02 reg.in=1.8e-01,1.8e-01,1.8e-01 reg.out=0.0e+00,0.0e+00,0.0e+00 resets=0 rank=20,20,20 samp/s=6676 rtime=1.50 data.rt=0.15 reset.rt=0.05
+    (epoch 10/10) lr=1.0e-01 bs=100 err=0.000,0.000,0.000 obj=2.72e-01,2.72e-01,2.72e-01 loss=9.1e-02,9.1e-02,9.1e-02 reg.in=1.8e-01,1.8e-01,1.8e-01 reg.out=0.0e+00,0.0e+00,0.0e+00 resets=0 rank=20,20,20 samp/s=6643 rtime=1.51 data.rt=0.15 reset.rt=0.05
   """
   args = synth_uos_base_args.copy()
   args['out_dir'] = '{}/base_synth_uos'.format(test_dir)
-  expected_obj = 2.715032101e-01
+  expected_obj = 2.715106308e-01
   evaluate_and_compare('base synth uos', args, expected_obj)
-
 
 def test_scale_grad_sgd():
   """Expected output:
 
-    (epoch 1/10) lr=1.0e-01 err=0.305,0.323,0.418 obj=3.97e-01,3.98e-01,4.17e-01 loss=2.6e-01,2.6e-01,2.9e-01 reg.in=1.3e-01,1.3e-01,1.4e-01 reg.out=0.0e+00,0.0e+00,0.0e+00 rank=20,20,20 resets=0 samp/s=392 rtime=25.51 data.rt=24.25 reset.rt=0.04
-    (epoch 2/10) lr=1.0e-01 err=0.000,0.011,0.097 obj=2.82e-01,2.88e-01,3.06e-01 loss=9.8e-02,1.1e-01,1.3e-01 reg.in=1.7e-01,1.8e-01,1.8e-01 reg.out=0.0e+00,0.0e+00,0.0e+00 rank=20,20,20 resets=0 samp/s=7496 rtime=1.33 data.rt=0.11 reset.rt=0.04
-    (epoch 3/10) lr=1.0e-01 err=0.000,0.000,0.031 obj=2.80e-01,2.81e-01,2.91e-01 loss=9.7e-02,9.8e-02,1.1e-01 reg.in=1.8e-01,1.8e-01,1.8e-01 reg.out=0.0e+00,0.0e+00,0.0e+00 rank=20,20,20 resets=0 samp/s=7443 rtime=1.34 data.rt=0.11 reset.rt=0.03
-    (epoch 4/10) lr=1.0e-01 err=0.000,0.000,0.000 obj=2.79e-01,2.81e-01,2.81e-01 loss=9.7e-02,9.8e-02,9.8e-02 reg.in=1.8e-01,1.8e-01,1.8e-01 reg.out=0.0e+00,0.0e+00,0.0e+00 rank=20,20,20 resets=0 samp/s=7503 rtime=1.33 data.rt=0.11 reset.rt=0.03
-    (epoch 5/10) lr=1.0e-01 err=0.000,0.000,0.000 obj=2.81e-01,2.81e-01,2.81e-01 loss=9.8e-02,9.8e-02,9.8e-02 reg.in=1.8e-01,1.8e-01,1.8e-01 reg.out=0.0e+00,0.0e+00,0.0e+00 rank=20,20,20 resets=0 samp/s=7096 rtime=1.41 data.rt=0.11 reset.rt=0.11
-    (epoch 6/10) lr=1.0e-01 err=0.000,0.000,0.000 obj=2.81e-01,2.81e-01,2.81e-01 loss=9.8e-02,9.8e-02,9.8e-02 reg.in=1.8e-01,1.8e-01,1.8e-01 reg.out=0.0e+00,0.0e+00,0.0e+00 rank=20,20,20 resets=0 samp/s=6748 rtime=1.48 data.rt=0.11 reset.rt=0.17
-    (epoch 7/10) lr=1.0e-01 err=0.000,0.000,0.000 obj=2.81e-01,2.81e-01,2.81e-01 loss=9.8e-02,9.8e-02,9.8e-02 reg.in=1.8e-01,1.8e-01,1.8e-01 reg.out=0.0e+00,0.0e+00,0.0e+00 rank=20,20,20 resets=0 samp/s=6598 rtime=1.52 data.rt=0.11 reset.rt=0.20
-    (epoch 8/10) lr=1.0e-01 err=0.000,0.000,0.000 obj=2.81e-01,2.81e-01,2.81e-01 loss=9.8e-02,9.8e-02,9.8e-02 reg.in=1.8e-01,1.8e-01,1.8e-01 reg.out=0.0e+00,0.0e+00,0.0e+00 rank=20,20,20 resets=0 samp/s=6595 rtime=1.52 data.rt=0.11 reset.rt=0.20
-    (epoch 9/10) lr=1.0e-01 err=0.000,0.000,0.000 obj=2.81e-01,2.81e-01,2.81e-01 loss=9.8e-02,9.8e-02,9.8e-02 reg.in=1.8e-01,1.8e-01,1.8e-01 reg.out=0.0e+00,0.0e+00,0.0e+00 rank=20,20,20 resets=0 samp/s=6625 rtime=1.51 data.rt=0.11 reset.rt=0.20
-    (epoch 10/10) lr=1.0e-01 err=0.000,0.000,0.000 obj=2.81e-01,2.81e-01,2.81e-01 loss=9.8e-02,9.8e-02,9.8e-02 reg.in=1.8e-01,1.8e-01,1.8e-01 reg.out=0.0e+00,0.0e+00,0.0e+00 rank=20,20,20 resets=0 samp/s=6512 rtime=1.54 data.rt=0.11 reset.rt=0.21
-
-
-    (epoch 1/10) lr=1.0e-01 err=0.306,0.382,0.427 obj=4.13e-01,4.21e-01,4.35e-01 loss=2.9e-01,3.0e-01,3.2e-01 reg.in=1.1e-01,1.1e-01,1.2e-01 reg.out=0.0e+00,0.0e+00,0.0e+00 rank=20,20,20 resets=0 samp/s=897 rtime=11.15 data.rt=9.89 reset.rt=0.03
-    (epoch 2/10) lr=1.0e-01 err=0.000,0.096,0.130 obj=2.82e-01,3.06e-01,3.16e-01 loss=1.1e-01,1.4e-01,1.5e-01 reg.in=1.6e-01,1.7e-01,1.7e-01 reg.out=0.0e+00,0.0e+00,0.0e+00 rank=20,20,20 resets=0 samp/s=7329 rtime=1.36 data.rt=0.11 reset.rt=0.03
-    (epoch 3/10) lr=1.0e-01 err=0.000,0.008,0.100 obj=2.72e-01,2.81e-01,2.96e-01 loss=9.2e-02,1.0e-01,1.2e-01 reg.in=1.7e-01,1.8e-01,1.8e-01 reg.out=0.0e+00,0.0e+00,0.0e+00 rank=20,20,20 resets=0 samp/s=7349 rtime=1.36 data.rt=0.11 reset.rt=0.03
-    (epoch 4/10) lr=1.0e-01 err=0.000,0.000,0.100 obj=2.71e-01,2.72e-01,2.95e-01 loss=9.1e-02,9.1e-02,1.2e-01 reg.in=1.7e-01,1.8e-01,1.8e-01 reg.out=0.0e+00,0.0e+00,0.0e+00 rank=20,20,20 resets=0 samp/s=7353 rtime=1.36 data.rt=0.11 reset.rt=0.03
-    (epoch 5/10) lr=1.0e-01 err=0.000,0.000,0.193 obj=2.71e-01,2.71e-01,2.90e-01 loss=9.1e-02,9.1e-02,1.2e-01 reg.in=1.7e-01,1.8e-01,1.8e-01 reg.out=0.0e+00,0.0e+00,0.0e+00 rank=20,20,20 resets=11 samp/s=187 rtime=53.62 data.rt=0.11 reset.rt=52.28
-    (epoch 6/10) lr=1.0e-01 err=0.000,0.000,0.000 obj=2.71e-01,2.71e-01,2.72e-01 loss=9.1e-02,9.1e-02,9.1e-02 reg.in=1.8e-01,1.8e-01,1.8e-01 reg.out=0.0e+00,0.0e+00,0.0e+00 rank=20,20,20 resets=0 samp/s=6742 rtime=1.48 data.rt=0.11 reset.rt=0.14
-    (epoch 7/10) lr=1.0e-01 err=0.000,0.000,0.000 obj=2.71e-01,2.71e-01,2.71e-01 loss=9.0e-02,9.0e-02,9.0e-02 reg.in=1.8e-01,1.8e-01,1.8e-01 reg.out=0.0e+00,0.0e+00,0.0e+00 rank=20,20,20 resets=0 samp/s=6402 rtime=1.56 data.rt=0.11 reset.rt=0.20
-    (epoch 8/10) lr=1.0e-01 err=0.000,0.000,0.000 obj=2.71e-01,2.71e-01,2.71e-01 loss=9.0e-02,9.0e-02,9.0e-02 reg.in=1.8e-01,1.8e-01,1.8e-01 reg.out=0.0e+00,0.0e+00,0.0e+00 rank=20,20,20 resets=0 samp/s=6481 rtime=1.54 data.rt=0.11 reset.rt=0.18
-    (epoch 9/10) lr=1.0e-01 err=0.000,0.000,0.000 obj=2.71e-01,2.71e-01,2.71e-01 loss=9.0e-02,9.0e-02,9.0e-02 reg.in=1.8e-01,1.8e-01,1.8e-01 reg.out=0.0e+00,0.0e+00,0.0e+00 rank=20,20,20 resets=0 samp/s=6394 rtime=1.56 data.rt=0.11 reset.rt=0.21
-    (epoch 10/10) lr=1.0e-01 err=0.000,0.000,0.000 obj=2.71e-01,2.71e-01,2.71e-01 loss=9.0e-02,9.0e-02,9.0e-02 reg.in=1.8e-01,1.8e-01,1.8e-01 reg.out=0.0e+00,0.0e+00,0.0e+00 rank=20,20,20 resets=0 samp/s=6420 rtime=1.56 data.rt=0.11 reset.rt=0.21
+    (epoch 1/10) lr=1.0e-01 bs=100 err=0.178,0.271,0.380 obj=3.62e-01,3.80e-01,3.99e-01 loss=2.1e-01,2.3e-01,2.6e-01 reg.in=1.4e-01,1.5e-01,1.6e-01 reg.out=0.0e+00,0.0e+00,0.0e+00 resets=0 rank=20,20,20 lip=1.09e-01,1.38e-01,1.60e-01 lip.err=0.85,0.89,0.92 samp/s=7331 rtime=1.37 data.rt=0.11 reset.rt=0.03
+    (epoch 2/10) lr=1.0e-01 bs=100 err=0.000,0.051,0.128 obj=2.83e-01,2.98e-01,3.06e-01 loss=1.0e-01,1.2e-01,1.3e-01 reg.in=1.7e-01,1.7e-01,1.8e-01 reg.out=0.0e+00,0.0e+00,0.0e+00 resets=0 rank=20,20,20 lip=1.12e-01,1.43e-01,1.75e-01 lip.err=0.90,0.90,0.93 samp/s=7369 rtime=1.36 data.rt=0.11 reset.rt=0.03
+    (epoch 3/10) lr=1.0e-01 bs=100 err=0.000,0.000,0.137 obj=2.80e-01,2.82e-01,3.03e-01 loss=9.7e-02,9.9e-02,1.3e-01 reg.in=1.7e-01,1.7e-01,1.8e-01 reg.out=0.0e+00,0.0e+00,0.0e+00 resets=0 rank=20,20,20 lip=1.21e-01,1.35e-01,1.93e-01 lip.err=0.90,0.92,0.93 samp/s=7374 rtime=1.36 data.rt=0.11 reset.rt=0.03
+    (epoch 4/10) lr=1.0e-01 bs=100 err=0.000,0.000,0.147 obj=2.82e-01,2.82e-01,3.03e-01 loss=9.8e-02,9.9e-02,1.3e-01 reg.in=1.7e-01,1.7e-01,1.8e-01 reg.out=0.0e+00,0.0e+00,0.0e+00 resets=0 rank=20,20,20 lip=1.20e-01,1.21e-01,1.95e-01 lip.err=0.89,0.92,0.92 samp/s=7410 rtime=1.35 data.rt=0.11 reset.rt=0.03
+    (epoch 5/10) lr=1.0e-01 bs=100 err=0.000,0.000,0.117 obj=2.81e-01,2.82e-01,2.96e-01 loss=9.8e-02,9.8e-02,1.2e-01 reg.in=1.8e-01,1.8e-01,1.8e-01 reg.out=0.0e+00,0.0e+00,0.0e+00 resets=26 rank=20,20,20 lip=1.29e-01,1.30e-01,1.74e-01 lip.err=0.68,0.85,0.89 samp/s=6860 rtime=1.46 data.rt=0.11 reset.rt=0.06
+    (epoch 6/10) lr=1.0e-01 bs=100 err=0.000,0.000,0.000 obj=2.80e-01,2.81e-01,2.82e-01 loss=9.7e-02,9.8e-02,9.8e-02 reg.in=1.8e-01,1.8e-01,1.8e-01 reg.out=0.0e+00,0.0e+00,0.0e+00 resets=0 rank=20,20,20 lip=1.22e-01,1.22e-01,1.23e-01 lip.err=0.91,0.92,0.93 samp/s=6829 rtime=1.46 data.rt=0.11 reset.rt=0.05
+    (epoch 7/10) lr=1.0e-01 bs=100 err=0.000,0.000,0.000 obj=2.82e-01,2.82e-01,2.82e-01 loss=9.9e-02,9.9e-02,9.9e-02 reg.in=1.8e-01,1.8e-01,1.8e-01 reg.out=0.0e+00,0.0e+00,0.0e+00 resets=0 rank=20,20,20 lip=1.20e-01,1.21e-01,1.22e-01 lip.err=0.92,0.92,0.93 samp/s=5935 rtime=1.69 data.rt=0.13 reset.rt=0.06
+    (epoch 8/10) lr=1.0e-01 bs=100 err=0.000,0.000,0.000 obj=2.82e-01,2.82e-01,2.82e-01 loss=9.9e-02,9.9e-02,9.9e-02 reg.in=1.8e-01,1.8e-01,1.8e-01 reg.out=0.0e+00,0.0e+00,0.0e+00 resets=0 rank=20,20,20 lip=1.19e-01,1.20e-01,1.22e-01 lip.err=0.91,0.92,0.93 samp/s=5960 rtime=1.68 data.rt=0.13 reset.rt=0.06
+    (epoch 9/10) lr=1.0e-01 bs=100 err=0.000,0.000,0.000 obj=2.82e-01,2.82e-01,2.82e-01 loss=9.9e-02,9.9e-02,9.9e-02 reg.in=1.8e-01,1.8e-01,1.8e-01 reg.out=0.0e+00,0.0e+00,0.0e+00 resets=0 rank=20,20,20 lip=1.20e-01,1.20e-01,1.21e-01 lip.err=0.92,0.93,0.94 samp/s=6423 rtime=1.56 data.rt=0.12 reset.rt=0.05
+    (epoch 10/10) lr=1.0e-01 bs=100 err=0.000,0.000,0.000 obj=2.82e-01,2.82e-01,2.82e-01 loss=9.9e-02,9.9e-02,9.9e-02 reg.in=1.8e-01,1.8e-01,1.8e-01 reg.out=0.0e+00,0.0e+00,0.0e+00 resets=0 rank=20,20,20 lip=1.20e-01,1.20e-01,1.21e-01 lip.err=0.92,0.92,0.93 samp/s=6374 rtime=1.57 data.rt=0.13 reset.rt=0.05
   """
   args = synth_uos_base_args.copy()
-  args['scale_grad_mode'] = 'lip'
+  args['scale_grad_lip'] = True
   args['out_dir'] = '{}/scale_grad_sgd_lip'.format(test_dir)
-  expected_obj = 2.810769677e-01
+  expected_obj = 2.820871472e-01
   evaluate_and_compare('scale grad sgd lip', args, expected_obj)
-
-  args['scale_grad_mode'] = 'newton'
-  args['out_dir'] = '{}/scale_grad_sgd_newton'.format(test_dir)
-  expected_obj = 2.714157999e-01
-  evaluate_and_compare('scale grad sgd newton', args, expected_obj)
 
 
 def test_online_synth_uos():
   """Expected output:
 
-    (epoch 1/10) lr=1.0e-01 err=0.632,0.684,0.731 obj=4.87e-01,4.91e-01,4.93e-01 loss=4.0e-01,4.1e-01,4.1e-01 reg.in=8.4e-02,8.5e-02,8.6e-02 reg.out=0.0e+00,0.0e+00,0.0e+00 rank=20,20,20 resets=0 samp/s=4550 rtime=2.20 data.rt=0.96 reset.rt=0.04
-    (epoch 2/10) lr=1.0e-01 err=0.167,0.286,0.317 obj=3.76e-01,4.02e-01,4.10e-01 loss=2.4e-01,2.7e-01,2.9e-01 reg.in=1.3e-01,1.3e-01,1.4e-01 reg.out=0.0e+00,0.0e+00,0.0e+00 rank=20,20,20 resets=0 samp/s=4598 rtime=2.17 data.rt=0.95 reset.rt=0.04
-    (epoch 3/10) lr=1.0e-01 err=0.039,0.095,0.196 obj=3.06e-01,3.16e-01,3.34e-01 loss=1.4e-01,1.5e-01,1.8e-01 reg.in=1.6e-01,1.6e-01,1.7e-01 reg.out=0.0e+00,0.0e+00,0.0e+00 rank=20,20,20 resets=0 samp/s=4622 rtime=2.16 data.rt=0.94 reset.rt=0.04
-    (epoch 4/10) lr=1.0e-01 err=0.000,0.028,0.193 obj=2.76e-01,2.96e-01,3.19e-01 loss=9.9e-02,1.2e-01,1.6e-01 reg.in=1.6e-01,1.7e-01,1.8e-01 reg.out=0.0e+00,0.0e+00,0.0e+00 rank=20,20,20 resets=0 samp/s=4629 rtime=2.16 data.rt=0.95 reset.rt=0.04
-    (epoch 5/10) lr=1.0e-01 err=0.000,0.000,0.193 obj=2.72e-01,2.75e-01,3.19e-01 loss=9.2e-02,9.6e-02,1.5e-01 reg.in=1.7e-01,1.7e-01,1.8e-01 reg.out=0.0e+00,0.0e+00,0.0e+00 rank=20,20,20 resets=0 samp/s=4622 rtime=2.16 data.rt=0.94 reset.rt=0.04
-    (epoch 6/10) lr=1.0e-01 err=0.000,0.000,0.263 obj=2.72e-01,2.72e-01,3.02e-01 loss=9.1e-02,9.2e-02,1.3e-01 reg.in=1.7e-01,1.8e-01,1.8e-01 reg.out=0.0e+00,0.0e+00,0.0e+00 rank=20,20,20 resets=35 samp/s=4552 rtime=2.20 data.rt=0.93 reset.rt=0.09
-    (epoch 7/10) lr=1.0e-01 err=0.000,0.000,0.000 obj=2.72e-01,2.72e-01,2.72e-01 loss=9.1e-02,9.2e-02,9.2e-02 reg.in=1.8e-01,1.8e-01,1.8e-01 reg.out=0.0e+00,0.0e+00,0.0e+00 rank=20,20,20 resets=0 samp/s=4325 rtime=2.31 data.rt=0.94 reset.rt=0.20
-    (epoch 8/10) lr=1.0e-01 err=0.000,0.000,0.000 obj=2.73e-01,2.73e-01,2.73e-01 loss=9.2e-02,9.2e-02,9.2e-02 reg.in=1.8e-01,1.8e-01,1.8e-01 reg.out=0.0e+00,0.0e+00,0.0e+00 rank=20,20,20 resets=0 samp/s=4265 rtime=2.34 data.rt=0.95 reset.rt=0.21
-    (epoch 9/10) lr=1.0e-01 err=0.000,0.000,0.000 obj=2.72e-01,2.72e-01,2.72e-01 loss=9.1e-02,9.1e-02,9.1e-02 reg.in=1.8e-01,1.8e-01,1.8e-01 reg.out=0.0e+00,0.0e+00,0.0e+00 rank=20,20,20 resets=0 samp/s=4152 rtime=2.41 data.rt=0.96 reset.rt=0.25
-    (epoch 10/10) lr=1.0e-01 err=0.000,0.000,0.000 obj=2.72e-01,2.72e-01,2.72e-01 loss=9.1e-02,9.1e-02,9.1e-02 reg.in=1.8e-01,1.8e-01,1.8e-01 reg.out=0.0e+00,0.0e+00,0.0e+00 rank=20,20,20 resets=0 samp/s=4224 rtime=2.37 data.rt=0.95 reset.rt=0.25
+    (epoch 1/10) lr=1.0e-01 bs=100 err=0.632,0.684,0.731 obj=4.87e-01,4.91e-01,4.93e-01 loss=4.0e-01,4.1e-01,4.1e-01 reg.in=8.4e-02,8.5e-02,8.6e-02 reg.out=0.0e+00,0.0e+00,0.0e+00 resets=0 rank=20,20,20 samp/s=4533 rtime=2.21 data.rt=0.96 reset.rt=0.03
+    (epoch 2/10) lr=1.0e-01 bs=100 err=0.166,0.286,0.317 obj=3.76e-01,4.02e-01,4.10e-01 loss=2.4e-01,2.7e-01,2.9e-01 reg.in=1.3e-01,1.3e-01,1.4e-01 reg.out=0.0e+00,0.0e+00,0.0e+00 resets=0 rank=20,20,20 samp/s=4635 rtime=2.16 data.rt=0.97 reset.rt=0.03
+    (epoch 3/10) lr=1.0e-01 bs=100 err=0.039,0.095,0.196 obj=3.06e-01,3.16e-01,3.34e-01 loss=1.4e-01,1.5e-01,1.8e-01 reg.in=1.6e-01,1.6e-01,1.7e-01 reg.out=0.0e+00,0.0e+00,0.0e+00 resets=0 rank=20,20,20 samp/s=4533 rtime=2.21 data.rt=0.98 reset.rt=0.03
+    (epoch 4/10) lr=1.0e-01 bs=100 err=0.000,0.028,0.194 obj=2.76e-01,2.96e-01,3.19e-01 loss=9.9e-02,1.2e-01,1.6e-01 reg.in=1.6e-01,1.7e-01,1.8e-01 reg.out=0.0e+00,0.0e+00,0.0e+00 resets=0 rank=20,20,20 samp/s=4588 rtime=2.18 data.rt=0.96 reset.rt=0.03
+    (epoch 5/10) lr=1.0e-01 bs=100 err=0.000,0.000,0.193 obj=2.72e-01,2.75e-01,3.19e-01 loss=9.2e-02,9.6e-02,1.5e-01 reg.in=1.7e-01,1.7e-01,1.8e-01 reg.out=0.0e+00,0.0e+00,0.0e+00 resets=0 rank=20,20,20 samp/s=4602 rtime=2.17 data.rt=0.95 reset.rt=0.03
+    (epoch 6/10) lr=1.0e-01 bs=100 err=0.000,0.000,0.189 obj=2.72e-01,2.72e-01,3.18e-01 loss=9.1e-02,9.2e-02,1.5e-01 reg.in=1.7e-01,1.8e-01,1.8e-01 reg.out=0.0e+00,0.0e+00,0.0e+00 resets=4 rank=20,20,20 samp/s=4357 rtime=2.30 data.rt=1.04 reset.rt=0.05
+    (epoch 7/10) lr=1.0e-01 bs=100 err=0.000,0.000,0.033 obj=2.72e-01,2.72e-01,2.80e-01 loss=9.1e-02,9.1e-02,1.0e-01 reg.in=1.8e-01,1.8e-01,1.8e-01 reg.out=0.0e+00,0.0e+00,0.0e+00 resets=4 rank=20,20,20 samp/s=4490 rtime=2.23 data.rt=1.01 reset.rt=0.05
+    (epoch 8/10) lr=1.0e-01 bs=100 err=0.000,0.000,0.000 obj=2.72e-01,2.72e-01,2.72e-01 loss=9.1e-02,9.1e-02,9.1e-02 reg.in=1.8e-01,1.8e-01,1.8e-01 reg.out=0.0e+00,0.0e+00,0.0e+00 resets=0 rank=20,20,20 samp/s=4529 rtime=2.21 data.rt=0.98 reset.rt=0.05
+    (epoch 9/10) lr=1.0e-01 bs=100 err=0.000,0.000,0.000 obj=2.73e-01,2.73e-01,2.73e-01 loss=9.2e-02,9.2e-02,9.2e-02 reg.in=1.8e-01,1.8e-01,1.8e-01 reg.out=0.0e+00,0.0e+00,0.0e+00 resets=0 rank=20,20,20 samp/s=4562 rtime=2.19 data.rt=0.96 reset.rt=0.05
+    (epoch 10/10) lr=1.0e-01 bs=100 err=0.000,0.000,0.000 obj=2.73e-01,2.73e-01,2.73e-01 loss=9.1e-02,9.1e-02,9.1e-02 reg.in=1.8e-01,1.8e-01,1.8e-01 reg.out=0.0e+00,0.0e+00,0.0e+00 resets=0 rank=20,20,20 samp/s=4577 rtime=2.18 data.rt=0.95 reset.rt=0.05
   """
   args = synth_uos_base_args.copy()
   args['out_dir'] = '{}/online_synth_uos'.format(test_dir)
   args['online'] = True
-  expected_obj = 2.721022069e-01
+  expected_obj = 2.725076675e-01
   evaluate_and_compare('online synth uos', args, expected_obj)
 
 
 def test_missing_data_synth_uos():
   """Expected output:
 
-    (epoch 1/2) lr=1.0e-01 err=0.744,0.793,0.812 obj=4.04e-01,4.04e-01,4.05e-01 loss=3.3e-01,3.3e-01,3.3e-01 reg.in=7.5e-02,7.6e-02,7.6e-02 reg.out=0.0e+00,0.0e+00,0.0e+00 comp.err=1.00,1.01,1.01 rank=20,20,20 resets=0 samp/s=342 rtime=29.23 data.rt=0.24 reset.rt=0.04
-    (epoch 2/2) lr=1.0e-01 err=0.395,0.559,0.621 obj=3.57e-01,3.68e-01,3.71e-01 loss=2.5e-01,2.7e-01,2.7e-01 reg.in=9.9e-02,1.0e-01,1.1e-01 reg.out=0.0e+00,0.0e+00,0.0e+00 comp.err=0.90,0.94,0.94 rank=20,20,20 resets=0 samp/s=346 rtime=28.93 data.rt=0.20 reset.rt=0.04
+    (epoch 1/2) lr=1.0e-01 bs=100 err=0.744,0.792,0.812 obj=4.04e-01,4.04e-01,4.05e-01 loss=3.3e-01,3.3e-01,3.3e-01 reg.in=7.5e-02,7.6e-02,7.6e-02 reg.out=0.0e+00,0.0e+00,0.0e+00 resets=0 rank=20,20,20 comp.err=1.00,1.01,1.01 samp/s=347 rtime=28.80 data.rt=0.24 reset.rt=0.03
+    (epoch 2/2) lr=1.0e-01 bs=100 err=0.395,0.559,0.621 obj=3.57e-01,3.68e-01,3.71e-01 loss=2.5e-01,2.7e-01,2.7e-01 reg.in=9.9e-02,1.0e-01,1.1e-01 reg.out=0.0e+00,0.0e+00,0.0e+00 resets=0 rank=20,20,20 comp.err=0.90,0.94,0.94 samp/s=341 rtime=29.35 data.rt=0.20 reset.rt=0.03
   """
   args = synth_uos_base_args.copy()
   args['out_dir'] = '{}/missing_data_synth_uos'.format(test_dir)
@@ -174,8 +162,8 @@ def test_missing_data_synth_uos():
 def test_dense_missing_data_synth_uos():
   """Expected output:
 
-    (epoch 1/2) lr=1.0e-01 err=0.744,0.793,0.812 obj=4.04e-01,4.04e-01,4.05e-01 loss=3.3e-01,3.3e-01,3.3e-01 reg.in=7.5e-02,7.6e-02,7.6e-02 reg.out=0.0e+00,0.0e+00,0.0e+00 comp.err=1.00,1.01,1.01 rank=20,20,20 resets=0 samp/s=686 rtime=14.58 data.rt=0.17 reset.rt=0.04
-    (epoch 2/2) lr=1.0e-01 err=0.395,0.559,0.621 obj=3.57e-01,3.68e-01,3.71e-01 loss=2.5e-01,2.7e-01,2.7e-01 reg.in=9.9e-02,1.0e-01,1.1e-01 reg.out=0.0e+00,0.0e+00,0.0e+00 comp.err=0.90,0.94,0.94 rank=20,20,20 resets=0 samp/s=699 rtime=14.32 data.rt=0.18 reset.rt=0.03
+    (epoch 1/2) lr=1.0e-01 bs=100 err=0.744,0.792,0.812 obj=4.04e-01,4.04e-01,4.05e-01 loss=3.3e-01,3.3e-01,3.3e-01 reg.in=7.5e-02,7.6e-02,7.6e-02 reg.out=0.0e+00,0.0e+00,0.0e+00 resets=0 rank=20,20,20 comp.err=1.00,1.01,1.01 samp/s=676 rtime=14.80 data.rt=0.19 reset.rt=0.03
+    (epoch 2/2) lr=1.0e-01 bs=100 err=0.395,0.559,0.621 obj=3.57e-01,3.68e-01,3.71e-01 loss=2.5e-01,2.7e-01,2.7e-01 reg.in=9.9e-02,1.0e-01,1.1e-01 reg.out=0.0e+00,0.0e+00,0.0e+00 resets=0 rank=20,20,20 comp.err=0.90,0.94,0.94 samp/s=674 rtime=14.85 data.rt=0.16 reset.rt=0.03
   """
   args = synth_uos_base_args.copy()
   args['out_dir'] = '{}/dense_missing_data_synth_uos'.format(test_dir)
@@ -186,6 +174,29 @@ def test_dense_missing_data_synth_uos():
   args['epochs'] = 2
   expected_obj = 3.568494022e-01
   evaluate_and_compare('dense missing data synth uos', args, expected_obj)
+
+
+def test_synth_kmeans_sgd():
+  """Expected output:
+
+    (epoch 1/10) lr=1.0e-01 bs=100 err=0.213,0.295,0.500 obj=9.68e-01,1.03e+00,1.18e+00 loss=9.7e-01,1.0e+00,1.2e+00 reg.in=0.0e+00,0.0e+00,0.0e+00 reg.out=0.0e+00,0.0e+00,0.0e+00 resets=0 rank=1,1,1 samp/s=21502 rtime=0.47 data.rt=0.11 reset.rt=0.03
+    (epoch 2/10) lr=1.0e-01 bs=100 err=0.200,0.205,0.499 obj=6.86e-01,7.31e-01,1.06e+00 loss=6.9e-01,7.3e-01,1.1e+00 reg.in=0.0e+00,0.0e+00,0.0e+00 reg.out=0.0e+00,0.0e+00,0.0e+00 resets=0 rank=1,1,1 samp/s=21364 rtime=0.47 data.rt=0.11 reset.rt=0.03
+    (epoch 3/10) lr=1.0e-01 bs=100 err=0.200,0.200,0.499 obj=6.81e-01,7.24e-01,1.06e+00 loss=6.8e-01,7.2e-01,1.1e+00 reg.in=0.0e+00,0.0e+00,0.0e+00 reg.out=0.0e+00,0.0e+00,0.0e+00 resets=0 rank=1,1,1 samp/s=21430 rtime=0.47 data.rt=0.11 reset.rt=0.03
+    (epoch 4/10) lr=1.0e-01 bs=100 err=0.200,0.200,0.417 obj=6.81e-01,7.23e-01,9.73e-01 loss=6.8e-01,7.2e-01,9.7e-01 reg.in=0.0e+00,0.0e+00,0.0e+00 reg.out=0.0e+00,0.0e+00,0.0e+00 resets=5 rank=1,1,1 samp/s=21139 rtime=0.47 data.rt=0.11 reset.rt=0.04
+    (epoch 5/10) lr=1.0e-01 bs=100 err=0.100,0.198,0.294 obj=6.21e-01,6.91e-01,8.06e-01 loss=6.2e-01,6.9e-01,8.1e-01 reg.in=0.0e+00,0.0e+00,0.0e+00 reg.out=0.0e+00,0.0e+00,0.0e+00 resets=17 rank=1,1,1 samp/s=20668 rtime=0.48 data.rt=0.11 reset.rt=0.05
+    (epoch 6/10) lr=1.0e-01 bs=100 err=0.000,0.000,0.100 obj=5.00e-01,5.00e-01,6.11e-01 loss=5.0e-01,5.0e-01,6.1e-01 reg.in=0.0e+00,0.0e+00,0.0e+00 reg.out=0.0e+00,0.0e+00,0.0e+00 resets=4 rank=1,1,1 samp/s=20826 rtime=0.48 data.rt=0.11 reset.rt=0.04
+    (epoch 7/10) lr=1.0e-01 bs=100 err=0.000,0.000,0.022 obj=5.00e-01,5.00e-01,5.23e-01 loss=5.0e-01,5.0e-01,5.2e-01 reg.in=0.0e+00,0.0e+00,0.0e+00 reg.out=0.0e+00,0.0e+00,0.0e+00 resets=2 rank=1,1,1 samp/s=21004 rtime=0.48 data.rt=0.11 reset.rt=0.04
+    (epoch 8/10) lr=1.0e-01 bs=100 err=0.000,0.000,0.000 obj=5.00e-01,5.00e-01,5.00e-01 loss=5.0e-01,5.0e-01,5.0e-01 reg.in=0.0e+00,0.0e+00,0.0e+00 reg.out=0.0e+00,0.0e+00,0.0e+00 resets=0 rank=1,1,1 samp/s=20971 rtime=0.48 data.rt=0.11 reset.rt=0.04
+    (epoch 9/10) lr=1.0e-01 bs=100 err=0.000,0.000,0.000 obj=5.00e-01,5.00e-01,5.00e-01 loss=5.0e-01,5.0e-01,5.0e-01 reg.in=0.0e+00,0.0e+00,0.0e+00 reg.out=0.0e+00,0.0e+00,0.0e+00 resets=0 rank=1,1,1 samp/s=21012 rtime=0.48 data.rt=0.11 reset.rt=0.04
+    (epoch 10/10) lr=1.0e-01 bs=100 err=0.000,0.000,0.000 obj=5.00e-01,5.00e-01,5.00e-01 loss=5.0e-01,5.0e-01,5.0e-01 reg.in=0.0e+00,0.0e+00,0.0e+00 reg.out=0.0e+00,0.0e+00,0.0e+00 resets=0 rank=1,1,1 samp/s=20961 rtime=0.48 data.rt=0.11 reset.rt=0.04
+  """
+  args = synth_uos_base_args.copy()
+  args['setting'] = 'synth-kmeans'
+  args['out_dir'] = '{}/synth_kmeans_sgd'.format(test_dir)
+  args['sep'] = 2.0
+  args['b_frosqr_out_lamb'] = 0.0
+  expected_obj = 4.998686910e-01
+  evaluate_and_compare('base synth uos', args, expected_obj)
 
 
 def evaluate_and_compare(test_name, args, expected_obj):

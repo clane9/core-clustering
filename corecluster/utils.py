@@ -247,82 +247,24 @@ def assign_and_value(assign_obj, compute_c=True):
   return groups, min_assign_obj, c, c_mean, value
 
 
-def find_soft_assign(losses, T=1.):
-  """soft assignment found by shifting up negative losses by T, thresholding
-  and normalizing.
+def update_ema_metric(val, ema, ema_decay=0.99, inplace=True):
+  """Update an exponential moving average tensor.
 
   Args:
-    losses (Tensor): (Nb, n) matrix of loss values.
-    T (float): soft assignment parameter in (0, \infty).
-
-  .. note::
-    For any T there is a tau such that the returned c is a solution to
-
-      min_c c^T l  s.t.  c >= 0, c^T 1 = 1, ||c||_2^2 <= tau
-
-    Since the optimality conditions of this problem yield
-
-      c^* = 1/gamma( lambda \1 - l)_+
-
-    for gamma, lambda Lagrange multipliers.
-  """
-  if T <= 0:
-    raise ValueError("soft assignment T must be > 0.")
-  # normalize loss to that T has consistent interpretation.
-  # NOTE: minimum loss can't be exactly zero
-  loss_min, _ = losses.min(dim=1, keepdim=True)
-  losses = losses.div(loss_min)
-  c = torch.clamp(T + 1. - losses, min=0.)
-  c = c.div(c.sum(dim=1, keepdim=True))
-  return c
-
-
-def coherence(U1, U2, normalize=False, svd=False, sv_tol=None):
-  """Compute coherence between U1, U2.
-
-  Args:
-    U1, U2: (D x d) matrices
-    normalize: normalize columns of U1, U2 (default: False)
-    svd: Orthogonalize bases by svd (default: False)
-    sv_tol: Singular value threshold (default: None)
+    val: current value.
+    ema: moving average (possibly with nan entries).
+    ema_decay: (default: 0.99)
+    inplace: (default: True)
 
   Returns:
-    coh: scalar coherence loss
+    ema
   """
-  d = U1.size(1)
-  if normalize:
-    U1 = unit_normalize(U1, p=2, dim=0)
-    U2 = unit_normalize(U2, p=2, dim=0)
-  if svd:
-    U1, s1, _ = torch.svd(U1)
-    U2, s2, _ = torch.svd(U2)
-    if sv_tol is not None and sv_tol > 0:
-      U1 = U1[:, (s1 >= sv_tol*s1[0])]
-      U2 = U2[:, (s2 >= sv_tol*s2[0])]
-      d = min(U1.size(1), U2.size(1))
-  coh = torch.matmul(U1.t(), U2).pow(2).sum().div(d)
-  return coh
-
-
-def eval_cluster_coherence(Us, normalize=False, svd=True, sv_tol=1e-3):
-  """Evaluate coherence for every pair of subspace bases
-
-  Args:
-    Us: subspace bases, shape (k, D, d)
-    normalize: normalize columns of U1, U2 (default: False)
-    svd: Orthogonalize bases by svd (default: True)
-    sv_tol: Singular value threshold (default: 1e-3)
-
-  Returns:
-    coh_mat: coherence matrix, shape (k, k)
-  """
-  with torch.no_grad():
-    k = Us.shape[0]
-    coh_mat = np.array([[
-        coherence(Us[ii, :], Us[jj, :], normalize=False,
-            svd=True, sv_tol=sv_tol).item()
-        for jj in range(k)] for ii in range(k)])
-  return coh_mat
+  if not inplace:
+    ema = torch.clone(ema)
+  nan_mask = torch.isnan(ema)
+  ema[nan_mask] = val[nan_mask]
+  ema.mul_(ema_decay).add_(1-ema_decay, val)
+  return ema
 
 
 def cos_knn(y, X, k, normalize=False):
@@ -333,7 +275,7 @@ def cos_knn(y, X, k, normalize=False):
     X: dataset, shape (N, D).
 
   Returns:
-    y_nn: nearest neighbors, shape (n, k, D)
+    knnIdx: indices of nearest neighbors, shape (n, k).
   """
   with torch.no_grad():
     if y.dim() == 1:
@@ -345,10 +287,8 @@ def cos_knn(y, X, k, normalize=False):
     # (N, n)
     cos_abs = torch.matmul(X, y.t()).abs()
     # (n, k)
-    Idx = (torch.topk(cos_abs, k, dim=0)[1]).t()
-    # (n, k, D)
-    y_knn = X[Idx, :]
-  return y_knn
+    knnIdx = (torch.topk(cos_abs, k, dim=0)[1]).t()
+  return knnIdx
 
 
 def unit_normalize(X, p=2, dim=None):
@@ -364,6 +304,18 @@ def unit_normalize(X, p=2, dim=None):
   """
   unitX = X.div(torch.norm(X, p=p, dim=dim, keepdim=True).add(EPS))
   return unitX
+
+
+def shift_and_zero(buf):
+  """Shift 1 -> 0, and zero out 1."""
+  buf[0, :] = buf[1, :]
+  buf[1, :] = 0.0
+  return buf
+
+
+def min_med_max(x):
+  """Compute min, median, max of tensor x."""
+  return [x.min().item(), x.median().item(), x.max().item()]
 
 
 def batch_svd(X, out=None):

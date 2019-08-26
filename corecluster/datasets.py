@@ -282,7 +282,9 @@ class SynthKMeansDataset(Dataset):
       self.separation = separation
 
     self.rng = np.random.RandomState(seed=seed)
-    self.bs = (self.separation / np.sqrt(2)) * self.rng.randn(k, D)
+    # will have EE ||b_i - b_j||_2 ~= separation
+    self.bs = ((self.separation / (np.sqrt(2)*np.sqrt(D))) *
+        self.rng.randn(k, D))
 
     dists = np.sqrt(np.sum((np.expand_dims(self.bs, 1) -
         np.expand_dims(self.bs, 0))**2, axis=2))
@@ -291,7 +293,8 @@ class SynthKMeansDataset(Dataset):
 
     self.X = self.bs.repeat(Ng, axis=0)
     self.groups = np.arange(k, dtype=np.int32).repeat(Ng)
-    self.X += self.rng.randn(Ng*k, D)
+    # will have EE || x_i - b ||_2 = 1
+    self.X += (1/np.sqrt(D)) * self.rng.randn(Ng*k, D)
 
     # permute order of data
     self.perm = self.rng.permutation(self.N)
@@ -307,6 +310,28 @@ class SynthKMeansDataset(Dataset):
 
   def __getitem__(self, ii):
     return self.X[ii, :], self.groups[ii]
+
+
+class SynthKMeansOnlineDataset(SynthKMeansDataset):
+  """Synthetic k means dataset with fresh samples."""
+  def __init__(self, k, D, N, separation=2.0, seed=None):
+    super().__init__(k, D, 10, separation, seed)
+    self.bs = torch.tensor(self.bs, dtype=torch.float32)
+    self.N = N
+
+    # parent constructor called to generate centers, but X, groups don't matter
+    self.X = None
+    self.perm = None
+    self.groups = None
+    return
+
+  def __len__(self):
+    return self.N
+
+  def __getitem__(self, ii):
+    grp = torch.randint(high=self.k, size=(1,), dtype=torch.int64)[0]
+    x = self.bs[grp, :] + torch.randn(self.D).div(np.sqrt(self.D))
+    return x, grp
 
 
 class NetflixDataset(Dataset):

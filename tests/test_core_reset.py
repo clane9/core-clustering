@@ -55,7 +55,7 @@ def test_core_reset(assign_obj_and_reg_out):
   k, d, D, r, cache_size = 4, 2, 20, 8, 200
   assign_obj, reg_out = assign_obj_and_reg_out
 
-  mf_model = mod.KSubspaceMFModel(k, d, D, affine=False, replicates=r,
+  mf_model = mod.KSubspaceMFModel(k=k, d=d, D=D, affine=False, replicates=r,
       reset_patience=20, reset_try_tol=-1, reset_max_steps=10,
       reset_accept_tol=1e-3, reset_cache_size=cache_size)
 

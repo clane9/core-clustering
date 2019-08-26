@@ -11,6 +11,7 @@ import shutil
 import json
 import time
 
+import numpy as np
 import torch
 from torch.utils.data import DataLoader
 from torch.optim.lr_scheduler import LambdaLR
@@ -24,38 +25,30 @@ from corecluster import utils as ut
 
 def eval_core_clustering(args):
   # setting some potentially undefined args depending on setting
-  default_args = [('init', 'random'), ('form', 'mf'), ('miss_rate', 0.0),
-      ('eval_rank', False)]
+  default_args = [('init', 'random'), ('form', 'mf')]
   for arg, val in default_args:
     setattr(args, arg, getattr(args, arg, val))
 
-  # error checking, in no particular order
-  if args.setting == 'synth-uos' and args.online and args.optim == 'batch-alt':
-    raise ValueError(("Online mode not compatible with batch-alt "
-        "optimization."))
+  uos_mode = args.setting != 'synth-kmeans'
+  batch_mode = args.optim == 'batch-alt'
+  online_mode = args.setting in {'synth-uos', 'synth-kmeans'} and args.online
   mc_mode = ((args.setting == 'synth-uos' and args.miss_rate > 0) or
       args.setting == 'movie-mc-uos')
-  if mc_mode:
-    if args.optim == 'batch-alt' or args.form == 'proj':
-      raise ValueError(("batch-alt optimization and proj form not compatible "
-          " with missing data."))
-    if args.init != 'random':
-      raise ValueError("only random initialization supported in MC setting.")
-  uos_mode = args.setting != 'synth-kmeans'
-  if uos_mode:
-    if args.form == 'proj' and args.scale_grad_mode in {'lip', 'newton'}:
-      raise ValueError("proj formulation not compatible with grad scaling.")
-    if args.affine and args.scale_grad_mode in {'lip', 'newton'}:
-      raise ValueError("affine setting not compatible with grad scaling.")
-    if args.form == 'proj' and args.init != 'random':
-      raise ValueError(("proj formulation only compatible with random "
-          "initialization."))
-  if not uos_mode and args.init == 'pca':
-    raise ValueError("pca initialization not compatible with k-means.")
-  real_data_mode = args.setting in {'img-uos', 'movie-mc-uos'}
-  if real_data_mode:
-    if args.model_d is None or args.model_d <= 0:
-      raise ValueError("model dimension is actually required for real data.")
+  real_mode = args.setting in {'img-uos', 'movie-mc-uos'}
+  scale_grad_mode = args.scale_grad_lip and not batch_mode
+
+  # error checking, in no particular order, not too organized...
+  if online_mode and batch_mode:
+    raise ValueError(("Online data not compatible with batch-alt "
+        "optimization."))
+  if mc_mode and (batch_mode or args.form == 'proj' or args.init == 'pfi'):
+    raise ValueError(("batch-alt optimization, proj form, PFI initialization "
+        "not compatible with missing data."))
+  if scale_grad_mode and uos_mode and (args.form == 'proj' or args.affine):
+    raise ValueError(("proj form, affine setting not compatible with grad "
+        "scaling."))
+  if real_mode and (args.model_d is None or args.model_d <= 0):
+    raise ValueError("model dimension is required for real data.")
 
   use_cuda = args.cuda and torch.cuda.is_available()
   device = torch.device('cuda' if use_cuda else 'cpu')
@@ -66,7 +59,7 @@ def eval_core_clustering(args):
     shutil.rmtree(args.out_dir)
   os.makedirs(args.out_dir)
 
-  # save args
+  # save args, before later modifications
   with open('{}/args.json'.format(args.out_dir), 'w') as f:
     json.dump(args.__dict__, f, sort_keys=True, indent=4)
 
@@ -86,7 +79,7 @@ def eval_core_clustering(args):
     store_sparse = args.sparse_encode or args.sparse_decode
 
   # shuffling not necessary for online data.
-  shuffle_data = not (args.setting == 'synth-uos' and args.online)
+  shuffle_data = not online_mode
 
   if args.setting == 'synth-uos':
     dataset = dat.generate_synth_uos_dataset(args.k, args.d, args.D, args.Ng,
@@ -101,15 +94,17 @@ def eval_core_clustering(args):
     dataset = dat.NetflixDataset(dataset=args.mc_dataset, center=args.center,
         normalize=args.normalize, store_sparse=store_sparse,
         store_dense=store_dense)
+  elif args.setting == 'synth-kmeans' and online_mode:
+    dataset = dat.SynthKMeansOnlineDataset(args.k, args.D, args.N,
+        separation=args.sep, seed=args.data_seed)
   elif args.setting == 'synth-kmeans':
     dataset = dat.SynthKMeansDataset(args.k, args.D, args.Ng,
         separation=args.sep, seed=args.data_seed)
   else:
-    raise ValueError("Invalid setting {}".format(args.setting))
+    raise ValueError("Invalid data setting {}".format(args.setting))
 
-  if args.setting == 'synth-kmeans' or args.optim == 'batch-alt':
-    data_loader = None
-    bs_scheduler = None
+  if batch_mode:
+    data_loader, bs_scheduler = None, None
   else:
     kwargs = {'num_workers': args.num_workers,
         'batch_size': args.init_bs, 'shuffle': shuffle_data,
@@ -155,81 +150,90 @@ def eval_core_clustering(args):
   else:
     reg_params = {'b_frosqr_out': args.b_frosqr_out_lamb}
 
-  if args.init in {'pfi', 'pca'}:
-    initN = args.reset_cache_size
-    if initN < dataset.N:
-      Idx = torch.randperm(dataset.N)[:initN]
-      initX = dataset.X[Idx]
-    else:
-      initX = dataset.X
-    initX = initX.to(device)
-  else:
-    initX = None
-
   reset_kwargs = dict(reset_patience=args.reset_patience,
       reset_try_tol=args.reset_try_tol,
       reset_max_steps=args.reset_steps,
       reset_accept_tol=args.reset_accept_tol,
       reset_cache_size=args.reset_cache_size)
 
-  if uos_mode:
-    if args.optim == 'batch-alt':
-      if args.form == 'mf':
-        model = mod.KSubspaceBatchAltMFModel(args.model_k, args.model_d,
-            dataset, affine=args.affine, replicates=args.reps,
-            reg_params=reg_params, svd_solver='randomized', init=args.init,
-            **reset_kwargs)
-      else:
-        model = mod.KSubspaceBatchAltProjModel(args.model_k, args.model_d,
-            dataset, affine=args.affine, replicates=args.reps,
-            reg_params=reg_params, svd_solver='randomized', **reset_kwargs)
-    else:
-      if args.miss_rate > 0:
-        model = mod.KSubspaceMCModel(args.model_k, args.model_d, dataset.D,
-            affine=args.affine, replicates=args.reps, reg_params=reg_params,
-            scale_grad_mode=args.scale_grad_mode,
-            scale_grad_update_freq=args.scale_grad_update_freq,
-            sparse_encode=args.sparse_encode,
-            sparse_decode=args.sparse_decode, **reset_kwargs)
-      elif args.form == 'mf':
-        model = mod.KSubspaceMFModel(args.model_k, args.model_d, dataset.D,
-            affine=args.affine, replicates=args.reps, reg_params=reg_params,
-            scale_grad_mode=args.scale_grad_mode,
-            scale_grad_update_freq=args.scale_grad_update_freq, init=args.init,
-            **reset_kwargs)
-      else:
-        model = mod.KSubspaceProjModel(args.model_k, args.model_d, dataset.D,
-            affine=args.affine, replicates=args.reps, reg_params=reg_params,
-            **reset_kwargs)
+  if uos_mode and batch_mode and args.form == 'mf':
+    model = mod.KSubspaceBatchAltMFModel(k=args.model_k, d=args.model_d,
+        dataset=dataset, affine=args.affine, replicates=args.reps,
+        reg_params=reg_params, svd_solver='randomized', **reset_kwargs)
+  elif uos_mode and batch_mode and args.form == 'proj':
+    model = mod.KSubspaceBatchAltProjModel(k=args.model_k, d=args.model_d,
+        dataset=dataset, affine=args.affine, replicates=args.reps,
+        reg_params=reg_params, svd_solver='randomized', **reset_kwargs)
+  elif uos_mode and mc_mode:
+    model = mod.KSubspaceMCModel(k=args.model_k, d=args.model_d, D=dataset.D,
+        affine=args.affine, replicates=args.reps, reg_params=reg_params,
+        scale_grad_lip=args.scale_grad_lip, sparse_encode=args.sparse_encode,
+        sparse_decode=args.sparse_decode, **reset_kwargs)
+  elif uos_mode and args.form == 'mf':
+    model = mod.KSubspaceMFModel(k=args.model_k, d=args.model_d, D=dataset.D,
+        affine=args.affine, replicates=args.reps, reg_params=reg_params,
+        scale_grad_lip=args.scale_grad_lip, **reset_kwargs)
+  elif uos_mode and args.form == 'proj':
+    model = mod.KSubspaceProjModel(k=args.model_k, d=args.model_d, D=dataset.D,
+        affine=args.affine, replicates=args.reps, reg_params=reg_params,
+        **reset_kwargs)
+  elif not uos_mode and batch_mode:
+    model = mod.KMeansBatchAltModel(k=args.model_k, dataset=dataset,
+        replicates=args.reps, reg_params=reg_params, **reset_kwargs)
+  elif not uos_mode:
+    model = mod.KMeansModel(k=args.model_k, D=dataset.D, replicates=args.reps,
+        reg_params=reg_params, scale_grad_lip=args.scale_grad_lip,
+        **reset_kwargs)
   else:
-    model = mod.KMeansBatchAltModel(args.model_k, dataset,
-        replicates=args.reps, reg_params=reg_params, init=args.init,
-        kpp_n_trials=args.kpp_n_trials, **reset_kwargs)
+    raise ValueError("Invalid model setting.")
+
   model = model.to(device)
-  if initX is not None:
-    model.reset_parameters(initX=initX)
-    initX = None
-  else:
-    model.reset_parameters()
+
+  # PFI initialization
+  if args.init == 'pfi':
+    # construct pfi initialization dataset
+    if args.pfi_init_size is None or args.pfi_init_size <= 0:
+      args.pfi_init_size = args.reset_cache_size
+    args.pfi_init_size = min(args.pfi_init_size, dataset.N)
+
+    if data_loader is not None:
+      initX = torch.zeros(args.pfi_init_size, dataset.D)
+      init_head = 0
+      for x, _ in data_loader:
+        append_size = min(args.pfi_init_size - init_head, x.shape[0])
+        initX[init_head: (init_head+append_size), :] = x[:append_size, :]
+        init_head += append_size
+        if init_head >= args.pfi_init_size:
+          break
+    else:
+      Idx = torch.randperm(dataset.N)[:args.pfi_init_size]
+      initX = dataset.X[Idx, :]
+    initX = initX.to(device)
+
+    if uos_mode:
+      # normalize data
+      initX = initX.div(torch.norm(initX, p=2, dim=1, keepdim=True).add(1e-8))
+      fit_kwargs = {'nn_q': int(np.ceil(0.1*args.model_d)), 'normalize': False}
+    else:
+      fit_kwargs = dict()
+
+    model.pfi_init(initX, pfi_n_cands=args.pfi_n_cands, fit_kwargs=fit_kwargs)
+
   init_time = time.time() - model_tic
 
   # optimizer
-  if not uos_mode or args.epoch_size is None or args.epoch_size <= 0:
+  if args.epoch_size is None or args.epoch_size <= 0:
     args.epoch_size = len(dataset)
 
-  if not uos_mode or args.optim == 'batch-alt':
-    optimizer = None
-    lr_scheduler = None
+  if batch_mode:
+    optimizer, lr_scheduler = None, None
   else:
-    if args.scale_grad_mode == 'newton':
-      optimizer = torch.optim.SGD(model.parameters(), lr=args.init_lr,
-          momentum=0.0)
-    elif args.optim == 'sgd':
+    if args.optim == 'sgd':
       optimizer = torch.optim.SGD(model.parameters(), lr=args.init_lr,
           momentum=0.9, nesterov=True)
     elif args.optim == 'adam':
       optimizer = torch.optim.Adam(model.parameters(), lr=args.init_lr,
-          betas=(0.9, 0.9), amsgrad=True)
+          betas=(0.9, 0.999), amsgrad=True)
     else:
       raise ValueError("Invalid optimizer {}.".format(args.optim))
 
@@ -249,7 +253,7 @@ def eval_core_clustering(args):
   return tr.train_loop(model, data_loader, device, optimizer, args.out_dir,
       args.epochs, args.chkp_freq, args.stop_freq, lr_scheduler=lr_scheduler,
       bs_scheduler=bs_scheduler, epoch_size=args.epoch_size,
-      eval_rank=args.eval_rank, core_reset=args.core_reset,
+      core_reset=args.core_reset, eval_rank=args.eval_rank,
       save_data=args.save_large_data, init_time=init_time)
 
 
@@ -269,11 +273,11 @@ def generate_parser():
   parser_km = subparsers.add_parser('synth-kmeans',
       help='Synthetic k-means setting')
 
-  model_args = ['form', 'init', 'model-k', 'model-d', 'auto-reg', 'sigma-hat',
+  uos_model_args = ['form', 'model-k', 'model-d', 'auto-reg', 'sigma-hat',
       'min-size', 'U-frosqr-in-lamb', 'U-frosqr-out-lamb', 'z-lamb']
-  opt_args = ['epochs', 'epoch-size', 'optim', 'init-lr', 'lr-step-size',
-      'lr-gamma', 'lr-min', 'init-bs', 'bs-step-size', 'bs-gamma', 'bs-max']
-  scale_grad_args = ['scale-grad-mode', 'scale-grad-update-freq']
+  opt_args = ['init', 'pfi-init-size', 'pfi-n-cands', 'epochs', 'epoch-size',
+      'optim', 'init-lr', 'lr-step-size', 'lr-gamma', 'lr-min', 'init-bs',
+      'bs-step-size', 'bs-gamma', 'bs-max', 'scale-grad-lip']
   sparse_args = ['sparse-encode', 'sparse-decode']
   reset_args = ['reps', 'core-reset', 'reset-patience', 'reset-try-tol',
       'reset-steps', 'reset-accept-tol', 'reset-cache-size']
@@ -282,21 +286,21 @@ def generate_parser():
 
   conf.add_args(parser_uos,
       ['out-dir', 'k', 'd', 'D', 'Ng', 'N', 'affine', 'sigma', 'theta',
-      'miss-rate', 'online', 'normalize'] + model_args + opt_args +
-      scale_grad_args + sparse_args + reset_args + generic_args)
+      'miss-rate', 'online', 'normalize'] + uos_model_args + opt_args +
+      sparse_args + reset_args + generic_args)
 
   conf.add_args(parser_img,
       ['out-dir', 'img-dataset', 'center', 'normalize', 'sv-range', 'affine'] +
-      model_args + opt_args + scale_grad_args + reset_args + generic_args)
+      uos_model_args + opt_args + reset_args + generic_args)
 
   conf.add_args(parser_mc,
       ['out-dir', 'mc-dataset', 'center', 'normalize', 'affine'] +
-      model_args[2:] + opt_args + scale_grad_args + sparse_args + reset_args +
+      uos_model_args[1:] + opt_args[3:] + sparse_args + reset_args +
       generic_args)
 
   conf.add_args(parser_km,
-      ['out-dir', 'k', 'D', 'Ng', 'N', 'sep', 'init', 'kpp-n-trials',
-      'model-k', 'b-frosqr-out-lamb', 'epochs'] + reset_args + generic_args)
+      ['out-dir', 'k', 'D', 'Ng', 'N', 'sep', 'online', 'model-k',
+      'b-frosqr-out-lamb'] + opt_args + reset_args + generic_args)
   return parser
 
 
