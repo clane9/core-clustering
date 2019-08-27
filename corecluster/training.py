@@ -148,7 +148,10 @@ def train_loop(model, data_loader, device, optimizer, out_dir=None, epochs=200,
           print(logformstr.format(epoch, lr, bs, *metrics_summary), file=f)
       print(printformstr.format(epoch, epochs, lr, bs, *metrics_summary))
 
-      is_conv = model._updates == 0 if batch_mode else epoch == epochs
+      waiting_to_reset = (core_reset and
+          (model.num_bad_steps[1, :] <= 3*model.reset_patience).any().item())
+      is_conv = ((model._updates == 0 and not waiting_to_reset) if batch_mode
+          else epoch == epochs)
       save_chkp = (out_dir is not None and
           (epoch % chkp_freq == 0 or (is_conv and chkp_freq <= epochs)))
       if save_chkp:
@@ -330,6 +333,8 @@ def batch_alt_step(model, eval_cluster_error=True, core_reset=False,
   if core_reset:
     reset_tic = time.time()
     resets = model.core_reset()
+    if resets.shape[0] > 0:
+      resets = np.insert(resets, 0, 1, axis=1)
     reset_rtime = time.time() - reset_tic
   else:
     resets, reset_rtime = None, 0.0
@@ -378,8 +383,9 @@ def _cluster_error_summary(eval_cluster_error, conf_mats, model):
 
 def _resets_summary(core_reset, resets, model):
   if core_reset:
-    resets = (np.concatenate(resets) if len(resets) > 0
-        else np.zeros((0, RESET_NCOL+1), dtype=object))
+    if type(resets) is list:
+      resets = (np.concatenate(resets) if len(resets) > 0
+          else np.zeros((0, RESET_NCOL+1), dtype=object))
     reset_count = resets.shape[0]
     rep_reset_counts = np.zeros((1, model.replicates))
     if reset_count > 0:

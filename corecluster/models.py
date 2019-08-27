@@ -861,7 +861,23 @@ class KSubspaceBatchAltBaseModel(KSubspaceBaseModel):
     if update_cache:
       self._updates = ((self.groups != groups_prev).sum()
           if groups_prev is not None else self.N)
+      # overwrite ema with current objective, since computed on full-batch
+      self.obj_ema.copy_(obj_vals[1])
     return obj_vals
+
+  def _update_forward_cache(self, z, x_, reg_out, assign_obj, c_mean, value):
+    """Cache loss, reg, obj values computed during forward."""
+    self._z = z.data if self.cache_z else None
+    self._x_ = x_.data if self.cache_x_ else None
+    self._reg_out_per_cluster = reg_out.data
+
+    # cached assignment objectives used in CoRe
+    self._update_assign_obj_cache(assign_obj)
+
+    # cluster size, value, shape (r,)
+    self.c_mean.copy_(c_mean)
+    self.value.copy_(value)
+    return
 
 
 class KSubspaceBatchAltProjModel(KSubspaceBatchAltBaseModel,

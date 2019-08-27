@@ -193,7 +193,7 @@ def eval_core_clustering(args):
   if args.init == 'pfi':
     # construct pfi initialization dataset
     if args.pfi_init_size is None or args.pfi_init_size <= 0:
-      args.pfi_init_size = args.reset_cache_size
+      args.pfi_init_size = dataset.N
     args.pfi_init_size = min(args.pfi_init_size, dataset.N)
 
     if data_loader is not None:
