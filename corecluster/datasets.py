@@ -16,10 +16,9 @@ class SynthUoSDataset(Dataset):
         normalize=False, seed=None):
     super(SynthUoSDataset).__init__()
 
-    if theta is not None:
-      if theta <= 0:
-        raise ValueError("Invalid principal angle {}".format(theta))
-      if k*d > D:
+    self.theta_mode = theta is not None and theta > 0 and theta < np.pi/2
+    if self.theta_mode:
+      if (k+1)*d > D:
         raise ValueError("Can only specify principal angle for independent "
             "subspaces")
 
@@ -43,12 +42,13 @@ class SynthUoSDataset(Dataset):
     self.groups = np.zeros(self.N, dtype=np.int32)
 
     # generate bases
-    if theta is None:
+    if not self.theta_mode:
       # bases sampled uniformly at random
       for ii in range(k):
         self.Us[ii, :] = np.linalg.qr(self.rng.randn(D, d))[0]
     else:
       # bases sampled with fixed principal angles.
+      # theta in [0, pi/2]
       alpha = np.sqrt(np.cos(theta))
       beta = np.sqrt(1.0 - alpha**2)
 
@@ -61,6 +61,15 @@ class SynthUoSDataset(Dataset):
       U0_comp = np.matmul(U0_comp, Q)
       for ii in range(k):
         P = np.linalg.qr(self.rng.randn(d, d))[0]
+        # with this construction, have
+        #
+        #   U_i^T U_i = alpha^2 (P_i^T U_0^T U_0 P_i) + beta^2 Z_i^T Z_i
+        #             = alpha^2 I + beta^2 I = I
+        #
+        #   U_i^T U_j = alpha^2 (P_i^T U_0^T U_0 P_j)
+        #             = alpha^2 P_i^T P_j
+        #
+        # So, || U_i^T U_j ||_2 = alpha^2 = cos(theta)
         self.Us[ii, :] = (alpha*np.matmul(U0, P) +
             beta*U0_comp[:, ii*d:(ii+1)*d])
 

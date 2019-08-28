@@ -567,5 +567,5 @@ def set_auto_reg_params(k, d, D, Ng, sigma_hat, min_size=0.0):
     raise ValueError("min size {} should be in [0, 1).".format(min_size))
   U_frosqr_in_lamb = ((1.0 + np.sqrt((D - d)/Ng))**2 * (sigma_hat**2 / D))
   U_frosqr_out_lamb = ((min_size / k) * (1.0 / d + sigma_hat**2 / D))
-  z_lamb = 0.01
+  z_lamb = 0.01 if max(U_frosqr_in_lamb, U_frosqr_out_lamb) > 0 else 0.0
   return U_frosqr_in_lamb, U_frosqr_out_lamb, z_lamb
