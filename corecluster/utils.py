@@ -11,9 +11,71 @@ from scipy.sparse.linalg import svds
 from sklearn.utils.extmath import randomized_svd
 import torch
 import torch.nn.functional as F
+from torch.utils.data import DataLoader
 import pandas as pd
 
 EPS = 1e-8
+
+# use torch.solve in >=1.1.0 and torch.gesv in 0.4.1
+solve = torch.solve if hasattr(torch, 'solve') else torch.gesv
+
+
+class _BSScheduler(object):
+  def __init__(self, dataset, dl_kwargs, last_epoch=0):
+    self.dataset = dataset
+    self.dl_kwargs = dl_kwargs
+    self.last_epoch = last_epoch
+    self.batch_size = dl_kwargs['batch_size']
+
+  def update_bs(self):
+    raise NotImplementedError
+
+  def step(self, epoch=None):
+    # returns a new DataLoader instance when batch size updated. this is not
+    # too elegant, but not overly expensive either.
+    if epoch is None:
+      epoch = self.last_epoch + 1
+    self.last_epoch = epoch
+    return self.update_bs()
+
+  def new_data_loader(self):
+    return DataLoader(self.dataset, **self.dl_kwargs)
+
+
+class LambdaBS(_BSScheduler):
+  def __init__(self, dataset, dl_kwargs, bs_lambda, last_epoch=0):
+    self.bs_lambda = bs_lambda
+    super(LambdaBS, self).__init__(dataset, dl_kwargs, last_epoch)
+
+  def update_bs(self):
+    batch_size = self.bs_lambda(self.last_epoch)
+    updated = False
+    if batch_size != self.batch_size:
+      self.batch_size = self.dl_kwargs['batch_size'] = batch_size
+      updated = True
+    return updated
+
+
+class ClampDecay(object):
+  def __init__(self, initval, step_size, gamma, min=None, max=None):
+    self.initval = initval
+    self.step_size = step_size
+    self.gamma = gamma
+    self.minval = min
+    self.maxval = max
+
+  def __call__(self, ii):
+    val = clamp(self.initval * (self.gamma ** (ii // self.step_size)),
+        minval=self.minval, maxval=self.maxval)
+    return val
+
+
+def clamp(x, minval=None, maxval=None):
+  if minval is not None:
+    x = max(x, minval)
+  if maxval is not None:
+    x = min(x, maxval)
+  return x
 
 
 class AverageMeter(object):
@@ -44,8 +106,8 @@ def boolarg(arg):
 def reset_optimizer_state(model, optimizer, rIdx):
   """Reset optimizer states to zero for re-initialized replicates &
   clusters. Or, if copy=True, copy states from duplicated clusters."""
-  for p in model.parameters():
-    if not p.requires_grad:
+  for p in [model.Us, model.bs]:
+    if p is None or not p.requires_grad:
       continue
     state = optimizer.state[p]
     for key, val in state.items():
@@ -155,82 +217,54 @@ def rank(X, tol=.01):
   return (svs > tol*svs.max()).sum(), svs
 
 
-def find_soft_assign(losses, T=1.):
-  """soft assignment found by shifting up negative losses by T, thresholding
-  and normalizing.
+def assign_and_value(assign_obj, compute_c=True):
+  """Compute assignments and cluster size & values."""
+  batch_size, r, k = assign_obj.shape
+  device = assign_obj.device
+
+  if k > 1:
+    top2obj, top2idx = torch.topk(assign_obj, 2, dim=2, largest=False,
+        sorted=True)
+    groups = top2idx[:, :, 0]
+    min_assign_obj = top2obj[:, :, 0]
+  else:
+    groups = torch.zeros(batch_size, r, device=device, dtype=torch.int64)
+    min_assign_obj = assign_obj.squeeze(2)
+
+  if compute_c:
+    c = torch.zeros_like(assign_obj)
+    c.scatter_(2, groups.unsqueeze(2), 1)
+    c_mean = c.mean(dim=0)
+  else:
+    c = c_mean = None
+
+  if k > 1:
+    value = torch.zeros_like(assign_obj)
+    value = value.scatter_(2, groups.unsqueeze(2),
+        (top2obj[:, :, 1] - top2obj[:, :, 0]).unsqueeze(2)).mean(dim=0)
+  else:
+    value = torch.ones(r, k, device=device)
+  return groups, min_assign_obj, c, c_mean, value
+
+
+def update_ema_metric(val, ema, ema_decay=0.99, inplace=True):
+  """Update an exponential moving average tensor.
 
   Args:
-    losses (Tensor): (Nb, n) matrix of loss values.
-    T (float): soft assignment parameter in (0, \infty).
-
-  .. note::
-    For any T there is a tau such that the returned c is a solution to
-
-      min_c c^T l  s.t.  c >= 0, c^T 1 = 1, ||c||_2^2 <= tau
-
-    Since the optimality conditions of this problem yield
-
-      c^* = 1/gamma( lambda \1 - l)_+
-
-    for gamma, lambda Lagrange multipliers.
-  """
-  if T <= 0:
-    raise ValueError("soft assignment T must be > 0.")
-  # normalize loss to that T has consistent interpretation.
-  # NOTE: minimum loss can't be exactly zero
-  loss_min, _ = losses.min(dim=1, keepdim=True)
-  losses = losses.div(loss_min)
-  c = torch.clamp(T + 1. - losses, min=0.)
-  c = c.div(c.sum(dim=1, keepdim=True))
-  return c
-
-
-def coherence(U1, U2, normalize=False, svd=False, sv_tol=None):
-  """Compute coherence between U1, U2.
-
-  Args:
-    U1, U2: (D x d) matrices
-    normalize: normalize columns of U1, U2 (default: False)
-    svd: Orthogonalize bases by svd (default: False)
-    sv_tol: Singular value threshold (default: None)
+    val: current value.
+    ema: moving average (possibly with nan entries).
+    ema_decay: (default: 0.99)
+    inplace: (default: True)
 
   Returns:
-    coh: scalar coherence loss
+    ema
   """
-  d = U1.size(1)
-  if normalize:
-    U1 = unit_normalize(U1, p=2, dim=0)
-    U2 = unit_normalize(U2, p=2, dim=0)
-  if svd:
-    U1, s1, _ = torch.svd(U1)
-    U2, s2, _ = torch.svd(U2)
-    if sv_tol is not None and sv_tol > 0:
-      U1 = U1[:, (s1 >= sv_tol*s1[0])]
-      U2 = U2[:, (s2 >= sv_tol*s2[0])]
-      d = min(U1.size(1), U2.size(1))
-  coh = torch.matmul(U1.t(), U2).pow(2).sum().div(d)
-  return coh
-
-
-def eval_cluster_coherence(Us, normalize=False, svd=True, sv_tol=1e-3):
-  """Evaluate coherence for every pair of subspace bases
-
-  Args:
-    Us: subspace bases, shape (k, D, d)
-    normalize: normalize columns of U1, U2 (default: False)
-    svd: Orthogonalize bases by svd (default: True)
-    sv_tol: Singular value threshold (default: 1e-3)
-
-  Returns:
-    coh_mat: coherence matrix, shape (k, k)
-  """
-  with torch.no_grad():
-    k = Us.shape[0]
-    coh_mat = np.array([[
-        coherence(Us[ii, :], Us[jj, :], normalize=False,
-            svd=True, sv_tol=sv_tol).item()
-        for jj in range(k)] for ii in range(k)])
-  return coh_mat
+  if not inplace:
+    ema = torch.clone(ema)
+  nan_mask = torch.isnan(ema)
+  ema[nan_mask] = val[nan_mask]
+  ema.mul_(ema_decay).add_(1-ema_decay, val)
+  return ema
 
 
 def cos_knn(y, X, k, normalize=False):
@@ -241,7 +275,7 @@ def cos_knn(y, X, k, normalize=False):
     X: dataset, shape (N, D).
 
   Returns:
-    y_nn: nearest neighbors, shape (n, k, D)
+    knnIdx: indices of nearest neighbors, shape (n, k).
   """
   with torch.no_grad():
     if y.dim() == 1:
@@ -253,10 +287,8 @@ def cos_knn(y, X, k, normalize=False):
     # (N, n)
     cos_abs = torch.matmul(X, y.t()).abs()
     # (n, k)
-    Idx = (torch.topk(cos_abs, k, dim=0)[1]).t()
-    # (n, k, D)
-    y_knn = X[Idx, :]
-  return y_knn
+    knnIdx = (torch.topk(cos_abs, k, dim=0)[1]).t()
+  return knnIdx
 
 
 def unit_normalize(X, p=2, dim=None):
@@ -272,6 +304,18 @@ def unit_normalize(X, p=2, dim=None):
   """
   unitX = X.div(torch.norm(X, p=p, dim=dim, keepdim=True).add(EPS))
   return unitX
+
+
+def shift_and_zero(buf):
+  """Shift 1 -> 0, and zero out 1."""
+  buf[0, :] = buf[1, :]
+  buf[1, :] = 0.0
+  return buf
+
+
+def min_med_max(x):
+  """Compute min, median, max of tensor x."""
+  return [x.min().item(), x.median().item(), x.max().item()]
 
 
 def batch_svd(X, out=None):
@@ -350,7 +394,7 @@ def batch_ridge(B, A, lamb=0.0):
     lambeye = torch.eye(p, dtype=A.dtype, device=A.device).mul_(lamb)
     AtA = AtA.add_(lambeye)
 
-  X, _ = torch.gesv(AtB, AtA)
+  X, _ = solve(AtB, AtA)
   return X
 
 
@@ -486,21 +530,21 @@ def unique_resets(reset_cids):
 
 def aggregate_resets(resets):
   """Aggregate resets for each epoch and replicate."""
-  columns = ['epoch', 'itr', 'ridx', 'cidx', 'cand.ridx', 'cand.cidx',
-      'success', 'obj.decr', 'cumu.obj.decr', 'temp']
-  dtypes = 7*[int] + 3*[float]
+  columns = ['epoch', 'step', 'ridx', 'core.step', 'cidx', 'cand.ridx',
+      'cand.cidx', 'obj.decr', 'cumu.obj.decr']
+  dtypes = 7*[int] + 2*[float]
   resets_dict = {columns[ii]: resets[:, ii].astype(dtypes[ii])
       for ii in range(len(columns))}
   resets = pd.DataFrame(data=resets_dict)
-  resets = resets[resets['success'] == 1]
-  grouped = resets.groupby(['epoch', 'itr', 'ridx'])
-  agg_resets = grouped.agg(OrderedDict([('success', ['count']), ('obj.decr',
-      ['min', 'median', 'max']), ('cumu.obj.decr', ['min', 'median', 'max']),
-      ('temp', ['min'])]))
-  agg_resets.reset_index(inplace=True)
-  agg_resets.columns = (['epoch', 'itr', 'ridx', 'path.length'] +
+  grouped = resets.groupby(['epoch', 'step', 'ridx'], as_index=False)
+  agg_resets = grouped.agg(OrderedDict([
+      ('core.step', ['count']),
+      ('obj.decr', ['min', 'median', 'max']),
+      ('cumu.obj.decr', ['min', 'median', 'max'])]))
+  agg_resets.columns = (
+      ['epoch', 'step', 'ridx', 'core.steps'] +
       ['{}.{}'.format(met, meas) for met in ['obj.decr', 'cumu.obj.decr']
-          for meas in ['min', 'med', 'max']] + ['temp'])
+          for meas in ['min', 'med', 'max']])
   return agg_resets
 
 
@@ -523,5 +567,5 @@ def set_auto_reg_params(k, d, D, Ng, sigma_hat, min_size=0.0):
     raise ValueError("min size {} should be in [0, 1).".format(min_size))
   U_frosqr_in_lamb = ((1.0 + np.sqrt((D - d)/Ng))**2 * (sigma_hat**2 / D))
   U_frosqr_out_lamb = ((min_size / k) * (1.0 / d + sigma_hat**2 / D))
-  z_lamb = 0.01
+  z_lamb = 0.01 if max(U_frosqr_in_lamb, U_frosqr_out_lamb) > 0 else 0.0
   return U_frosqr_in_lamb, U_frosqr_out_lamb, z_lamb

@@ -4,7 +4,7 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
-import utils as ut
+from . import utils as ut
 
 
 global_args_dict = {
@@ -14,7 +14,7 @@ global_args_dict = {
     # data settings
     'img-dataset': dict(type=str, default='mnist',
         help='Real image dataset [default: mnist].',
-        choices=['mnist', 'coil100', 'coil20', 'yaleb']),
+        choices=['mnist', 'cifar10', 'coil100', 'coil20', 'yaleb']),
     'mc-dataset': dict(type=str, default='nf_1k',
         help='Real matrix completion dataset [default: nf_1k].',
         choices=['nf_1k', 'nf_17k']),
@@ -53,11 +53,6 @@ global_args_dict = {
     'form': dict(type=str, default='mf',
         help='Model formulation [default: mf]',
         choices=['mf', 'proj']),
-    'init': dict(type=str, default='random',
-        help='Initialization [default: random]',
-        choices=['random', 'pca', 'pfi']),
-    'kpp-n-trials': dict(type=int, default=None,
-        help='Number of k-means++ (pfi) samples [default: 2 log n]'),
     'model-k': dict(type=int, default=None,
         help='Model number of subspaces [default: k]'),
     'model-d': dict(type=int, default=None,
@@ -83,39 +78,49 @@ global_args_dict = {
             '[default: 0.0]')),
 
     # training settings
+    'init': dict(type=str, default='random',
+        help='Initialization [default: random]',
+        choices=['random', 'pfi']),
+    'pfi-init-size': dict(type=int, default=None,
+        help='Size of initialization data subset for PFI [default: N]'),
+    'pfi-n-cands': dict(type=int, default=None,
+        help='Number of insertion candidates [default: 2 log k]'),
     'epochs': dict(type=int, default=20,
         help='Number of epochs to train [default: 20]'),
     'epoch-size': dict(type=int, default=None,
         help='Number of samples to consider an "epoch" [default: N]'),
-    'batch-size': dict(type=int, default=100,
-        help='Input batch size for training [default: 100]'),
     'optim': dict(type=str, default='sgd',
         help='Optimizer [default: sgd]',
         choices=['sgd', 'adam', 'batch-alt']),
     'init-lr': dict(type=float, default=0.1,
         help='Initial learning rate [default: 0.1]'),
-    'scale-grad-mode': dict(type=str, default=None,
-        help='SGD gradient scaling mode for MF formulation [default: None]',
-        choices=['none', 'lip', 'newton']),
-    'scale-grad-update-freq': dict(type=int, default=20,
-        help='How often to re-compute gradient scaling [default: 20]'),
+    'lr-step-size': dict(type=int, default=None,
+        help='How often to decay LR [default: None]'),
+    'lr-gamma': dict(type=float, default=0.1,
+        help='How much to decay LR [default: 0.1]'),
+    'lr-min': dict(type=float, default=1e-8,
+        help='Minimum LR [default: 1e-8]'),
+    'init-bs': dict(type=int, default=100,
+        help='Initial batch size [default: 100]'),
+    'bs-step-size': dict(type=int, default=None,
+        help='How often to increase batch size [default: None]'),
+    'bs-gamma': dict(type=int, default=4,
+        help='How much to increase batch size [default: 4]'),
+    'bs-max': dict(type=int, default=8192,
+        help='Maximum batch size [default: 8192]'),
+    'scale-grad-lip': dict(type=ut.boolarg, default=0,
+        help=('Enable gradient scaling for MF & k-means formulations '
+            '[default: 0]')),
     'sparse-encode': dict(type=ut.boolarg, default=True,
         help='Sparse encoding in MC setting [default: 1]'),
     'sparse-decode': dict(type=ut.boolarg, default=True,
         help='Sparse decoding in MC setting  [default: 1]'),
-    'serial-eval': dict(type=str, default=None,
-        help='Serial evaluation mode [default: none]',
-        choices=['none', 'r', 'k', 'rk']),
 
     # reset settings
     'reps': dict(type=int, default=6,
         help='Number of model replicates [default: 6]'),
     'core-reset': dict(type=ut.boolarg, default=True,
         help='Re-initialize using CoRe [default: 1]'),
-    'reset-metric': dict(type=str, default='obj_decr',
-        help=('Metric used to sample swap candidates '
-            '[default: obj_decr]'),
-        choices=['obj_decr', 'value']),
     'reset-patience': dict(type=int, default=100,
         help=('Steps to wait without obj decrease before trying to reset '
             '[default: 100]')),
@@ -135,8 +140,8 @@ global_args_dict = {
         help='Enables CUDA training [default: 0]'),
     'num-threads': dict(type=int, default=1,
         help='Number of parallel threads to use [default: 1]'),
-    'num-workers': dict(type=int, default=1,
-        help='Number of workers for data loading [default: 1]'),
+    'num-workers': dict(type=int, default=0,
+        help='Number of workers for data loading [default: 0]'),
     'data-seed': dict(type=int, default=2001,
         help='Data random seed [default: 2001]'),
     'seed': dict(type=int, default=2018,
@@ -149,6 +154,9 @@ global_args_dict = {
         help='How often to stop in ipdb [default: None]'),
     'save-large-data': dict(type=ut.boolarg, default=True,
         help='Save larger data [default: 1]'),
+    'config': dict(type=str, default=None,
+        help=('Json file containing args (command line takes precedent) '
+          '[default: None]')),
 }
 
 
